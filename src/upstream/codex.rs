@@ -35,9 +35,12 @@ impl CodexClient {
     }
 
     pub fn responses_url(&self) -> Result<Url, String> {
-        self.base_url
-            .join("responses")
-            .map_err(|e| format!("base_url 无效: {e}"))
+        let mut u = self.base_url.clone();
+        let base_path = u.path().trim_end_matches('/');
+        u.set_path(&format!("{base_path}/responses"));
+        u.set_query(None);
+        u.set_fragment(None);
+        Ok(u)
     }
 
     pub async fn send_with_retry(

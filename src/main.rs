@@ -1,7 +1,12 @@
+use std::collections::HashSet;
 use std::env;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use codex_proxy_rs::{api, config::Config};
+use codex_proxy_rs::{api, config::Config, core::Manager, quota::QuotaChecker, upstream::codex::CodexClient};
+use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig, KeepAlive, KeepAliveConfig};
 use tracing_subscriber::EnvFilter;
+use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -9,6 +14,59 @@ async fn main() -> Result<(), String> {
     let cfg = Config::load(&config_path)?;
 
     init_tracing(&cfg.log_level);
+
+    let manager = Arc::new(Manager::new(&cfg.auth_dir));
+    if cfg.startup_async_load {
+        tracing::info!("startup_async_load enabled; accounts will load in background");
+        let manager = manager.clone();
+        let auth_dir = cfg.auth_dir.clone();
+        tokio::spawn(async move {
+            let start = Instant::now();
+            loop {
+                match manager.load_accounts() {
+                    Ok(count) => {
+                        tracing::info!(
+                            auth_dir = %auth_dir,
+                            count,
+                            elapsed = ?start.elapsed(),
+                            "accounts loaded"
+                        );
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!("后台加载账号失败: {err}，10 秒后重试");
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    }
+                }
+            }
+        });
+    } else {
+        let start = Instant::now();
+        let count = manager.load_accounts()?;
+        tracing::info!(
+            auth_dir = %cfg.auth_dir,
+            count,
+            elapsed = ?start.elapsed(),
+            "accounts loaded"
+        );
+    }
+
+    let quota_checker = Arc::new(QuotaChecker::new(
+        &cfg.base_url,
+        &cfg.backend_domain,
+        &cfg.proxy_url,
+        50,
+    )?);
+
+    let base_url = Url::parse(&cfg.base_url).map_err(|e| format!("base-url 无效: {e}"))?;
+    let codex_client = Arc::new(CodexClient::new(base_url.clone(), &cfg.proxy_url)?);
+
+    let api_keys: HashSet<String> = cfg
+        .api_keys
+        .iter()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
 
     tracing::info!(
         listen = %cfg.listen,
@@ -20,13 +78,73 @@ async fn main() -> Result<(), String> {
         "codex-proxy-rs starting"
     );
 
-    let app = api::router();
+    let app = api::router(api::AppState {
+        manager: manager.clone(),
+        quota_checker,
+        codex_client: codex_client.clone(),
+        api_keys: Arc::new(api_keys),
+        max_retry: cfg.max_retry,
+    });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr())
         .await
         .map_err(|e| format!("监听失败: {e}"))?;
-    let shutdown = async {
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    if cfg.health_check_interval > 0 {
+        let hc = Arc::new(HealthChecker::new(
+            base_url.clone(),
+            &cfg.proxy_url,
+            HealthCheckerConfig {
+                check_interval: Duration::from_secs(cfg.health_check_interval),
+                max_consecutive_failures: cfg.health_check_max_failures as i64,
+                concurrency: cfg.health_check_concurrency as usize,
+                start_delay: Duration::from_secs(cfg.health_check_start_delay),
+                batch_size: cfg.health_check_batch_size as usize,
+                request_timeout: Duration::from_secs(cfg.health_check_request_timeout),
+            },
+        )?);
+
+        let manager = manager.clone();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            hc.start_loop(manager, rx).await;
+        });
+    } else {
+        tracing::info!("health_check_interval=0; health checker disabled");
+    }
+
+    let mut ping_url = base_url.clone();
+    let base_path = ping_url.path().trim_end_matches('/').to_string();
+    if let Some(stripped) = base_path.strip_suffix("/codex") {
+        ping_url.set_path(if stripped.is_empty() { "/" } else { stripped });
+    } else {
+        ping_url.set_path("/");
+    }
+    ping_url.set_query(None);
+    ping_url.set_fragment(None);
+
+    match KeepAlive::new(
+        ping_url,
+        &cfg.proxy_url,
+        KeepAliveConfig {
+            interval: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(10),
+        },
+    ) {
+        Ok(ka) => {
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                ka.start_loop(rx).await;
+            });
+        }
+        Err(err) => tracing::warn!("keepalive disabled: {err}"),
+    }
+
+    let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutdown signal received");
+        let _ = shutdown_tx.send(true);
     };
 
     axum::serve(listener, app)

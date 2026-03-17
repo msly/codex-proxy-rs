@@ -36,6 +36,14 @@ pub struct TokenData {
     pub plan_type: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct QuotaInfo {
+    pub valid: bool,
+    pub status_code: u16,
+    pub raw_data: Vec<u8>,
+    pub checked_at_ms: i64,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum AccountStatus {
     Active = 0,
@@ -65,6 +73,7 @@ impl AccountStatus {
 pub struct Account {
     file_path: String,
     token: RwLock<TokenData>,
+    quota: RwLock<Option<QuotaInfo>>,
 
     status: AtomicI32,
     cooldown_until_ms: AtomicI64,
@@ -83,6 +92,7 @@ impl Account {
         Self {
             file_path,
             token: RwLock::new(token),
+            quota: RwLock::new(None),
             status: AtomicI32::new(AccountStatus::Active as i32),
             cooldown_until_ms: AtomicI64::new(0),
             used_percent_x100: AtomicI64::new(-100),
@@ -186,6 +196,33 @@ impl Account {
         self.last_refresh_ms.store(now_ms, Ordering::Relaxed);
     }
 
+    pub fn set_quota_info(&self, info: QuotaInfo) {
+        {
+            let mut guard = self.quota.write().expect("quota lock poisoned");
+            *guard = Some(info.clone());
+        }
+        self.refresh_used_percent_from_quota(&info);
+    }
+
+    pub fn quota_info(&self) -> Option<QuotaInfo> {
+        self.quota
+            .read()
+            .expect("quota lock poisoned")
+            .as_ref()
+            .cloned()
+    }
+
+    fn refresh_used_percent_from_quota(&self, info: &QuotaInfo) {
+        if !info.valid || info.raw_data.is_empty() {
+            self.used_percent_x100.store(-100, Ordering::Relaxed);
+            return;
+        }
+
+        let used = extract_used_percent_x100(&info.raw_data);
+        self.used_percent_x100
+            .store(used.unwrap_or(-100), Ordering::Relaxed);
+    }
+
     pub fn record_success(&self, now_ms: i64) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
@@ -244,6 +281,16 @@ pub fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis() as i64
+}
+
+fn extract_used_percent_x100(raw_json: &[u8]) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_slice(raw_json).ok()?;
+    let used = v
+        .get("rate_limit")?
+        .get("primary_window")?
+        .get("used_percent")?
+        .as_f64()?;
+    Some((used * 100.0) as i64)
 }
 
 pub fn parse_id_token_claims(id_token: &str) -> (String, String, String) {
@@ -339,5 +386,38 @@ mod tests {
         assert_eq!(snap.consecutive_failures, 0);
         assert!((snap.used_percent - 12.34).abs() < 1e-6, "used_percent={}", snap.used_percent);
         assert_eq!(snap.token_expire, "2099-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn core_account_set_quota_info_updates_used_percent() {
+        let acc = Account::new(
+            "a.json".to_string(),
+            TokenData {
+                id_token: String::new(),
+                access_token: String::new(),
+                refresh_token: "rt".to_string(),
+                account_id: String::new(),
+                email: "a@example.com".to_string(),
+                expired: "2099-01-01T00:00:00Z".to_string(),
+                plan_type: String::new(),
+            },
+        );
+
+        acc.set_quota_info(QuotaInfo {
+            valid: true,
+            status_code: 200,
+            raw_data: serde_json::json!({
+              "rate_limit": {
+                "primary_window": {
+                  "used_percent": 12.34
+                }
+              }
+            })
+            .to_string()
+            .into_bytes(),
+            checked_at_ms: now_unix_ms(),
+        });
+
+        assert!((acc.used_percent() - 12.34).abs() < 0.02, "used={}", acc.used_percent());
     }
 }

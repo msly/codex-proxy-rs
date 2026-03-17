@@ -13,6 +13,15 @@ pub fn convert_openai_request_to_codex(model_name: &str, raw_json: &[u8], stream
     serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec())
 }
 
+pub fn build_reverse_tool_name_map(raw_json: &[u8]) -> HashMap<String, String> {
+    let v: Value = serde_json::from_slice(raw_json).unwrap_or_else(|_| Value::Object(Map::new()));
+    let tool_name_map = build_tool_name_map(&v);
+    tool_name_map
+        .into_iter()
+        .map(|(orig, short)| (short, orig))
+        .collect()
+}
+
 fn convert_existing_input(model_name: &str, mut v: Value, stream: bool) -> Value {
     // input 为字符串时，转换为标准消息数组
     if let Some(input) = v.get("input").and_then(Value::as_str) {

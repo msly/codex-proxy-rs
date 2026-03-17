@@ -1,6 +1,8 @@
 pub mod request;
+pub mod response;
 
-pub use request::convert_openai_request_to_codex;
+pub use request::{build_reverse_tool_name_map, convert_openai_request_to_codex};
+pub use response::{convert_non_stream_response, convert_stream_chunk, StreamState};
 
 #[cfg(test)]
 mod tests {

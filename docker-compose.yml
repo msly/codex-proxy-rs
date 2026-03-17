@@ -1,0 +1,9 @@
+services:
+  codex-proxy-rs:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./auths:/app/auths
+
