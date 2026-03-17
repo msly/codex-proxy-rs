@@ -156,7 +156,7 @@ async fn api_gzip_applies_to_non_v1_routes() {
     let mut decoder = GzDecoder::new(&bytes[..]);
     let mut out = String::new();
     decoder.read_to_string(&mut out).unwrap();
-    assert!(out.contains("codex-proxy-rs"));
+    assert!(out.contains("数据统计与展示"));
 }
 
 #[tokio::test]
