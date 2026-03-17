@@ -3,8 +3,11 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use codex_proxy_rs::{api, config::Config, core::Manager, quota::QuotaChecker, upstream::codex::CodexClient};
 use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig, KeepAlive, KeepAliveConfig};
+use codex_proxy_rs::refresh::{RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue};
+use codex_proxy_rs::{
+    api, config::Config, core::Manager, quota::QuotaChecker, upstream::codex::CodexClient,
+};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -23,8 +26,17 @@ async fn main() -> Result<(), String> {
         tokio::spawn(async move {
             let start = Instant::now();
             loop {
-                match manager.load_accounts() {
-                    Ok(count) => {
+                match manager.scan_new_files() {
+                    Ok(_) => {
+                        let count = manager.account_count();
+                        if count == 0 {
+                            tracing::warn!(
+                                auth_dir = %auth_dir,
+                                "后台加载账号失败: 未找到有效账号文件，10 秒后重试"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            continue;
+                        }
                         tracing::info!(
                             auth_dir = %auth_dir,
                             count,
@@ -60,6 +72,8 @@ async fn main() -> Result<(), String> {
 
     let base_url = Url::parse(&cfg.base_url).map_err(|e| format!("base-url 无效: {e}"))?;
     let codex_client = Arc::new(CodexClient::new(base_url.clone(), &cfg.proxy_url)?);
+    let refresher = Refresher::new(&cfg.proxy_url)?;
+    let save_queue = SaveQueue::start(4);
 
     let api_keys: HashSet<String> = cfg
         .api_keys
@@ -84,12 +98,42 @@ async fn main() -> Result<(), String> {
         codex_client: codex_client.clone(),
         api_keys: Arc::new(api_keys),
         max_retry: cfg.max_retry,
+        refresher: refresher.clone(),
+        save_queue: save_queue.clone(),
+        refresh_concurrency: cfg.refresh_concurrency as usize,
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr())
         .await
         .map_err(|e| format!("监听失败: {e}"))?;
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    if cfg.refresh_interval > 0 {
+        let refresh_interval = Duration::from_secs(cfg.refresh_interval);
+        let scan_interval = Duration::from_secs(30.min(cfg.refresh_interval));
+
+        match RefreshLoop::new(
+            manager.clone(),
+            refresher.clone(),
+            save_queue.clone(),
+            RefreshLoopConfig {
+                refresh_interval,
+                scan_interval,
+                refresh_concurrency: cfg.refresh_concurrency as usize,
+                max_retries: 3,
+            },
+        ) {
+            Ok(loop_) => {
+                let rx = shutdown_rx.clone();
+                tokio::spawn(async move {
+                    loop_.start_loop(rx).await;
+                });
+            }
+            Err(err) => tracing::warn!("refresh loop disabled: {err}"),
+        }
+    } else {
+        tracing::info!("refresh_interval=0; refresh loop disabled");
+    }
 
     if cfg.health_check_interval > 0 {
         let hc = Arc::new(HealthChecker::new(

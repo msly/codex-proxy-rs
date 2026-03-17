@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::core::{Account, TokenFile};
 
@@ -13,8 +13,7 @@ pub fn save_token_to_file(account: &Account) -> Result<(), String> {
     let last_refresh = if last_refresh_ms > 0 {
         let dt = OffsetDateTime::from_unix_timestamp_nanos((last_refresh_ms as i128) * 1_000_000)
             .map_err(|e| format!("last_refresh 时间戳无效: {e}"))?;
-        dt.format(&Rfc3339)
-            .unwrap_or_else(|_| String::new())
+        dt.format(&Rfc3339).unwrap_or_else(|_| String::new())
     } else {
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -81,7 +80,7 @@ impl SaveQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{now_unix_ms, Account, TokenData};
+    use crate::core::{Account, TokenData, now_unix_ms};
 
     #[test]
     fn refresh_save_token_to_file_writes_json() {

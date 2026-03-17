@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::routing::head;
-use axum::Router;
 use codex_proxy_rs::health::{KeepAlive, KeepAliveConfig};
 use url::Url;
 
@@ -19,7 +19,9 @@ async fn ping(State(state): State<AppState>) -> axum::http::StatusCode {
 }
 
 async fn start_server(calls: Arc<AtomicUsize>) -> Url {
-    let app = Router::new().route("/", head(ping)).with_state(AppState { calls });
+    let app = Router::new()
+        .route("/", head(ping))
+        .with_state(AppState { calls });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -56,4 +58,3 @@ async fn health_keepalive_pings_and_can_be_canceled() {
 
     assert!(calls.load(Ordering::Relaxed) >= 1);
 }
-

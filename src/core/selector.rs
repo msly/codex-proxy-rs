@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use super::account::{now_unix_ms, Account};
+use super::account::{Account, now_unix_ms};
 
 pub trait Selector: Send + Sync {
     fn pick(&self, model: &str, accounts: &[Arc<Account>]) -> Result<Arc<Account>, String>;
@@ -61,8 +61,8 @@ fn compare_used_percent(a: &Account, b: &Account) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::account::{now_unix_ms, AccountStatus, TokenData};
     use crate::core::Account;
+    use crate::core::account::{AccountStatus, TokenData, now_unix_ms};
 
     fn make_account(path: &str) -> Arc<Account> {
         Arc::new(Account::new(

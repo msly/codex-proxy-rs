@@ -1,8 +1,13 @@
+pub mod claude;
 pub mod request;
 pub mod response;
 
+pub use claude::{
+    ClaudeNonStreamResult, ClaudeStreamState, convert_claude_request_to_openai,
+    convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
+};
 pub use request::{build_reverse_tool_name_map, convert_openai_request_to_codex};
-pub use response::{convert_non_stream_response, convert_stream_chunk, StreamState};
+pub use response::{StreamState, convert_non_stream_response, convert_stream_chunk};
 
 #[cfg(test)]
 mod tests {

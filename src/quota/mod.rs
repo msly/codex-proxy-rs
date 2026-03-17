@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use reqwest::Url;
 use serde::Serialize;
 
-use crate::core::{now_unix_ms, Account, Manager, QuotaInfo};
+use crate::core::{Account, Manager, QuotaInfo, now_unix_ms};
 use crate::upstream::codex::CODEX_USER_AGENT;
 
 #[derive(Debug, Clone)]
@@ -47,6 +47,10 @@ impl QuotaChecker {
         &self.usage_url
     }
 
+    pub async fn check_one(&self, acc: Arc<Account>) -> bool {
+        matches!(self.check_account(acc).await, CheckOutcome::Valid { .. })
+    }
+
     async fn check_account(&self, acc: Arc<Account>) -> CheckOutcome {
         let (access_token, account_id, email) = {
             let token = acc.token();
@@ -64,7 +68,10 @@ impl QuotaChecker {
         let mut req = self
             .http
             .get(self.usage_url.clone())
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {access_token}"),
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
             .header("Origin", "https://chatgpt.com")
@@ -125,7 +132,10 @@ impl QuotaChecker {
         CheckOutcome::Invalid { email }
     }
 
-    pub fn check_all_stream(&self, manager: Arc<Manager>) -> tokio::sync::mpsc::Receiver<ProgressEvent> {
+    pub fn check_all_stream(
+        &self,
+        manager: Arc<Manager>,
+    ) -> tokio::sync::mpsc::Receiver<ProgressEvent> {
         let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(100);
         let checker = self.clone();
 
@@ -392,9 +402,7 @@ mod tests {
     async fn quota_check_one_updates_cache_and_used_percent() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base = start_server(calls.clone()).await;
-        let base_url = base
-            .join("/backend-api/codex")
-            .expect("join base url");
+        let base_url = base.join("/backend-api/codex").expect("join base url");
 
         let dir = tempfile::tempdir().unwrap();
         write_auth_file(dir.path(), "a.json", "at-ok").await;
@@ -419,9 +427,7 @@ mod tests {
     async fn quota_invalid_account_is_removed() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base = start_server(calls.clone()).await;
-        let base_url = base
-            .join("/backend-api/codex")
-            .expect("join base url");
+        let base_url = base.join("/backend-api/codex").expect("join base url");
 
         let dir = tempfile::tempdir().unwrap();
         write_auth_file(dir.path(), "a.json", "at-bad").await;

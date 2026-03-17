@@ -6,6 +6,7 @@ use axum::http::{Request, StatusCode};
 use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::Manager;
 use codex_proxy_rs::quota::QuotaChecker;
+use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::CodexClient;
 use tower::util::ServiceExt;
 use url::Url;
@@ -32,6 +33,9 @@ fn build_state() -> AppState {
         ),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
     }
 }
 
@@ -39,7 +43,12 @@ fn build_state() -> AppState {
 async fn api_v1_models_contains_expected_variants() {
     let app = api::router(build_state());
     let res = app
-        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
 
@@ -64,4 +73,3 @@ async fn api_v1_models_contains_expected_variants() {
     assert!(ids.contains("gpt-5.1-codex-max"));
     assert!(ids.contains("gpt-5.1-codex-max-fast"));
 }
-

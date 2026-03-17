@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use super::account::{parse_id_token_claims, Account, TokenData, TokenFile};
+use super::account::{Account, TokenData, TokenFile, parse_id_token_claims};
 use super::selector::{RoundRobinSelector, Selector};
 
 #[derive(Debug)]
@@ -90,7 +90,10 @@ impl Manager {
             .collect();
 
         if filtered.is_empty() {
-            return Err(format!("没有更多可用账号（已排除 {} 个）", excluded_file_paths.len()));
+            return Err(format!(
+                "没有更多可用账号（已排除 {} 个）",
+                excluded_file_paths.len()
+            ));
         }
 
         self.selector.pick(model, &filtered)
@@ -124,12 +127,68 @@ impl Manager {
         match fs::remove_file(file_path) {
             Ok(()) => tracing::warn!(file_path, reason, "account removed (memory+disk)"),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(file_path, reason, "account removed (memory only; disk missing)")
+                tracing::warn!(
+                    file_path,
+                    reason,
+                    "account removed (memory only; disk missing)"
+                )
             }
-            Err(err) => tracing::warn!(file_path, reason, "account removed (disk delete failed: {err})"),
+            Err(err) => tracing::warn!(
+                file_path,
+                reason,
+                "account removed (disk delete failed: {err})"
+            ),
         }
 
         true
+    }
+
+    /// Scan `auth_dir` and hot-load new `*.json` auth files.
+    ///
+    /// Unlike `load_accounts`, this will not replace existing in-memory accounts.
+    pub fn scan_new_files(&self) -> Result<usize, String> {
+        let entries = fs::read_dir(&self.auth_dir)
+            .map_err(|e| format!("读取账号目录失败: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("读取账号目录失败: {e}"))?;
+
+        let snap = self.accounts.load_full();
+        let existing: HashSet<String> = snap.iter().map(|a| a.file_path().to_string()).collect();
+
+        let mut added = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if !is_json_file(&path) {
+                continue;
+            }
+            let file_path = path.to_string_lossy().to_string();
+            if existing.contains(&file_path) {
+                continue;
+            }
+
+            match load_account_from_file(&path) {
+                Ok(acc) => added.push(acc),
+                Err(err) => {
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                        tracing::warn!(file = name, "skip invalid auth file: {err}");
+                    } else {
+                        tracing::warn!("skip invalid auth file: {err}");
+                    }
+                }
+            }
+        }
+
+        if added.is_empty() {
+            return Ok(0);
+        }
+
+        let mut merged = Vec::with_capacity(snap.len() + added.len());
+        merged.extend(snap.iter().cloned());
+        merged.extend(added);
+
+        let count = merged.len() - snap.len();
+        self.accounts.store(Arc::new(merged));
+        Ok(count)
     }
 }
 

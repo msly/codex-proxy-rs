@@ -8,17 +8,22 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
 
 - OpenAI 兼容端点：
   - `POST /v1/responses`（流式/非流式，透传上游 Responses SSE 或 response 对象）
+  - `POST /v1/responses/compact`（流式/非流式，透传上游 Compact 响应）
   - `POST /v1/chat/completions`（流式/非流式，上游 Responses SSE → Chat Completions 转换）
   - `GET /v1/models`（生成 thinking 后缀与 `-fast` 变体）
+- Claude 兼容端点：
+  - `POST /v1/messages`（流式/非流式，Codex Responses SSE → Claude Messages 格式）
 - 管理端点：
   - `GET /stats`（账号 summary + 统计 + quota raw JSON cache）
   - `POST /check-quota`（SSE，批量查询 `/backend-api/wham/usage`）
+  - `POST /refresh`（SSE，强制刷新所有账号 Token）
   - `GET /health`（不鉴权）
 - 多账号池 + 内部重试：
   - 从 `auth-dir` 读取 `*.json`（access_token/refresh_token/account_id/email/expired）
   - 账号切换重试（400/403 不重试，其它可重试）
   - **SSE gate**：仅在拿到上游 **2xx** 后才向下游返回流式响应（客户端“无感重试”）
 - 后台任务（可取消）：
+  - refresh loop：定时扫描新增 auth 文件并并发刷新即将过期的 Token
   - health checker：探测 `/responses` 并对 401/403/429 做移除/冷却处理
   - keepalive：周期性 HEAD ping 上游，保持连接池热度
 
@@ -148,6 +153,15 @@ curl -N http://127.0.0.1:8080/v1/responses \
   -d '{"model":"gpt-5.4","stream":true,"input":"hello"}'
 ```
 
+### 3.1) Responses Compact（流式）
+
+```bash
+curl -N http://127.0.0.1:8080/v1/responses/compact \
+  -H 'Authorization: Bearer your-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.4","stream":true,"input":"hello"}'
+```
+
 ### 4) Chat Completions（非流式）
 
 ```bash
@@ -166,6 +180,15 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}'
 ```
 
+### 5.1) Claude Messages（流式）
+
+```bash
+curl -N http://127.0.0.1:8080/v1/messages \
+  -H 'Authorization: Bearer your-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.4","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
+```
+
 ### 6) 查询剩余额度（SSE）
 
 ```bash
@@ -177,6 +200,13 @@ curl -N -X POST http://127.0.0.1:8080/check-quota \
 
 ```bash
 curl -sS http://127.0.0.1:8080/stats \
+  -H 'Authorization: Bearer your-api-key'
+```
+
+### 8) 手动刷新所有账号 Token（SSE）
+
+```bash
+curl -N -X POST http://127.0.0.1:8080/refresh \
   -H 'Authorization: Bearer your-api-key'
 ```
 
@@ -242,7 +272,7 @@ flowchart TD
 
 ## 现状与差异（相对 Go）
 
-- 已实现：`/v1/responses`、`/v1/chat/completions`、`/v1/models`、`/stats`、`/check-quota`、health checker、keepalive
-- 未实现（待补齐）：`/v1/messages`、`/v1/responses/compact`、websocket、`/refresh` 管理端点、后台 refresh loop 的完整对齐等
+- 已实现：`/v1/responses`（含 websocket fallback）、`/v1/responses/compact`、`/v1/chat/completions`、`/v1/messages`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
+- 未实现（待补齐）：上游原生 websocket 转发等（当前只实现 Go 同款 fallback）
 
 更多对齐清单见 `docs/parity.md`。

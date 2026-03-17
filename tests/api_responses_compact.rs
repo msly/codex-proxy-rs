@@ -19,10 +19,14 @@ struct UpstreamState {
     calls: Arc<AtomicUsize>,
 }
 
-async fn upstream_responses(
+async fn upstream_compact(
     State(state): State<UpstreamState>,
     headers: HeaderMap,
-) -> (axum::http::StatusCode, &'static str) {
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    &'static str,
+) {
     state.calls.fetch_add(1, Ordering::Relaxed);
     let auth = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -34,24 +38,40 @@ async fn upstream_responses(
         .unwrap_or("");
 
     match auth {
-        "Bearer at1" => (axum::http::StatusCode::UNAUTHORIZED, "unauthorized"),
+        "Bearer at1" => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "unauthorized",
+        ),
         "Bearer at2" => {
             if accept.contains("text/event-stream") {
-                (axum::http::StatusCode::OK, "data: ok\n\n")
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "data: compact\n\n",
+                )
             } else {
                 (
                     axum::http::StatusCode::OK,
-                    r#"{"id":"r1","object":"response"}"#,
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    r#"{"compact":true}"#,
                 )
             }
         }
-        _ => (axum::http::StatusCode::FORBIDDEN, "forbidden"),
+        _ => (
+            axum::http::StatusCode::FORBIDDEN,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "forbidden",
+        ),
     }
 }
 
 async fn start_upstream(calls: Arc<AtomicUsize>) -> Url {
     let app = Router::new()
-        .route("/backend-api/codex/responses", post(upstream_responses))
+        .route(
+            "/backend-api/codex/responses/compact",
+            post(upstream_compact),
+        )
         .with_state(UpstreamState { calls });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -80,7 +100,7 @@ async fn write_auth_file(dir: &std::path::Path, name: &str, access_token: &str) 
 }
 
 #[tokio::test]
-async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
+async fn api_v1_responses_compact_stream_passthrough_uses_internal_retry_gate() {
     let calls = Arc::new(AtomicUsize::new(0));
     let base_url = start_upstream(calls.clone()).await;
 
@@ -107,11 +127,11 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/responses")
+                .uri("/v1/responses/compact")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     serde_json::json!({
-                        "model": "gpt-5.4",
+                        "model": "gpt-5.4-high",
                         "stream": true,
                         "input": "hi"
                     })
@@ -135,12 +155,12 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(body, "data: ok\n\n");
+    assert_eq!(body, "data: compact\n\n");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]
-async fn api_v1_responses_non_stream_passthrough_returns_json() {
+async fn api_v1_responses_compact_non_stream_passthrough_returns_json() {
     let calls = Arc::new(AtomicUsize::new(0));
     let base_url = start_upstream(calls.clone()).await;
 
@@ -167,11 +187,11 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/v1/responses")
+                .uri("/v1/responses/compact")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     serde_json::json!({
-                        "model": "gpt-5.4",
+                        "model": "gpt-5.4-high",
                         "stream": false,
                         "input": "hi"
                     })
@@ -195,6 +215,6 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(body, r#"{"id":"r1","object":"response"}"#);
+    assert_eq!(body, r#"{"compact":true}"#);
     assert_eq!(calls.load(Ordering::Relaxed), 2);
 }

@@ -6,6 +6,7 @@ use axum::http::{Request, StatusCode};
 use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::Manager;
 use codex_proxy_rs::quota::QuotaChecker;
+use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::CodexClient;
 use tower::util::ServiceExt;
 use url::Url;
@@ -35,6 +36,9 @@ fn build_state(api_keys: &[&str]) -> AppState {
         ),
         api_keys: Arc::new(keys),
         max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
     }
 }
 
@@ -122,7 +126,12 @@ async fn api_auth_middleware_protects_v1_routes() {
 
     let res = app
         .clone()
-        .oneshot(Request::builder().uri("/v1/models").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -144,7 +153,12 @@ async fn api_auth_middleware_protects_v1_routes() {
 async fn api_auth_middleware_does_not_protect_health() {
     let app = api::router(build_state(&["k1"]));
     let res = app
-        .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);

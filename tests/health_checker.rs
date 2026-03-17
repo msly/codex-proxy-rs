@@ -2,10 +2,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
-use axum::Router;
 use codex_proxy_rs::core::Manager;
 use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig};
 use url::Url;

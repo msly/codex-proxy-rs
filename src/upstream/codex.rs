@@ -43,6 +43,15 @@ impl CodexClient {
         Ok(u)
     }
 
+    pub fn responses_compact_url(&self) -> Result<Url, String> {
+        let mut u = self.base_url.clone();
+        let base_path = u.path().trim_end_matches('/');
+        u.set_path(&format!("{base_path}/responses/compact"));
+        u.set_query(None);
+        u.set_fragment(None);
+        Ok(u)
+    }
+
     pub async fn send_with_retry(
         &self,
         manager: &Manager,
@@ -176,10 +185,10 @@ fn is_retryable_status(code: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::extract::State;
     use axum::http::HeaderMap;
     use axum::routing::post;
-    use axum::Router;
     use axum::{body::Body, response::Response};
     use std::net::SocketAddr;
     use std::path::Path;
@@ -278,9 +287,9 @@ mod tests {
             .unwrap();
 
         let status = upstream.status();
-        let stream = upstream.bytes_stream().map(|chunk| {
-            chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
+        let stream = upstream
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
         let mut resp = Response::new(Body::from_stream(stream));
         *resp.status_mut() = status;
         resp.headers_mut().insert(

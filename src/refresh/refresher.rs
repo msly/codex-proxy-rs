@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use reqwest::Url;
 use serde::Deserialize;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-use crate::core::{parse_id_token_claims, TokenData};
+use crate::core::{TokenData, parse_id_token_claims};
 
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -126,9 +126,7 @@ impl Refresher {
 
         let (account_id, email, plan_type) = parse_id_token_claims(&token_resp.id_token);
         let expire = OffsetDateTime::now_utc() + time::Duration::seconds(token_resp.expires_in);
-        let expire_str = expire
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| String::new());
+        let expire_str = expire.format(&Rfc3339).unwrap_or_else(|_| String::new());
 
         Ok(TokenData {
             id_token: token_resp.id_token,
@@ -185,15 +183,15 @@ impl Refresher {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
     use super::*;
     use axum::extract::State;
     use axum::routing::post;
     use axum::{Form, Router};
+    use base64::Engine;
     use serde_json::json;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     #[derive(Clone, Default)]

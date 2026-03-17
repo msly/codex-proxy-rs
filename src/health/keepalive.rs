@@ -30,7 +30,11 @@ impl KeepAlive {
             .build()
             .map_err(|e| format!("构建 keepalive HTTP client 失败: {e}"))?;
 
-        Ok(Self { http, ping_url, cfg })
+        Ok(Self {
+            http,
+            ping_url,
+            cfg,
+        })
     }
 
     pub fn ping_url(&self) -> &Url {

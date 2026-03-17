@@ -6,6 +6,7 @@ use axum::http::{Request, StatusCode};
 use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::{Manager, QuotaInfo};
 use codex_proxy_rs::quota::QuotaChecker;
+use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::CodexClient;
 use tower::util::ServiceExt;
 use url::Url;
@@ -67,11 +68,19 @@ async fn api_stats_returns_cached_quota_raw_json() {
         ),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
     };
 
     let app = api::router(state);
     let res = app
-        .oneshot(Request::builder().uri("/stats").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -91,4 +100,3 @@ async fn api_stats_returns_cached_quota_raw_json() {
         12.34
     );
 }
-

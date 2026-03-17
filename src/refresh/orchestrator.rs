@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
-use crate::core::{now_unix_ms, Account, Manager};
+use crate::core::{Account, Manager, now_unix_ms};
 
 use super::refresher::{RefreshError, Refresher};
 use super::save::SaveQueue;
@@ -149,7 +149,10 @@ mod tests {
 
         let mut paths: Vec<String> = got.iter().map(|a| a.file_path().to_string()).collect();
         paths.sort();
-        assert_eq!(paths, vec!["invalid.json".to_string(), "near.json".to_string()]);
+        assert_eq!(
+            paths,
+            vec!["invalid.json".to_string(), "near.json".to_string()]
+        );
     }
 
     #[derive(Clone)]
@@ -171,7 +174,10 @@ mod tests {
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 "rate limited".to_string(),
             ),
-            "500" => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "oops".to_string()),
+            "500" => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "oops".to_string(),
+            ),
             _ => {
                 let id_token = build_test_id_token("acc-1", "a@example.com", "plus");
                 let body = json!({

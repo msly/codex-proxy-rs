@@ -384,7 +384,11 @@ mod tests {
         assert_eq!(snap.total_requests, 3);
         assert_eq!(snap.total_errors, 2);
         assert_eq!(snap.consecutive_failures, 0);
-        assert!((snap.used_percent - 12.34).abs() < 1e-6, "used_percent={}", snap.used_percent);
+        assert!(
+            (snap.used_percent - 12.34).abs() < 1e-6,
+            "used_percent={}",
+            snap.used_percent
+        );
         assert_eq!(snap.token_expire, "2099-01-01T00:00:00Z");
     }
 
@@ -418,6 +422,10 @@ mod tests {
             checked_at_ms: now_unix_ms(),
         });
 
-        assert!((acc.used_percent() - 12.34).abs() < 0.02, "used={}", acc.used_percent());
+        assert!(
+            (acc.used_percent() - 12.34).abs() < 0.02,
+            "used={}",
+            acc.used_percent()
+        );
     }
 }

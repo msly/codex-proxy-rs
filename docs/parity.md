@@ -12,10 +12,10 @@
 | `GET /v1/models` | ✅ | base models + thinking suffix + `-fast` 变体（fast no-op） |
 | `POST /v1/responses` | ✅ | stream/non-stream passthrough（含内部重试 SSE gate） |
 | `POST /v1/chat/completions` | ✅ | stream/non-stream（上游 Responses → Chat Completions 转换） |
-| `POST /refresh` | ❌ | Go 支持；Rust 未实现管理端点 |
-| `POST /v1/messages` | ❌ | Go 支持 Claude Messages API；Rust 未实现 |
-| `POST /v1/responses/compact` | ❌ | Go 支持；Rust 未实现 |
-| `/v1/responses` websocket upgrade | ❌ | Go 支持 fallback；Rust 未实现 |
+| `POST /refresh` | ✅ | SSE；强制刷新所有账号 Token（成功后会查询 quota） |
+| `POST /v1/messages` | ✅ | stream/non-stream（Codex Responses SSE → Claude Messages 格式） |
+| `POST /v1/responses/compact` | ✅ | stream/non-stream passthrough（上游 `/responses/compact`） |
+| `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
 
 ## 鉴权
 
@@ -38,7 +38,7 @@
 | 项 | Rust | 说明 |
 |---|---:|---|
 | OAuth refresh（/oauth/token） | ✅ | mock tests 覆盖 429/重试/不可重试 |
-| refresh loop（定时并发刷新） | ⚠️ | 刷新能力已实现，但未完全对齐 Go 的 loop/热加载策略 |
+| refresh loop（定时并发刷新） | ✅ | scan interval=min(30s, refresh-interval)，按规则过滤并并发刷新；支持 shutdown 取消 |
 | wham/usage quota cache | ✅ | raw JSON 缓存并提取 used_percent |
 | health checker loop | ✅ | mock tests 覆盖 401 移除 + cancel |
 | keepalive ping | ✅ | mock tests 覆盖 HEAD ping + cancel |
@@ -47,4 +47,3 @@
 
 - `-fast`：Rust 当前为 no-op（仅解析/剥离，不透传 `service_tier=fast`）。
 - Chat Completions 响应转换：已实现基础 text/tool_calls/usage 映射，但可能与 Go 在边界事件顺序/细节上仍有差异（需要更多 fixture 回归）。
-

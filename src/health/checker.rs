@@ -151,7 +151,10 @@ impl HealthChecker {
             .http
             .post(self.responses_url.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {access_token}"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {access_token}"),
+            )
             .header(reqwest::header::ACCEPT, "application/json")
             .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
             .header("Origin", "https://chatgpt.com")
@@ -213,7 +216,12 @@ impl HealthChecker {
                 if preview.len() > 120 {
                     preview.truncate(120);
                 }
-                tracing::warn!(email, status, body = preview, "health check unexpected status");
+                tracing::warn!(
+                    email,
+                    status,
+                    body = preview,
+                    "health check unexpected status"
+                );
             }
         }
     }

@@ -82,7 +82,11 @@ pub fn convert_stream_chunk(
         "response.reasoning_summary_text.delta" => {
             if let Some(delta) = root.get("delta").and_then(Value::as_str) {
                 set_delta_role_assistant(&mut chunk);
-                set_choice_delta(&mut chunk, "reasoning_content", Value::String(delta.to_string()));
+                set_choice_delta(
+                    &mut chunk,
+                    "reasoning_content",
+                    Value::String(delta.to_string()),
+                );
                 return vec![chunk.to_string()];
             }
             Vec::new()
@@ -97,12 +101,19 @@ pub fn convert_stream_chunk(
             vec![chunk.to_string()]
         }
         "response.reasoning.delta" | "response.reasoning_text.delta" => {
-            let delta = root.get("delta").and_then(Value::as_str).unwrap_or_default();
+            let delta = root
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if delta.is_empty() {
                 return Vec::new();
             }
             set_delta_role_assistant(&mut chunk);
-            set_choice_delta(&mut chunk, "reasoning_content", Value::String(delta.to_string()));
+            set_choice_delta(
+                &mut chunk,
+                "reasoning_content",
+                Value::String(delta.to_string()),
+            );
             vec![chunk.to_string()]
         }
         "response.output_text.delta" => {
@@ -223,7 +234,10 @@ pub fn convert_stream_chunk(
             set_finish_reason(&mut chunk, finish_reason);
 
             if let Some(usage) = root.get("response").and_then(|r| r.get("usage")) {
-                state.usage_input = usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0);
+                state.usage_input = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
                 state.usage_output = usage
                     .get("output_tokens")
                     .and_then(Value::as_i64)
@@ -266,12 +280,19 @@ pub fn convert_stream_chunk(
         }
         _ => {
             if typ.contains("reasoning") && typ.ends_with(".delta") {
-                let delta = root.get("delta").and_then(Value::as_str).unwrap_or_default();
+                let delta = root
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if delta.is_empty() {
                     return Vec::new();
                 }
                 set_delta_role_assistant(&mut chunk);
-                set_choice_delta(&mut chunk, "reasoning_content", Value::String(delta.to_string()));
+                set_choice_delta(
+                    &mut chunk,
+                    "reasoning_content",
+                    Value::String(delta.to_string()),
+                );
                 return vec![chunk.to_string()];
             }
             Vec::new()
@@ -293,7 +314,10 @@ pub fn convert_non_stream_response(
 
     let resp = root.get("response").unwrap_or(&Value::Null);
     let id = resp.get("id").and_then(Value::as_str).unwrap_or_default();
-    let model = resp.get("model").and_then(Value::as_str).unwrap_or_default();
+    let model = resp
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let created = resp
         .get("created_at")
         .and_then(Value::as_i64)
@@ -385,12 +409,22 @@ pub fn convert_non_stream_response(
                     }
                 }
                 "function_call" => {
-                    let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
-                    let mut name = item.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let mut name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     if let Some(orig) = reverse_tool_map.get(&name) {
                         name = orig.clone();
                     }
-                    let args = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
+                    let args = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",
