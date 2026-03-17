@@ -36,11 +36,24 @@ impl QuotaChecker {
             .build()
             .map_err(|e| format!("构建 quota HTTP client 失败: {e}"))?;
 
-        Ok(Self {
+        Ok(Self::new_with_http(usage_url, concurrency, http))
+    }
+
+    pub fn new_with_http(usage_url: Url, concurrency: usize, http: reqwest::Client) -> Self {
+        Self {
             http,
             concurrency: concurrency.max(1),
             usage_url,
-        })
+        }
+    }
+
+    pub fn new_with_config(
+        cfg: &crate::config::Config,
+        concurrency: usize,
+        http: reqwest::Client,
+    ) -> Result<Self, String> {
+        let usage_url = derive_usage_url(&cfg.base_url, &cfg.backend_domain)?;
+        Ok(Self::new_with_http(usage_url, concurrency, http))
     }
 
     pub fn usage_url(&self) -> &Url {

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>codex-proxy-rs</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica,
+          Arial, "Apple Color Emoji", "Segoe UI Emoji";
+        margin: 40px auto;
+        max-width: 880px;
+        padding: 0 16px;
+        line-height: 1.5;
+      }
+      code {
+        background: #f4f4f5;
+        padding: 0.15em 0.35em;
+        border-radius: 6px;
+      }
+      pre {
+        background: #0b1020;
+        color: #e6edf3;
+        padding: 14px 16px;
+        border-radius: 10px;
+        overflow: auto;
+      }
+      a {
+        color: #2563eb;
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>codex-proxy-rs</h1>
+    <p>Rust 重写版 codex-proxy：将 OpenAI 兼容请求转发到 ChatGPT Codex 后端。</p>
+
+    <h2>Endpoints</h2>
+    <ul>
+      <li><code>GET /health</code></li>
+      <li><code>GET /stats</code></li>
+      <li><code>POST /refresh</code></li>
+      <li><code>POST /check-quota</code></li>
+      <li><code>POST /v1/responses</code></li>
+      <li><code>POST /v1/chat/completions</code></li>
+      <li><code>POST /v1/messages</code></li>
+      <li><code>POST /v1/responses/compact</code></li>
+      <li><code>GET /v1/models</code></li>
+    </ul>
+
+    <h2>Quick Test</h2>
+    <pre><code>curl -sS http://127.0.0.1:8080/health</code></pre>
+
+    <p>更多用法见仓库内 <code>README.md</code>。</p>
+  </body>
+</html>
+

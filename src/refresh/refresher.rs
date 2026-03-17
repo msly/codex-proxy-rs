@@ -74,9 +74,12 @@ impl Refresher {
         let client = builder
             .build()
             .map_err(|e| format!("构建刷新 HTTP client 失败: {e}"))?;
-        let token_url = Url::parse(TOKEN_URL).expect("TOKEN_URL is valid");
+        Ok(Self::new_with_http(client))
+    }
 
-        Ok(Self { client, token_url })
+    pub fn new_with_http(client: reqwest::Client) -> Self {
+        let token_url = Url::parse(TOKEN_URL).expect("TOKEN_URL is valid");
+        Self { client, token_url }
     }
 
     pub fn with_token_url(mut self, token_url: Url) -> Self {

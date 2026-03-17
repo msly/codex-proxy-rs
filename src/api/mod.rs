@@ -9,6 +9,7 @@ use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgr
 use axum::http::header;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
+use axum::response::Html;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,6 +18,7 @@ use futures_util::StreamExt;
 use futures_util::stream::unfold;
 use serde::Serialize;
 use serde_json::json;
+use tower_http::compression::CompressionLayer;
 
 use crate::core::Manager;
 use crate::quota::QuotaChecker;
@@ -29,6 +31,8 @@ use crate::translate::{
 };
 use crate::upstream::codex::CodexClient;
 use crate::upstream::codex::UpstreamError;
+
+const INDEX_HTML: &str = include_str!("../../assets/index.html");
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -46,6 +50,7 @@ pub struct AppState {
     pub refresher: Refresher,
     pub save_queue: SaveQueue,
     pub refresh_concurrency: usize,
+    pub on_401: Option<crate::upstream::codex::On401Hook>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -63,11 +68,84 @@ pub fn router(state: AppState) -> Router {
         .route("/messages", post(v1_messages))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
-    Router::new()
+    let non_v1 = Router::new()
+        .route("/", get(index))
         .route("/health", get(health))
         .merge(mgmt)
+        .layer(CompressionLayer::new());
+
+    Router::new()
+        .merge(non_v1)
         .nest("/v1", v1)
+        .layer(middleware::from_fn(cors_and_options))
         .with_state(state)
+}
+
+async fn index() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+async fn cors_and_options(req: Request<Body>, next: Next) -> Response {
+    let origin = req
+        .headers()
+        .get("Origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("*")
+        .to_string();
+
+    if req.method() == axum::http::Method::OPTIONS {
+        let allow_methods = req
+            .headers()
+            .get("Access-Control-Request-Method")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("GET, POST, PUT, PATCH, DELETE, OPTIONS");
+
+        let allow_headers = req
+            .headers()
+            .get("Access-Control-Request-Headers")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Authorization, Content-Type");
+
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+        apply_cors_headers(resp.headers_mut(), &origin);
+        resp.headers_mut().insert(
+            "Access-Control-Allow-Methods",
+            axum::http::HeaderValue::from_str(allow_methods).unwrap_or(
+                axum::http::HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
+            ),
+        );
+        resp.headers_mut().insert(
+            "Access-Control-Allow-Headers",
+            axum::http::HeaderValue::from_str(allow_headers).unwrap_or(
+                axum::http::HeaderValue::from_static("Authorization, Content-Type"),
+            ),
+        );
+        resp.headers_mut().insert(
+            "Access-Control-Max-Age",
+            axum::http::HeaderValue::from_static("86400"),
+        );
+        return resp;
+    }
+
+    let mut resp = next.run(req).await;
+    apply_cors_headers(resp.headers_mut(), &origin);
+    resp
+}
+
+fn apply_cors_headers(headers: &mut HeaderMap, origin: &str) {
+    headers.insert(
+        "Access-Control-Allow-Origin",
+        axum::http::HeaderValue::from_str(origin)
+            .unwrap_or(axum::http::HeaderValue::from_static("*")),
+    );
+    headers.insert(header::VARY, axum::http::HeaderValue::from_static("Origin"));
 }
 
 async fn api_key_auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
@@ -264,6 +342,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             codex_body,
             stream,
             state.max_retry,
+            state.on_401.clone(),
         )
         .await
     {
@@ -474,6 +553,7 @@ async fn forward_responses_sse_as_ws(
             codex_body,
             true,
             state.max_retry,
+            state.on_401.clone(),
         )
         .await
         .map_err(ResponsesWsError::Upstream)?;
@@ -610,6 +690,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             codex_body,
             true,
             state.max_retry,
+            state.on_401.clone(),
         )
         .await
     {
@@ -777,6 +858,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             codex_body,
             stream,
             state.max_retry,
+            state.on_401.clone(),
         )
         .await
     {
@@ -928,6 +1010,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             codex_body,
             true,
             state.max_retry,
+            state.on_401.clone(),
         )
         .await
     {
@@ -941,6 +1024,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
     if stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
+        let account = account.clone();
         tokio::spawn(async move {
             let mut buf = Vec::<u8>::new();
             let mut state = StreamState::new(&base_model);
@@ -982,6 +1066,9 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             }
 
             if state.completed && (state.has_text || state.has_tool_call) {
+                if state.usage_input > 0 || state.usage_output > 0 {
+                    account.record_usage(state.usage_input, state.usage_output, state.usage_total);
+                }
                 let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
             }
         });
@@ -1039,6 +1126,25 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 "empty response",
                 "invalid_response",
             );
+        }
+
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
+            let usage = v.get("usage").unwrap_or(&serde_json::Value::Null);
+            let input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let total_tokens = usage
+                .get("total_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if input_tokens > 0 || output_tokens > 0 {
+                account.record_usage(input_tokens, output_tokens, total_tokens);
+            }
         }
 
         let mut resp = Response::new(Body::from(out));
@@ -1142,7 +1248,7 @@ async fn check_quota(
     let stream = unfold(rx, |mut rx| async move {
         let evt = rx.recv().await?;
         let json = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
-        Some((Ok(Event::default().data(json)), rx))
+        Some((Ok(Event::default().event(evt.event_type).data(json)), rx))
     });
 
     Sse::new(stream).keep_alive(
@@ -1166,7 +1272,7 @@ async fn refresh(
     let stream = unfold(rx, |mut rx| async move {
         let evt = rx.recv().await?;
         let json = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
-        Some((Ok(Event::default().data(json)), rx))
+        Some((Ok(Event::default().event(evt.event_type).data(json)), rx))
     });
 
     Sse::new(stream).keep_alive(
@@ -1325,15 +1431,36 @@ struct StatsQuota {
 }
 
 #[derive(Debug, Serialize)]
+struct StatsUsage {
+    total_completions: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct StatsAccount {
     file_path: String,
     email: String,
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_type: Option<String>,
     used_percent: f64,
     total_requests: i64,
     total_errors: i64,
     consecutive_failures: i64,
-    token_expire: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_refreshed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cooldown_until: Option<String>,
+    quota_exhausted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota_resets_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_expire: Option<String>,
+    usage: StatsUsage,
     #[serde(skip_serializing_if = "Option::is_none")]
     quota: Option<StatsQuota>,
 }
@@ -1346,6 +1473,7 @@ struct StatsResponse {
 
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let accounts = state.manager.accounts_snapshot();
+    let now_ms = crate::core::now_unix_ms();
 
     let mut out = Vec::with_capacity(accounts.len());
     let mut active = 0usize;
@@ -1360,6 +1488,18 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
             crate::core::AccountStatus::Disabled => disabled += 1,
         }
 
+        fn ms_to_rfc3339(ms: i64) -> Option<String> {
+            if ms <= 0 {
+                return None;
+            }
+            let dt = time::OffsetDateTime::from_unix_timestamp_nanos(
+                (ms as i128).saturating_mul(1_000_000),
+            )
+            .ok()?;
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        }
+
         let quota = acc.quota_info().map(|info| StatsQuota {
             valid: info.valid,
             status_code: info.status_code,
@@ -1371,15 +1511,44 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
             checked_at_ms: info.checked_at_ms,
         });
 
+        let mut quota_exhausted = snap.quota_exhausted;
+        if quota_exhausted && snap.quota_resets_at_ms > 0 && now_ms >= snap.quota_resets_at_ms {
+            quota_exhausted = false;
+        }
+
         out.push(StatsAccount {
             file_path: snap.file_path,
             email: snap.email,
             status: snap.status.as_str().to_string(),
+            plan_type: if snap.plan_type.is_empty() {
+                None
+            } else {
+                Some(snap.plan_type)
+            },
             used_percent: snap.used_percent,
             total_requests: snap.total_requests,
             total_errors: snap.total_errors,
             consecutive_failures: snap.consecutive_failures,
-            token_expire: snap.token_expire,
+            last_used_at: ms_to_rfc3339(snap.last_used_ms),
+            last_refreshed_at: ms_to_rfc3339(snap.last_refreshed_ms),
+            cooldown_until: ms_to_rfc3339(snap.cooldown_until_ms),
+            quota_exhausted,
+            quota_resets_at: if quota_exhausted {
+                ms_to_rfc3339(snap.quota_resets_at_ms)
+            } else {
+                None
+            },
+            token_expire: if snap.token_expire.is_empty() {
+                None
+            } else {
+                Some(snap.token_expire)
+            },
+            usage: StatsUsage {
+                total_completions: snap.usage_total_completions,
+                input_tokens: snap.usage_input_tokens,
+                output_tokens: snap.usage_output_tokens,
+                total_tokens: snap.usage_total_tokens,
+            },
             quota,
         });
     }
@@ -1429,6 +1598,7 @@ mod tests {
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
+            on_401: None,
         };
 
         let app = router(state);
@@ -1472,6 +1642,7 @@ mod tests {
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
+            on_401: None,
         };
 
         let app = router(state);
@@ -1499,8 +1670,12 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&bytes);
         assert!(
+            body.contains("event: done"),
+            "expected event: done framing, got body: {body}"
+        );
+        assert!(
             body.contains("\"type\":\"done\""),
-            "expected done event, got body: {body}"
+            "expected done payload, got body: {body}"
         );
     }
 }

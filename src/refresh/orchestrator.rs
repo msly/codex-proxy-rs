@@ -47,6 +47,25 @@ pub async fn refresh_account(
     account: Arc<Account>,
     max_retries: usize,
 ) -> Result<(), RefreshError> {
+    refresh_account_with_remove_reason(
+        manager,
+        refresher,
+        save_queue,
+        account,
+        max_retries,
+        "refresh_failed",
+    )
+    .await
+}
+
+pub async fn refresh_account_with_remove_reason(
+    manager: &Manager,
+    refresher: &Refresher,
+    save_queue: &SaveQueue,
+    account: Arc<Account>,
+    max_retries: usize,
+    remove_reason: &str,
+) -> Result<(), RefreshError> {
     if !account.try_begin_refresh() {
         return Ok(());
     }
@@ -79,7 +98,7 @@ pub async fn refresh_account(
             Err(err)
         }
         Err(err) => {
-            manager.remove_account(account.file_path(), "refresh_failed");
+            manager.remove_account(account.file_path(), remove_reason);
             Err(err)
         }
     }

@@ -99,7 +99,7 @@ impl Default for Config {
             max_conns_per_host: 512,
             max_idle_conns: 1024,
             max_idle_conns_per_host: 512,
-            enable_http2: true,
+            enable_http2: false,
             startup_async_load: true,
             accounts: Vec::new(),
             api_keys: Vec::new(),

@@ -82,6 +82,7 @@ async fn api_refresh_no_accounts_emits_done_event() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        on_401: None,
     };
 
     let app = api::router(state);
@@ -109,6 +110,10 @@ async fn api_refresh_no_accounts_emits_done_event() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
+    assert!(
+        body.contains("event: done"),
+        "expected event: done framing, got body: {body}"
+    );
     assert!(
         body.contains("\"type\":\"done\""),
         "expected done event, got body: {body}"
@@ -150,6 +155,7 @@ async fn api_refresh_with_account_emits_item_and_done_events() {
         refresher: Refresher::new("").unwrap().with_token_url(token_url),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 2,
+        on_401: None,
     };
 
     let app = api::router(state);
@@ -170,6 +176,14 @@ async fn api_refresh_with_account_emits_item_and_done_events() {
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
 
+    assert!(
+        body.contains("event: item"),
+        "expected event: item framing, got body: {body}"
+    );
+    assert!(
+        body.contains("event: done"),
+        "expected event: done framing, got body: {body}"
+    );
     assert!(
         body.contains("\"type\":\"item\""),
         "expected item event, got body: {body}"

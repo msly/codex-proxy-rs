@@ -4,9 +4,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig, KeepAlive, KeepAliveConfig};
-use codex_proxy_rs::refresh::{RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue};
+use codex_proxy_rs::refresh::{
+    RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue, refresh_account_with_remove_reason,
+};
 use codex_proxy_rs::{
-    api, config::Config, core::Manager, quota::QuotaChecker, upstream::codex::CodexClient,
+    api,
+    config::Config,
+    core::{Account, Manager},
+    net,
+    quota::QuotaChecker,
+    upstream::codex::{CodexClient, On401Hook},
 };
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -63,17 +70,38 @@ async fn main() -> Result<(), String> {
         );
     }
 
-    let quota_checker = Arc::new(QuotaChecker::new(
-        &cfg.base_url,
-        &cfg.backend_domain,
-        &cfg.proxy_url,
-        50,
-    )?);
-
     let base_url = Url::parse(&cfg.base_url).map_err(|e| format!("base-url 无效: {e}"))?;
-    let codex_client = Arc::new(CodexClient::new(base_url.clone(), &cfg.proxy_url)?);
-    let refresher = Refresher::new(&cfg.proxy_url)?;
+    let codex_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(5 * 60))?;
+    let codex_client = Arc::new(CodexClient::new_with_http(base_url.clone(), codex_http));
+
+    let quota_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(20))?;
+    let quota_checker = Arc::new(QuotaChecker::new_with_config(&cfg, 50, quota_http)?);
+
+    let refresh_http = net::build_generic_reqwest_client(&cfg, Duration::from_secs(30))?;
+    let refresher = Refresher::new_with_http(refresh_http);
     let save_queue = SaveQueue::start(4);
+
+    let on_401: On401Hook = {
+        let manager = manager.clone();
+        let refresher = refresher.clone();
+        let save_queue = save_queue.clone();
+        Arc::new(move |acc: Arc<Account>| {
+            let manager = manager.clone();
+            let refresher = refresher.clone();
+            let save_queue = save_queue.clone();
+            tokio::spawn(async move {
+                let _ = refresh_account_with_remove_reason(
+                    manager.as_ref(),
+                    &refresher,
+                    &save_queue,
+                    acc,
+                    2,
+                    "auth_401",
+                )
+                .await;
+            });
+        })
+    };
 
     let api_keys: HashSet<String> = cfg
         .api_keys
@@ -101,6 +129,7 @@ async fn main() -> Result<(), String> {
         refresher: refresher.clone(),
         save_queue: save_queue.clone(),
         refresh_concurrency: cfg.refresh_concurrency as usize,
+        on_401: Some(on_401),
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr())
         .await
@@ -136,9 +165,13 @@ async fn main() -> Result<(), String> {
     }
 
     if cfg.health_check_interval > 0 {
-        let hc = Arc::new(HealthChecker::new(
+        let health_http = net::build_backend_reqwest_client(
+            &cfg,
+            Duration::from_secs(cfg.health_check_request_timeout),
+        )?;
+        let hc = Arc::new(HealthChecker::new_with_http(
             base_url.clone(),
-            &cfg.proxy_url,
+            health_http,
             HealthCheckerConfig {
                 check_interval: Duration::from_secs(cfg.health_check_interval),
                 max_consecutive_failures: cfg.health_check_max_failures as i64,
@@ -147,7 +180,7 @@ async fn main() -> Result<(), String> {
                 batch_size: cfg.health_check_batch_size as usize,
                 request_timeout: Duration::from_secs(cfg.health_check_request_timeout),
             },
-        )?);
+        ));
 
         let manager = manager.clone();
         let rx = shutdown_rx.clone();
@@ -168,15 +201,16 @@ async fn main() -> Result<(), String> {
     ping_url.set_query(None);
     ping_url.set_fragment(None);
 
-    match KeepAlive::new(
-        ping_url,
-        &cfg.proxy_url,
-        KeepAliveConfig {
-            interval: Duration::from_secs(60),
-            request_timeout: Duration::from_secs(10),
-        },
-    ) {
-        Ok(ka) => {
+    match net::build_backend_reqwest_client(&cfg, Duration::from_secs(10)) {
+        Ok(keepalive_http) => {
+            let ka = KeepAlive::new_with_http(
+                ping_url,
+                keepalive_http,
+                KeepAliveConfig {
+                    interval: Duration::from_secs(60),
+                    request_timeout: Duration::from_secs(10),
+                },
+            );
             let rx = shutdown_rx.clone();
             tokio::spawn(async move {
                 ka.start_loop(rx).await;

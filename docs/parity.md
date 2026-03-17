@@ -6,6 +6,7 @@
 
 | 端点 | Rust | 说明 |
 |---|---:|---|
+| `GET /` | ✅ | embed `assets/index.html`（统计/展示首页） |
 | `GET /health` | ✅ | 不鉴权；返回 `status` + `accounts` |
 | `POST /check-quota` | ✅ | SSE；查询 wham/usage 并缓存 quota raw JSON |
 | `GET /stats` | ✅ | summary + accounts + quota raw JSON cache |
@@ -16,6 +17,14 @@
 | `POST /v1/messages` | ✅ | stream/non-stream（Codex Responses SSE → Claude Messages 格式） |
 | `POST /v1/responses/compact` | ✅ | stream/non-stream passthrough（上游 `/responses/compact`） |
 | `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
+
+## 中间件与基础行为
+
+| 项 | Rust | 说明 |
+|---|---:|---|
+| OPTIONS 预检直通 | ✅ | 全局 OPTIONS 返回 204；绕过 api-key 鉴权 |
+| CORS headers | ✅ | `Access-Control-Allow-Origin` + `Vary: Origin` |
+| gzip | ✅ | 仅 non-`/v1/*`；SSE 不压缩 |
 
 ## 鉴权
 
@@ -33,6 +42,29 @@
 | 内部重试切换账号 | ✅ | 400/403 不重试，其它可重试 |
 | SSE gate（2xx 前不写下游） | ✅ | integration test 已锁定 |
 
+## 上游请求头（Codex）
+
+| 项 | Rust | 说明 |
+|---|---:|---|
+| `Version` / `User-Agent` / `Origin` / `Referer` / `Originator` | ✅ | 与 Go 保持一致 |
+| `Session_id` | ✅ | 每次请求生成 UUID（对齐 Go） |
+
+## 上游失败副作用（账号状态）
+
+| 项 | Rust | 说明 |
+|---|---:|---|
+| 401 | ✅ | 30s 冷却 + 触发后台 refresh（失败按 `auth_401` 移除） |
+| 429 | ✅ | 解析 `resets_at`/`resets_in_seconds` → quota 冷却，并标记 `quota_exhausted` |
+| 403 | ✅ | 5min 冷却；403 不重试 |
+
+## `/stats` schema
+
+| 项 | Rust | 说明 |
+|---|---:|---|
+| `plan_type` / `last_used_at` / `last_refreshed_at` / `cooldown_until` | ✅ | UI 关键字段补齐 |
+| `quota_exhausted` / `quota_resets_at` | ✅ | 429 冷却对齐 |
+| `usage.*` | ✅ | completions/input/output/total tokens 统计 |
+
 ## Token 刷新 / 配额 / 健康检查
 
 | 项 | Rust | 说明 |
@@ -43,7 +75,13 @@
 | health checker loop | ✅ | mock tests 覆盖 401 移除 + cancel |
 | keepalive ping | ✅ | mock tests 覆盖 HEAD ping + cancel |
 
+## 网络配置（transport knobs）
+
+对齐说明见 `docs/network.md`。
+
 ## 语义差异（已知）
 
 - `-fast`：Rust 当前为 no-op（仅解析/剥离，不透传 `service_tier=fast`）。
+- `max-conns-per-host`：Go 使用 `Transport.MaxConnsPerHost`；Rust（reqwest）暂无等价项，当前不强制限制（已在 `docs/network.md` 标注）。
+- `/check-quota`：Rust 会更新 used_percent 排序缓存；Go 当前实现只更新 quota raw_data（不刷新 used_percent cache）。如需严格对齐，可单独调整为 Go 行为并补测试。
 - Chat Completions 响应转换：已实现基础 text/tool_calls/usage 映射，但可能与 Go 在边界事件顺序/细节上仍有差异（需要更多 fixture 回归）。

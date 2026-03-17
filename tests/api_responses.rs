@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::State;
@@ -10,7 +10,7 @@ use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::Manager;
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
-use codex_proxy_rs::upstream::codex::CodexClient;
+use codex_proxy_rs::upstream::codex::{CodexClient, On401Hook};
 use tower::util::ServiceExt;
 use url::Url;
 
@@ -91,6 +91,18 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
     let manager = Arc::new(Manager::new(dir.path()));
     manager.load_accounts().unwrap();
 
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hook_calls2 = hook_calls.clone();
+    let seen2 = seen.clone();
+    let on_401: On401Hook = Arc::new(move |acc| {
+        hook_calls2.fetch_add(1, Ordering::Relaxed);
+        seen2
+            .lock()
+            .expect("mutex poisoned")
+            .push(acc.file_path().to_string());
+    });
+
     let state = AppState {
         manager: manager.clone(),
         quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
@@ -100,6 +112,7 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        on_401: Some(on_401),
     };
 
     let app = api::router(state);
@@ -137,6 +150,14 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
     let body = String::from_utf8_lossy(&bytes);
     assert_eq!(body, "data: ok\n\n");
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+    assert!(
+        seen.lock()
+            .expect("mutex poisoned")
+            .iter()
+            .any(|p| p.ends_with("a.json")),
+        "expected hook called with a.json"
+    );
 }
 
 #[tokio::test]
@@ -160,6 +181,7 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        on_401: None,
     };
 
     let app = api::router(state);

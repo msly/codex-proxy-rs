@@ -39,6 +39,7 @@ fn build_state(api_keys: &[&str]) -> AppState {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        on_401: None,
     }
 }
 

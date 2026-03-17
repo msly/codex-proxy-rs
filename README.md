@@ -91,10 +91,16 @@ health-check-start-delay: 45
 health-check-batch-size: 20
 health-check-request-timeout: 8
 
-# 其他配置项仍保留以对齐 Go（部分未完全接入）
+# 网络配置（对齐说明见 docs/network.md）
+enable-http2: false
+# backend-resolve-address: "1.2.3.4" # or "host:port"
+max-conns-per-host: 512
+max-idle-conns: 1024
+max-idle-conns-per-host: 512
+
+# 其他配置项
 refresh-interval: 3000
 refresh-concurrency: 50
-enable-http2: true
 startup-async-load: true
 ```
 

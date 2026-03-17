@@ -30,11 +30,15 @@ impl KeepAlive {
             .build()
             .map_err(|e| format!("构建 keepalive HTTP client 失败: {e}"))?;
 
-        Ok(Self {
+        Ok(Self::new_with_http(ping_url, http, cfg))
+    }
+
+    pub fn new_with_http(ping_url: Url, http: reqwest::Client, cfg: KeepAliveConfig) -> Self {
+        Self {
             http,
             ping_url,
             cfg,
-        })
+        }
     }
 
     pub fn ping_url(&self) -> &Url {

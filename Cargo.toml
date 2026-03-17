@@ -16,9 +16,12 @@ time = { version = "0.3.34", features = ["formatting", "parsing"] }
 tokio = { version = "1.44.2", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tower-http = { version = "0.6.8", features = ["compression-gzip"] }
 url = "2.5.7"
+uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]
+flate2 = "1.0"
 tempfile = "3.19.1"
 tower = { version = "0.5.2", features = ["util"] }
 tokio-tungstenite = "0.26.2"

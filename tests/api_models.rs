@@ -36,6 +36,7 @@ fn build_state() -> AppState {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        on_401: None,
     }
 }
 

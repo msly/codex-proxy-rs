@@ -79,9 +79,19 @@ pub struct Account {
     cooldown_until_ms: AtomicI64,
     used_percent_x100: AtomicI64, // -100 means unknown (-1.00%)
 
+    last_used_ms: AtomicI64,
+
+    quota_exhausted: AtomicI32,
+    quota_resets_at_ms: AtomicI64,
+
     consecutive_failures: AtomicI64,
     total_requests: AtomicI64,
     total_errors: AtomicI64,
+
+    total_completions: AtomicI64,
+    input_tokens: AtomicI64,
+    output_tokens: AtomicI64,
+    total_tokens: AtomicI64,
 
     refreshing: AtomicI32,
     last_refresh_ms: AtomicI64,
@@ -96,9 +106,16 @@ impl Account {
             status: AtomicI32::new(AccountStatus::Active as i32),
             cooldown_until_ms: AtomicI64::new(0),
             used_percent_x100: AtomicI64::new(-100),
+            last_used_ms: AtomicI64::new(0),
+            quota_exhausted: AtomicI32::new(0),
+            quota_resets_at_ms: AtomicI64::new(0),
             consecutive_failures: AtomicI64::new(0),
             total_requests: AtomicI64::new(0),
             total_errors: AtomicI64::new(0),
+            total_completions: AtomicI64::new(0),
+            input_tokens: AtomicI64::new(0),
+            output_tokens: AtomicI64::new(0),
+            total_tokens: AtomicI64::new(0),
             refreshing: AtomicI32::new(0),
             last_refresh_ms: AtomicI64::new(0),
         }
@@ -136,6 +153,52 @@ impl Account {
         self.used_percent_x100() as f64 / 100.0
     }
 
+    pub fn cooldown_until_ms(&self) -> i64 {
+        self.cooldown_until_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn last_used_ms(&self) -> i64 {
+        self.last_used_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn quota_exhausted(&self) -> bool {
+        self.quota_exhausted.load(Ordering::Relaxed) != 0
+    }
+
+    pub fn quota_resets_at_ms(&self) -> i64 {
+        self.quota_resets_at_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn quota_exhausted_effective(&self, now_ms: i64) -> bool {
+        if !self.quota_exhausted() {
+            return false;
+        }
+        let resets_at = self.quota_resets_at_ms();
+        if resets_at > 0 && now_ms >= resets_at {
+            return false;
+        }
+        true
+    }
+
+    pub fn record_usage(&self, input_tokens: i64, output_tokens: i64, total_tokens: i64) {
+        self.total_completions.fetch_add(1, Ordering::Relaxed);
+        if input_tokens > 0 {
+            self.input_tokens.fetch_add(input_tokens, Ordering::Relaxed);
+        }
+        if output_tokens > 0 {
+            self.output_tokens
+                .fetch_add(output_tokens, Ordering::Relaxed);
+        }
+        if total_tokens > 0 {
+            self.total_tokens.fetch_add(total_tokens, Ordering::Relaxed);
+        } else if input_tokens > 0 || output_tokens > 0 {
+            self.total_tokens.fetch_add(
+                input_tokens.saturating_add(output_tokens),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     pub fn set_used_percent_for_test(&self, percent: Option<f64>) {
         let v = match percent {
             None => -100,
@@ -159,10 +222,25 @@ impl Account {
         self.cooldown_until_ms.store(until_ms, Ordering::Relaxed);
     }
 
-    pub fn set_active(&self) {
+    pub fn set_quota_cooldown(&self, duration_ms: i64, now_ms: i64) {
+        let until_ms = now_ms.saturating_add(duration_ms);
+        self.set_cooldown(duration_ms, now_ms);
+        self.quota_exhausted.store(1, Ordering::Relaxed);
+        self.quota_resets_at_ms.store(until_ms, Ordering::Relaxed);
+        self.used_percent_x100.store(10000, Ordering::Relaxed); // 100.00%
+    }
+
+    fn set_status_active(&self) {
         self.status
             .store(AccountStatus::Active as i32, Ordering::Relaxed);
         self.cooldown_until_ms.store(0, Ordering::Relaxed);
+    }
+
+    pub fn set_active(&self) {
+        self.set_status_active();
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.quota_exhausted.store(0, Ordering::Relaxed);
+        self.quota_resets_at_ms.store(0, Ordering::Relaxed);
     }
 
     pub fn last_refresh_ms(&self) -> i64 {
@@ -192,7 +270,7 @@ impl Account {
         *guard = token;
         drop(guard);
 
-        self.set_active();
+        self.set_status_active();
         self.last_refresh_ms.store(now_ms, Ordering::Relaxed);
     }
 
@@ -226,14 +304,14 @@ impl Account {
     pub fn record_success(&self, now_ms: i64) {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Relaxed);
-        let _ = now_ms;
+        self.last_used_ms.store(now_ms, Ordering::Relaxed);
     }
 
     pub fn record_failure(&self, now_ms: i64) -> i64 {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
         self.total_errors.fetch_add(1, Ordering::Relaxed);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = now_ms;
+        self.last_used_ms.store(now_ms, Ordering::Relaxed);
         failures
     }
 
@@ -255,10 +333,20 @@ impl Account {
             file_path: self.file_path.clone(),
             email: token.email.clone(),
             status: self.status(),
+            plan_type: token.plan_type.clone(),
             used_percent: self.used_percent(),
             total_requests: self.total_requests(),
             total_errors: self.total_errors(),
             consecutive_failures: self.consecutive_failures(),
+            last_used_ms: self.last_used_ms(),
+            last_refreshed_ms: self.last_refresh_ms(),
+            cooldown_until_ms: self.cooldown_until_ms(),
+            quota_exhausted: self.quota_exhausted(),
+            quota_resets_at_ms: self.quota_resets_at_ms(),
+            usage_total_completions: self.total_completions.load(Ordering::Relaxed),
+            usage_input_tokens: self.input_tokens.load(Ordering::Relaxed),
+            usage_output_tokens: self.output_tokens.load(Ordering::Relaxed),
+            usage_total_tokens: self.total_tokens.load(Ordering::Relaxed),
             token_expire: token.expired.clone(),
         }
     }
@@ -269,10 +357,20 @@ pub struct AccountStatsSnapshot {
     pub file_path: String,
     pub email: String,
     pub status: AccountStatus,
+    pub plan_type: String,
     pub used_percent: f64,
     pub total_requests: i64,
     pub total_errors: i64,
     pub consecutive_failures: i64,
+    pub last_used_ms: i64,
+    pub last_refreshed_ms: i64,
+    pub cooldown_until_ms: i64,
+    pub quota_exhausted: bool,
+    pub quota_resets_at_ms: i64,
+    pub usage_total_completions: i64,
+    pub usage_input_tokens: i64,
+    pub usage_output_tokens: i64,
+    pub usage_total_tokens: i64,
     pub token_expire: String,
 }
 

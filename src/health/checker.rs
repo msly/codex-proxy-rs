@@ -28,12 +28,6 @@ pub struct HealthChecker {
 
 impl HealthChecker {
     pub fn new(base_url: Url, proxy_url: &str, cfg: HealthCheckerConfig) -> Result<Self, String> {
-        let mut responses_url = base_url;
-        let base_path = responses_url.path().trim_end_matches('/');
-        responses_url.set_path(&format!("{base_path}/responses"));
-        responses_url.set_query(None);
-        responses_url.set_fragment(None);
-
         let mut builder = reqwest::Client::builder().timeout(cfg.request_timeout);
         if !proxy_url.trim().is_empty() {
             match reqwest::Proxy::all(proxy_url) {
@@ -46,12 +40,25 @@ impl HealthChecker {
             .build()
             .map_err(|e| format!("构建 health HTTP client 失败: {e}"))?;
 
-        Ok(Self {
+        Ok(Self::new_with_http(base_url, http, cfg))
+    }
+
+    pub fn new_with_http(
+        mut base_url: Url,
+        http: reqwest::Client,
+        cfg: HealthCheckerConfig,
+    ) -> Self {
+        let base_path = base_url.path().trim_end_matches('/');
+        base_url.set_path(&format!("{base_path}/responses"));
+        base_url.set_query(None);
+        base_url.set_fragment(None);
+
+        Self {
             http,
-            responses_url,
+            responses_url: base_url,
             cfg,
             cursor: Arc::new(AtomicU64::new(0)),
-        })
+        }
     }
 
     pub fn responses_url(&self) -> &Url {
@@ -202,7 +209,7 @@ impl HealthChecker {
             }
             429 => {
                 let cooldown_ms = parse_retry_after_ms(&body, 60_000);
-                acc.set_cooldown(cooldown_ms, now_ms);
+                acc.set_quota_cooldown(cooldown_ms, now_ms);
                 tracing::info!(email, cooldown_ms, "health check 429 (cooldown)");
             }
             200..=299 => {

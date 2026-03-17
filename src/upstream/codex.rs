@@ -4,11 +4,15 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::Url;
+use serde_json::Value;
+use uuid::Uuid;
 
 use crate::core::{Account, Manager};
 
 pub const CODEX_CLIENT_VERSION: &str = "0.101.0";
 pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
+
+pub type On401Hook = Arc<dyn Fn(Arc<Account>) + Send + Sync>;
 
 #[derive(Debug, Clone)]
 pub struct CodexClient {
@@ -31,7 +35,11 @@ impl CodexClient {
             .build()
             .map_err(|e| format!("构建 upstream HTTP client 失败: {e}"))?;
 
-        Ok(Self { http, base_url })
+        Ok(Self::new_with_http(base_url, http))
+    }
+
+    pub fn new_with_http(base_url: Url, http: reqwest::Client) -> Self {
+        Self { http, base_url }
     }
 
     pub fn responses_url(&self) -> Result<Url, String> {
@@ -60,6 +68,7 @@ impl CodexClient {
         body: Vec<u8>,
         stream: bool,
         max_retry: usize,
+        on_401: Option<On401Hook>,
     ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
         let mut excluded = HashSet::<String>::new();
         let max_attempts = max_retry.saturating_add(1).max(1);
@@ -80,6 +89,7 @@ impl CodexClient {
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
                 .header("Version", CODEX_CLIENT_VERSION)
+                .header("Session_id", Uuid::new_v4().to_string())
                 .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
                 .header("Origin", "https://chatgpt.com")
                 .header(reqwest::header::REFERER, "https://chatgpt.com/")
@@ -133,6 +143,8 @@ impl CodexClient {
             let now_ms = crate::core::now_unix_ms();
             account.record_failure(now_ms);
 
+            apply_retry_side_effects(&account, status, &err_body, now_ms, on_401.as_ref());
+
             if is_retryable_status(status) && attempt < max_attempts - 1 {
                 continue;
             }
@@ -182,6 +194,60 @@ fn is_retryable_status(code: u16) -> bool {
     }
 }
 
+fn apply_retry_side_effects(
+    account: &Arc<Account>,
+    status: u16,
+    err_body: &[u8],
+    now_ms: i64,
+    on_401: Option<&On401Hook>,
+) {
+    match status {
+        401 => {
+            account.set_cooldown(30_000, now_ms);
+            if let Some(h) = on_401 {
+                h(account.clone());
+            }
+        }
+        429 => {
+            let cooldown_ms = parse_retry_after_ms(err_body, now_ms, 60_000);
+            account.set_quota_cooldown(cooldown_ms, now_ms);
+        }
+        403 => {
+            account.set_cooldown(5 * 60_000, now_ms);
+        }
+        _ => {}
+    }
+}
+
+fn parse_retry_after_ms(body: &[u8], now_ms: i64, default_ms: i64) -> i64 {
+    let v: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return default_ms,
+    };
+
+    if let Some(resets_at) = v
+        .get("error")
+        .and_then(|e| e.get("resets_at"))
+        .and_then(Value::as_i64)
+    {
+        let now_s = (now_ms / 1000).max(0);
+        if resets_at > now_s {
+            return (resets_at - now_s).saturating_mul(1000);
+        }
+    }
+    if let Some(seconds) = v
+        .get("error")
+        .and_then(|e| e.get("resets_in_seconds"))
+        .and_then(Value::as_i64)
+    {
+        if seconds > 0 {
+            return seconds.saturating_mul(1000);
+        }
+    }
+
+    default_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +258,7 @@ mod tests {
     use axum::{body::Body, response::Response};
     use std::net::SocketAddr;
     use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
@@ -204,6 +271,72 @@ mod tests {
         State(state): State<UpstreamState>,
         headers: HeaderMap,
     ) -> (axum::http::StatusCode, &'static str) {
+        let version = headers
+            .get("Version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if version != CODEX_CLIENT_VERSION {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing/bad Version header",
+            );
+        }
+
+        let session_id = headers
+            .get("Session_id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if Uuid::parse_str(session_id).is_err() {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing/bad Session_id header",
+            );
+        }
+
+        let ua = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if ua != CODEX_USER_AGENT {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing/bad User-Agent header",
+            );
+        }
+
+        let origin = headers
+            .get("Origin")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if origin != "https://chatgpt.com" {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing/bad Origin header",
+            );
+        }
+
+        let referer = headers
+            .get(axum::http::header::REFERER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if referer != "https://chatgpt.com/" {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing/bad Referer header",
+            );
+        }
+
+        let originator = headers
+            .get("Originator")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if originator != "codex_cli_rs" {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "missing/bad Originator header",
+            );
+        }
+
         state.calls.fetch_add(1, Ordering::Relaxed);
         let auth = headers
             .get(axum::http::header::AUTHORIZATION)
@@ -211,6 +344,10 @@ mod tests {
             .unwrap_or("");
         match auth {
             "Bearer at1" => (axum::http::StatusCode::UNAUTHORIZED, "unauthorized"),
+            "Bearer at429" => (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                r#"{"error":{"resets_in_seconds":7}}"#,
+            ),
             "Bearer at2" => (axum::http::StatusCode::OK, "data: ok\n\n"),
             _ => (axum::http::StatusCode::FORBIDDEN, "forbidden"),
         }
@@ -261,7 +398,7 @@ mod tests {
         let url = client.responses_url().unwrap();
 
         let (resp, _acc, attempts) = client
-            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1)
+            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1, None)
             .await
             .expect("should succeed on second attempt");
 
@@ -270,6 +407,174 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert_eq!(body, "data: ok\n\n");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_invokes_on_401_hook_and_sets_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base_url = start_upstream(calls.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at1").await;
+        write_auth_file(dir.path(), "b.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let hook_calls2 = hook_calls.clone();
+        let seen2 = seen.clone();
+        let on_401: On401Hook = Arc::new(move |acc: Arc<Account>| {
+            hook_calls2.fetch_add(1, Ordering::Relaxed);
+            seen2
+                .lock()
+                .expect("mutex poisoned")
+                .push(acc.file_path().to_string());
+        });
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                Some(on_401),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            seen.lock()
+                .expect("mutex poisoned")
+                .iter()
+                .any(|p| p.ends_with("a.json")),
+            "expected hook called with a.json"
+        );
+
+        let snap = manager.accounts_snapshot();
+        let a = snap
+            .iter()
+            .find(|a| a.file_path().ends_with("a.json"))
+            .unwrap();
+        assert_eq!(a.status(), crate::core::AccountStatus::Cooldown);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_sets_quota_cooldown_on_429() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base_url = start_upstream(calls.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at429").await;
+        write_auth_file(dir.path(), "b.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1, None)
+            .await
+            .expect("should retry on 429 and succeed");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let snap = manager.accounts_snapshot();
+        let a = snap
+            .iter()
+            .find(|a| a.file_path().ends_with("a.json"))
+            .unwrap();
+        assert_eq!(a.status(), crate::core::AccountStatus::Cooldown);
+        assert_eq!(a.used_percent_x100(), 10000);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_does_not_retry_on_403() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base_url = start_upstream(calls.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at403").await;
+        write_auth_file(dir.path(), "b.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let err = client
+            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1, None)
+            .await
+            .expect_err("403 should be non-retryable");
+        match err {
+            UpstreamError::Status { code, .. } => assert_eq!(code, 403),
+            _ => panic!("expected status error, got: {err:?}"),
+        }
+
+        let snap = manager.accounts_snapshot();
+        let a = snap
+            .iter()
+            .find(|a| a.file_path().ends_with("a.json"))
+            .unwrap();
+        assert_eq!(a.status(), crate::core::AccountStatus::Cooldown);
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn upstream_parse_retry_after_ms_defaults_when_body_empty() {
+        assert_eq!(parse_retry_after_ms(b"", 1_700_000_000_000, 60_000), 60_000);
+    }
+
+    #[test]
+    fn upstream_parse_retry_after_ms_prefers_resets_at_over_resets_in_seconds() {
+        let now_ms = 1_700_000_000_000i64;
+        let now_s = now_ms / 1000;
+        let body = serde_json::json!({
+            "error": {
+                "resets_at": now_s + 10,
+                "resets_in_seconds": 999
+            }
+        });
+        assert_eq!(
+            parse_retry_after_ms(body.to_string().as_bytes(), now_ms, 60_000),
+            10_000
+        );
+    }
+
+    #[test]
+    fn upstream_parse_retry_after_ms_uses_resets_in_seconds_when_resets_at_past() {
+        let now_ms = 1_700_000_000_000i64;
+        let now_s = now_ms / 1000;
+        let body = serde_json::json!({
+            "error": {
+                "resets_at": now_s - 10,
+                "resets_in_seconds": 7
+            }
+        });
+        assert_eq!(
+            parse_retry_after_ms(body.to_string().as_bytes(), now_ms, 60_000),
+            7_000
+        );
     }
 
     #[derive(Clone)]
@@ -282,7 +587,15 @@ mod tests {
         let url = state.client.responses_url().unwrap();
         let (upstream, _acc, _attempts) = state
             .client
-            .send_with_retry(&state.manager, "gpt-4.1", url, b"{}".to_vec(), true, 1)
+            .send_with_retry(
+                &state.manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                None,
+            )
             .await
             .unwrap();
 
