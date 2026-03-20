@@ -9,8 +9,8 @@
 | `GET /` | ✅ | embed `assets/index.html`（统计/展示首页） |
 | `GET /health` | ✅ | 不鉴权；返回 `status` + `accounts` |
 | `POST /check-quota` | ✅ | SSE；查询 wham/usage 并缓存 quota raw JSON |
-| `GET /stats` | ✅ | summary + accounts + quota raw JSON cache |
-| `GET /v1/models` | ✅ | base models + thinking suffix + `-fast` 变体（fast no-op） |
+| `GET /stats` | ✅ | summary + rpm + token totals + accounts + quota raw JSON cache |
+| `GET /v1/models` | ✅ | Go 同款 per-model suffix matrix + `gpt-5.4-mini` + `-fast` |
 | `POST /v1/responses` | ✅ | stream/non-stream passthrough（含内部重试 SSE gate） |
 | `POST /v1/chat/completions` | ✅ | stream/non-stream（上游 Responses → Chat Completions 转换） |
 | `POST /refresh` | ✅ | SSE；强制刷新所有账号 Token（成功后会查询 quota） |
@@ -39,7 +39,9 @@
 |---|---:|---|
 | `auth-dir` 加载 `*.json` | ✅ | 跳过非法文件；缺 refresh_token 的文件会被跳过 |
 | Round-robin 选择器 | ✅ | used_percent 排序（unknown 排最后） |
+| Quota-first 选择器 | ✅ | `selector: quota-first` 按 used_percent 最低优先 |
 | 内部重试切换账号 | ✅ | 400/403 不重试，其它可重试 |
+| non-stream 空响应换号重试 | ✅ | `empty-retry-max` 仅用于 Chat Completions 非流式 |
 | SSE gate（2xx 前不写下游） | ✅ | integration test 已锁定 |
 
 ## 上游请求头（Codex）
@@ -53,14 +55,16 @@
 
 | 项 | Rust | 说明 |
 |---|---:|---|
-| 401 | ✅ | 30s 冷却 + 触发后台 refresh（失败按 `auth_401` 移除） |
-| 429 | ✅ | 解析 `resets_at`/`resets_in_seconds` → quota 冷却，并标记 `quota_exhausted` |
+| 401 | ✅ | `cooldown-401-sec` + 后台 refresh（失败按 `auth_401` 移除） |
+| 429 | ✅ | 解析 `resets_at`/`resets_in_seconds`，默认回退 `cooldown-429-sec` |
 | 403 | ✅ | 5min 冷却；403 不重试 |
 
 ## `/stats` schema
 
 | 项 | Rust | 说明 |
 |---|---:|---|
+| `summary.rpm` | ✅ | 每个 `AppState` 独立统计最近一分钟成功请求数 |
+| `summary.total_input_tokens` / `summary.total_output_tokens` | ✅ | 汇总账号 usage 统计 |
 | `plan_type` / `last_used_at` / `last_refreshed_at` / `cooldown_until` | ✅ | UI 关键字段补齐 |
 | `quota_exhausted` / `quota_resets_at` | ✅ | 429 冷却对齐 |
 | `usage.*` | ✅ | completions/input/output/total tokens 统计 |
@@ -70,10 +74,10 @@
 | 项 | Rust | 说明 |
 |---|---:|---|
 | OAuth refresh（/oauth/token） | ✅ | mock tests 覆盖 429/重试/不可重试 |
-| refresh loop（定时并发刷新） | ✅ | scan interval=min(30s, refresh-interval)，按规则过滤并并发刷新；支持 shutdown 取消 |
+| refresh loop（定时并发刷新） | ✅ | `auth-scan-interval`、`refresh-batch-size`、`cooldown-429-sec` 已接线；支持 shutdown 取消 |
 | wham/usage quota cache | ✅ | raw JSON 缓存并提取 used_percent |
 | health checker loop | ✅ | mock tests 覆盖 401 移除 + cancel |
-| keepalive ping | ✅ | mock tests 覆盖 HEAD ping + cancel |
+| keepalive ping | ✅ | `keepalive-interval` 已接线；mock tests 覆盖 HEAD ping + cancel |
 
 ## 网络配置（transport knobs）
 
@@ -81,7 +85,7 @@
 
 ## 语义差异（已知）
 
-- `-fast`：Rust 当前为 no-op（仅解析/剥离，不透传 `service_tier=fast`）。
 - `max-conns-per-host`：Go 使用 `Transport.MaxConnsPerHost`；Rust（reqwest）暂无等价项，当前不强制限制（已在 `docs/network.md` 标注）。
 - `/check-quota`：Rust 会更新 used_percent 排序缓存；Go 当前实现只更新 quota raw_data（不刷新 used_percent cache）。如需严格对齐，可单独调整为 Go 行为并补测试。
+- `stream-idle-timeout-sec` / `enable-stream-idle-retry`：当前 Go/Rust 都保留了配置面，但执行层尚未真正消费这两个参数。
 - Chat Completions 响应转换：已实现基础 text/tool_calls/usage 映射，但可能与 Go 在边界事件顺序/细节上仍有差异（需要更多 fixture 回归）。

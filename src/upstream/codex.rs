@@ -15,9 +15,27 @@ pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) 
 pub type On401Hook = Arc<dyn Fn(Arc<Account>) + Send + Sync>;
 
 #[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub cooldown_401_ms: i64,
+    pub default_cooldown_429_ms: i64,
+    pub header_timeout: Option<Duration>,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            cooldown_401_ms: 30_000,
+            default_cooldown_429_ms: 60_000,
+            header_timeout: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CodexClient {
     http: reqwest::Client,
     base_url: Url,
+    retry_policy: RetryPolicy,
 }
 
 impl CodexClient {
@@ -39,7 +57,19 @@ impl CodexClient {
     }
 
     pub fn new_with_http(base_url: Url, http: reqwest::Client) -> Self {
-        Self { http, base_url }
+        Self::new_with_http_and_policy(base_url, http, RetryPolicy::default())
+    }
+
+    pub fn new_with_http_and_policy(
+        base_url: Url,
+        http: reqwest::Client,
+        retry_policy: RetryPolicy,
+    ) -> Self {
+        Self {
+            http,
+            base_url,
+            retry_policy,
+        }
     }
 
     pub fn responses_url(&self) -> Result<Url, String> {
@@ -70,7 +100,31 @@ impl CodexClient {
         max_retry: usize,
         on_401: Option<On401Hook>,
     ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
-        let mut excluded = HashSet::<String>::new();
+        self.send_with_retry_excluding(
+            manager,
+            model,
+            url,
+            body,
+            stream,
+            max_retry,
+            on_401,
+            &HashSet::new(),
+        )
+        .await
+    }
+
+    pub async fn send_with_retry_excluding(
+        &self,
+        manager: &Manager,
+        model: &str,
+        url: Url,
+        body: Vec<u8>,
+        stream: bool,
+        max_retry: usize,
+        on_401: Option<On401Hook>,
+        initial_excluded: &HashSet<String>,
+    ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
+        let mut excluded = initial_excluded.clone();
         let max_attempts = max_retry.saturating_add(1).max(1);
         let mut last_err: Option<UpstreamError> = None;
 
@@ -106,7 +160,26 @@ impl CodexClient {
                 req = req.header("Chatgpt-Account-Id", account_id);
             }
 
-            let resp = match req.send().await {
+            let send_result = match self.retry_policy.header_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, req.send()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let now_ms = crate::core::now_unix_ms();
+                        account.record_failure(now_ms);
+                        last_err = Some(UpstreamError::Network(format!(
+                            "等待上游响应超时: {}s",
+                            timeout.as_secs()
+                        )));
+                        if attempt < max_attempts - 1 {
+                            continue;
+                        }
+                        break;
+                    }
+                },
+                None => req.send().await,
+            };
+
+            let resp = match send_result {
                 Ok(resp) => resp,
                 Err(err) => {
                     let now_ms = crate::core::now_unix_ms();
@@ -143,7 +216,7 @@ impl CodexClient {
             let now_ms = crate::core::now_unix_ms();
             account.record_failure(now_ms);
 
-            apply_retry_side_effects(&account, status, &err_body, now_ms, on_401.as_ref());
+            self.apply_retry_side_effects(&account, status, &err_body, now_ms, on_401.as_ref());
 
             if is_retryable_status(status) && attempt < max_attempts - 1 {
                 continue;
@@ -158,6 +231,36 @@ impl CodexClient {
         }
 
         Err(last_err.unwrap_or_else(|| UpstreamError::Network("请求失败".to_string())))
+    }
+
+    fn apply_retry_side_effects(
+        &self,
+        account: &Arc<Account>,
+        status: u16,
+        err_body: &[u8],
+        now_ms: i64,
+        on_401: Option<&On401Hook>,
+    ) {
+        match status {
+            401 => {
+                account.set_cooldown(self.retry_policy.cooldown_401_ms.max(0), now_ms);
+                if let Some(h) = on_401 {
+                    h(account.clone());
+                }
+            }
+            429 => {
+                let cooldown_ms = parse_retry_after_ms(
+                    err_body,
+                    now_ms,
+                    self.retry_policy.default_cooldown_429_ms.max(0),
+                );
+                account.set_quota_cooldown(cooldown_ms, now_ms);
+            }
+            403 => {
+                account.set_cooldown(5 * 60_000, now_ms);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -191,31 +294,6 @@ fn is_retryable_status(code: u16) -> bool {
     match code {
         400 | 403 => false,
         _ => true,
-    }
-}
-
-fn apply_retry_side_effects(
-    account: &Arc<Account>,
-    status: u16,
-    err_body: &[u8],
-    now_ms: i64,
-    on_401: Option<&On401Hook>,
-) {
-    match status {
-        401 => {
-            account.set_cooldown(30_000, now_ms);
-            if let Some(h) = on_401 {
-                h(account.clone());
-            }
-        }
-        429 => {
-            let cooldown_ms = parse_retry_after_ms(err_body, now_ms, 60_000);
-            account.set_quota_cooldown(cooldown_ms, now_ms);
-        }
-        403 => {
-            account.set_cooldown(5 * 60_000, now_ms);
-        }
-        _ => {}
     }
 }
 

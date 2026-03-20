@@ -6,7 +6,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::core::Manager;
 
-use super::{Refresher, SaveQueue, filter_need_refresh, refresh_account};
+use super::{Refresher, SaveQueue, filter_need_refresh, refresh_account_with_options};
 
 #[derive(Debug, Clone)]
 pub struct RefreshLoopConfig {
@@ -14,6 +14,8 @@ pub struct RefreshLoopConfig {
     pub scan_interval: Duration,
     pub refresh_concurrency: usize,
     pub max_retries: usize,
+    pub refresh_batch_size: usize,
+    pub rate_limit_cooldown_ms: i64,
 }
 
 #[derive(Clone)]
@@ -43,7 +45,9 @@ impl RefreshLoop {
             save_queue,
             cfg: RefreshLoopConfig {
                 refresh_concurrency: cfg.refresh_concurrency.max(1),
+                refresh_batch_size: cfg.refresh_batch_size,
                 max_retries: cfg.max_retries,
+                rate_limit_cooldown_ms: cfg.rate_limit_cooldown_ms.max(0),
                 ..cfg
             },
         })
@@ -106,26 +110,43 @@ impl RefreshLoop {
             "refresh: start batch"
         );
 
-        let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.refresh_concurrency));
-        let mut handles = Vec::with_capacity(need_refresh.len());
+        let batch_size = if self.cfg.refresh_batch_size == 0 {
+            need_refresh.len().max(1)
+        } else {
+            self.cfg.refresh_batch_size.max(1)
+        };
 
-        for acc in need_refresh {
-            let permit = sem.clone().acquire_owned().await.unwrap();
-            let manager = self.manager.clone();
-            let refresher = self.refresher.clone();
-            let save_queue = self.save_queue.clone();
-            let max_retries = self.cfg.max_retries;
+        for batch in need_refresh.chunks(batch_size) {
+            let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.refresh_concurrency));
+            let mut handles = Vec::with_capacity(batch.len());
 
-            handles.push(tokio::spawn(async move {
-                let _permit = permit;
-                let _ =
-                    refresh_account(manager.as_ref(), &refresher, &save_queue, acc, max_retries)
-                        .await;
-            }));
-        }
+            for acc in batch {
+                let permit = sem.clone().acquire_owned().await.unwrap();
+                let manager = self.manager.clone();
+                let refresher = self.refresher.clone();
+                let save_queue = self.save_queue.clone();
+                let max_retries = self.cfg.max_retries;
+                let rate_limit_cooldown_ms = self.cfg.rate_limit_cooldown_ms;
+                let acc = acc.clone();
 
-        for h in handles {
-            let _ = h.await;
+                handles.push(tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = refresh_account_with_options(
+                        manager.as_ref(),
+                        &refresher,
+                        &save_queue,
+                        acc,
+                        max_retries,
+                        "refresh_failed",
+                        rate_limit_cooldown_ms,
+                    )
+                    .await;
+                }));
+            }
+
+            for h in handles {
+                let _ = h.await;
+            }
         }
 
         tracing::info!("refresh: batch done");
@@ -153,6 +174,8 @@ mod tests {
                 scan_interval: Duration::from_secs(3600),
                 refresh_concurrency: 1,
                 max_retries: 0,
+                refresh_batch_size: 0,
+                rate_limit_cooldown_ms: 60_000,
             },
         )
         .unwrap();

@@ -152,7 +152,7 @@ impl HealthChecker {
             return;
         }
 
-        let body = r#"{"model":"gpt-5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":false,"store":false,"max_output_tokens":1,"reasoning":{"effort":"minimal"}}"#;
+        let body = r#"{"model":"gpt-5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}],"stream":false,"store":false,"max_output_tokens":1,"reasoning":{"effort":"auto"}}"#;
 
         let mut req = self
             .http

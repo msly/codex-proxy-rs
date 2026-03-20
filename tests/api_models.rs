@@ -31,8 +31,10 @@ fn build_state() -> AppState {
             )
             .unwrap(),
         ),
+        request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
+        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -71,6 +73,15 @@ async fn api_v1_models_contains_expected_variants() {
     assert!(ids.contains("gpt-5.4-fast"));
     assert!(ids.contains("gpt-5.4-high"));
     assert!(ids.contains("gpt-5.4-high-fast"));
+    assert!(ids.contains("gpt-5.4-mini"));
+    assert!(ids.contains("gpt-5.4-mini-none-fast"));
     assert!(ids.contains("gpt-5.1-codex-max"));
     assert!(ids.contains("gpt-5.1-codex-max-fast"));
+    assert!(ids.contains("gpt-5.1-codex-max-xhigh"));
+    assert!(!ids.contains("gpt-5-max"));
+    assert!(!ids.contains("gpt-5-none"));
+    assert!(!ids.contains("gpt-5.1-codex-none"));
+    assert!(!ids.contains("gpt-5.1-codex-max-none"));
+    assert!(!ids.contains("gpt-5.3-codex-spark"));
+    assert!(!ids.contains("codex-mini"));
 }

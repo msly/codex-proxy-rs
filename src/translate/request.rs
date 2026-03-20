@@ -80,15 +80,9 @@ fn convert_existing_input(model_name: &str, mut v: Value, stream: bool) -> Value
         delete(&mut v, &[key]);
     }
 
-    // service_tier：仅保留 "priority"
-    if let Some(tier) = v.get("service_tier").and_then(Value::as_str) {
-        if tier != "priority" {
-            delete(&mut v, &["service_tier"]);
-        }
-    }
-
     fix_tools_array_schema(&mut v);
     convert_system_role_to_developer(&mut v);
+    ensure_input_contains_json(&mut v);
     v
 }
 
@@ -262,6 +256,13 @@ fn convert_chat_completions(
                         Value::String("text".to_string()),
                     );
                 }
+                "json_object" => {
+                    set(
+                        &mut out,
+                        &["text", "format", "type"],
+                        Value::String("json_object".to_string()),
+                    );
+                }
                 "json_schema" => {
                     if let Some(js) = rf.get("json_schema") {
                         set(
@@ -391,6 +392,18 @@ fn convert_chat_completions(
         }
     }
 
+    if let Some(service_tier) = v.get("service_tier").and_then(Value::as_str) {
+        let service_tier = service_tier.trim();
+        if !service_tier.is_empty() {
+            set(
+                &mut out,
+                &["service_tier"],
+                Value::String(service_tier.to_string()),
+            );
+        }
+    }
+
+    ensure_input_contains_json(&mut out);
     out
 }
 
@@ -425,6 +438,55 @@ fn push_tool(out: &mut Value, item: Value) {
     if let Some(arr) = out.get_mut("tools").and_then(Value::as_array_mut) {
         arr.push(item);
     }
+}
+
+fn ensure_input_contains_json(v: &mut Value) {
+    let format_type = v
+        .get("text")
+        .and_then(|t| t.get("format"))
+        .and_then(|f| f.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    if format_type != "json_object" && format_type != "json_schema" {
+        return;
+    }
+
+    let has_json = |s: &str| s.to_lowercase().contains("json");
+
+    if let Some(instructions) = v.get("instructions").and_then(Value::as_str) {
+        if has_json(instructions) {
+            return;
+        }
+    }
+
+    if let Some(input) = v.get("input").and_then(Value::as_array) {
+        for item in input {
+            if item.get("type").and_then(Value::as_str) != Some("message") {
+                continue;
+            }
+            if let Some(content) = item.get("content").and_then(Value::as_array) {
+                for part in content {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        if has_json(text) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let existing = v
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let next = if existing.is_empty() {
+        "Respond in JSON format.".to_string()
+    } else {
+        format!("Respond in JSON format.\n\n{existing}")
+    };
+    set(v, &["instructions"], Value::String(next));
 }
 
 fn build_tool_name_map(raw: &Value) -> HashMap<String, String> {

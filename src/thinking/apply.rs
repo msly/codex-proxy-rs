@@ -4,7 +4,7 @@ use super::suffix::parse_model_suffix;
 
 pub fn apply_thinking(body: &[u8], model: &str) -> (Vec<u8>, String) {
     let parse = parse_model_suffix(model);
-    let base_model = parse.model_name;
+    let base_model = parse.model_name.trim().to_string();
 
     let mut v: Value = serde_json::from_slice(body).unwrap_or_else(|_| Value::Object(Map::new()));
     let effort = match parse.thinking_suffix.as_deref() {
@@ -16,7 +16,10 @@ pub fn apply_thinking(body: &[u8], model: &str) -> (Vec<u8>, String) {
         set_reasoning_effort(&mut v, &effort);
     }
 
-    // 本阶段不实现 fast：不写入/不透传 service_tier
+    if parse.is_fast {
+        set_service_tier(&mut v, "priority");
+    }
+
     (
         serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec()),
         base_model,
@@ -75,7 +78,7 @@ fn effort_from_suffix(raw_suffix: &str) -> Option<String> {
 fn budget_to_level(budget: i64) -> &'static str {
     match budget {
         b if b <= 0 => "none",
-        b if b <= 512 => "minimal",
+        b if b <= 512 => "auto",
         b if b <= 1024 => "low",
         b if b <= 8192 => "medium",
         b if b <= 24576 => "high",
@@ -100,4 +103,16 @@ fn set_reasoning_effort(v: &mut Value, effort: &str) {
     if let Some(r) = reasoning.as_object_mut() {
         r.insert("effort".to_string(), Value::String(effort.to_string()));
     }
+}
+
+fn set_service_tier(v: &mut Value, tier: &str) {
+    let obj = match v.as_object_mut() {
+        Some(m) => m,
+        None => {
+            *v = Value::Object(Map::new());
+            v.as_object_mut().expect("just set to object")
+        }
+    };
+
+    obj.insert("service_tier".to_string(), Value::String(tier.to_string()));
 }

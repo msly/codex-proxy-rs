@@ -69,6 +69,50 @@ pub struct Config {
     #[serde(rename = "startup-async-load")]
     pub startup_async_load: bool,
 
+    #[serde(rename = "startup-load-retry-interval")]
+    pub startup_load_retry_interval: u64,
+
+    #[serde(rename = "shutdown-timeout")]
+    pub shutdown_timeout: u64,
+
+    #[serde(rename = "auth-scan-interval")]
+    pub auth_scan_interval: u64,
+
+    #[serde(rename = "save-workers")]
+    pub save_workers: u64,
+
+    #[serde(rename = "cooldown-401-sec")]
+    pub cooldown_401_sec: u64,
+
+    #[serde(rename = "cooldown-429-sec")]
+    pub cooldown_429_sec: u64,
+
+    #[serde(rename = "refresh-single-timeout-sec")]
+    pub refresh_single_timeout_sec: u64,
+
+    #[serde(rename = "quota-check-concurrency")]
+    pub quota_check_concurrency: u64,
+
+    #[serde(rename = "keepalive-interval")]
+    pub keepalive_interval: u64,
+
+    #[serde(rename = "upstream-timeout-sec")]
+    pub upstream_timeout_sec: u64,
+
+    #[serde(rename = "stream-idle-timeout-sec")]
+    pub stream_idle_timeout_sec: u64,
+
+    #[serde(rename = "empty-retry-max")]
+    pub empty_retry_max: usize,
+
+    #[serde(rename = "enable-stream-idle-retry")]
+    pub enable_stream_idle_retry: bool,
+
+    pub selector: String,
+
+    #[serde(rename = "refresh-batch-size")]
+    pub refresh_batch_size: u64,
+
     #[serde(default)]
     pub accounts: Vec<String>,
 
@@ -96,11 +140,26 @@ impl Default for Config {
             health_check_batch_size: 20,
             health_check_request_timeout: 8,
             refresh_concurrency: 50,
-            max_conns_per_host: 512,
-            max_idle_conns: 1024,
-            max_idle_conns_per_host: 512,
-            enable_http2: false,
+            max_conns_per_host: 20,
+            max_idle_conns: 50,
+            max_idle_conns_per_host: 10,
+            enable_http2: true,
             startup_async_load: true,
+            startup_load_retry_interval: 10,
+            shutdown_timeout: 5,
+            auth_scan_interval: 30,
+            save_workers: 4,
+            cooldown_401_sec: 30,
+            cooldown_429_sec: 60,
+            refresh_single_timeout_sec: 30,
+            quota_check_concurrency: 0,
+            keepalive_interval: 60,
+            upstream_timeout_sec: 0,
+            stream_idle_timeout_sec: 0,
+            empty_retry_max: 2,
+            enable_stream_idle_retry: true,
+            selector: "round-robin".to_string(),
+            refresh_batch_size: 0,
             accounts: Vec::new(),
             api_keys: Vec::new(),
         }
@@ -184,6 +243,43 @@ impl Config {
         if self.refresh_concurrency == 0 {
             self.refresh_concurrency = 50;
         }
+        if self.startup_load_retry_interval == 0 {
+            self.startup_load_retry_interval = 10;
+        }
+        if self.shutdown_timeout == 0 {
+            self.shutdown_timeout = 5;
+        }
+        if self.shutdown_timeout > 60 {
+            self.shutdown_timeout = 60;
+        }
+        if self.auth_scan_interval == 0 {
+            self.auth_scan_interval = 30;
+        }
+        if self.save_workers == 0 {
+            self.save_workers = 4;
+        }
+        if self.save_workers > 32 {
+            self.save_workers = 32;
+        }
+        if self.cooldown_401_sec == 0 {
+            self.cooldown_401_sec = 30;
+        }
+        if self.cooldown_429_sec == 0 {
+            self.cooldown_429_sec = 60;
+        }
+        if self.refresh_single_timeout_sec == 0 {
+            self.refresh_single_timeout_sec = 30;
+        }
+        if self.quota_check_concurrency == 0 {
+            self.quota_check_concurrency = self.refresh_concurrency;
+        }
+        if self.keepalive_interval == 0 {
+            self.keepalive_interval = 60;
+        }
+        self.selector = self.selector.trim().to_lowercase();
+        if self.selector != "quota-first" {
+            self.selector = "round-robin".to_string();
+        }
 
         match self.log_level.as_str() {
             "debug" | "info" | "warn" | "error" => {}
@@ -214,6 +310,8 @@ mod tests {
         assert_eq!(cfg.backend_domain, "chatgpt.com");
         assert_eq!(cfg.base_url, "https://chatgpt.com/backend-api/codex");
         assert_eq!(cfg.log_level, "info");
+        assert_eq!(cfg.selector, "round-robin");
+        assert_eq!(cfg.quota_check_concurrency, 50);
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8080");
     }
 

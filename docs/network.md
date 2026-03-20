@@ -19,7 +19,7 @@ OAuth refresh（`https://auth.openai.com/oauth/token`）使用“通用 client b
 
 - Go：`Transport.ForceAttemptHTTP2`
 - Rust：`enable-http2: false` 时启用 `reqwest::ClientBuilder::http1_only()`
-- 说明：默认 **false**，避免长 SSE 连接在 HTTP/2 下产生队头阻塞（与 Go 默认一致）。
+- 说明：默认 **true**，与当前 Go 版默认值一致；如遇上游 `GOAWAY ENHANCE_YOUR_CALM`，可按 Go 的建议调低连接池参数或关闭 HTTP/2。
 
 ### `backend-resolve-address`
 
@@ -33,8 +33,16 @@ OAuth refresh（`https://auth.openai.com/oauth/token`）使用“通用 client b
 - `max-idle-conns-per-host` → `pool_max_idle_per_host`
 - `max-idle-conns`：当 `max-idle-conns-per-host=0` 时，作为 `pool_max_idle_per_host` 的回退值（`reqwest` 没有“全局 MaxIdleConns”配置）
 - `max-conns-per-host`：`reqwest` 当前无等价参数，暂不强制限制（会在 README 里标注）
+- `upstream-timeout-sec`：作为上游首包/响应头等待超时，包裹 `req.send()`；不会额外截断已建立的 SSE body 读取
+- `keepalive-interval`：映射到 keepalive ping 循环间隔
 - 固定值（对齐 Go）：
   - `pool_idle_timeout = 120s`
   - `tcp_keepalive = 60s`
   - `connect_timeout = 10s`
 
+### 当前仅保留配置面的参数
+
+- `stream-idle-timeout-sec`
+- `enable-stream-idle-retry`
+
+这两个参数当前在 Go/Rust 两边都已经进入配置结构，但执行层尚未真正消费；Rust 目前保持相同状态，不额外扩展语义。

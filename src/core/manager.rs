@@ -8,19 +8,25 @@ use arc_swap::ArcSwap;
 use super::account::{Account, TokenData, TokenFile, parse_id_token_claims};
 use super::selector::{RoundRobinSelector, Selector};
 
-#[derive(Debug)]
 pub struct Manager {
     auth_dir: PathBuf,
     accounts: ArcSwap<Vec<Arc<Account>>>,
-    selector: RoundRobinSelector,
+    selector: Arc<dyn Selector>,
 }
 
 impl Manager {
     pub fn new(auth_dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_selector(auth_dir, Arc::new(RoundRobinSelector::new()))
+    }
+
+    pub fn new_with_selector(
+        auth_dir: impl Into<PathBuf>,
+        selector: Arc<dyn Selector>,
+    ) -> Self {
         Self {
             auth_dir: auth_dir.into(),
             accounts: ArcSwap::from_pointee(Vec::new()),
-            selector: RoundRobinSelector::new(),
+            selector,
         }
     }
 

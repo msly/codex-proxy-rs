@@ -30,7 +30,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_parse_suffix_fast_is_stripped_but_no_semantics() {
+    fn thinking_parse_suffix_fast_is_stripped() {
         assert_eq!(
             parse_model_suffix("gpt-5.4-fast"),
             ParseResult {
@@ -89,5 +89,23 @@ mod tests {
         assert_eq!(base, "gpt-5.4");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn thinking_apply_fast_sets_priority_service_tier() {
+        let body = json!({});
+        let (out, base) = apply_thinking(&serde_json::to_vec(&body).unwrap(), "gpt-5.4-fast");
+        assert_eq!(base, "gpt-5.4");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["service_tier"], "priority");
+    }
+
+    #[test]
+    fn thinking_apply_small_budget_maps_to_auto() {
+        let body = json!({});
+        let (out, base) = apply_thinking(&serde_json::to_vec(&body).unwrap(), "gpt-5.4-512");
+        assert_eq!(base, "gpt-5.4");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "auto");
     }
 }

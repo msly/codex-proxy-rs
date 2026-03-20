@@ -47,13 +47,14 @@ pub async fn refresh_account(
     account: Arc<Account>,
     max_retries: usize,
 ) -> Result<(), RefreshError> {
-    refresh_account_with_remove_reason(
+    refresh_account_with_options(
         manager,
         refresher,
         save_queue,
         account,
         max_retries,
         "refresh_failed",
+        60_000,
     )
     .await
 }
@@ -65,6 +66,27 @@ pub async fn refresh_account_with_remove_reason(
     account: Arc<Account>,
     max_retries: usize,
     remove_reason: &str,
+) -> Result<(), RefreshError> {
+    refresh_account_with_options(
+        manager,
+        refresher,
+        save_queue,
+        account,
+        max_retries,
+        remove_reason,
+        60_000,
+    )
+    .await
+}
+
+pub async fn refresh_account_with_options(
+    manager: &Manager,
+    refresher: &Refresher,
+    save_queue: &SaveQueue,
+    account: Arc<Account>,
+    max_retries: usize,
+    remove_reason: &str,
+    rate_limit_cooldown_ms: i64,
 ) -> Result<(), RefreshError> {
     if !account.try_begin_refresh() {
         return Ok(());
@@ -94,7 +116,7 @@ pub async fn refresh_account_with_remove_reason(
             Ok(())
         }
         Err(err) if err.is_rate_limited() => {
-            account.set_cooldown(60_000, now_unix_ms());
+            account.set_cooldown(rate_limit_cooldown_ms.max(0), now_unix_ms());
             Err(err)
         }
         Err(err) => {

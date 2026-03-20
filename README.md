@@ -14,7 +14,7 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
 - Claude 兼容端点：
   - `POST /v1/messages`（流式/非流式，Codex Responses SSE → Claude Messages 格式）
 - 管理端点：
-  - `GET /stats`（账号 summary + 统计 + quota raw JSON cache）
+  - `GET /stats`（账号 summary + RPM + token totals + quota raw JSON cache）
   - `POST /check-quota`（SSE，批量查询 `/backend-api/wham/usage`）
   - `POST /refresh`（SSE，强制刷新所有账号 Token）
   - `GET /health`（不鉴权）
@@ -92,16 +92,33 @@ health-check-batch-size: 20
 health-check-request-timeout: 8
 
 # 网络配置（对齐说明见 docs/network.md）
-enable-http2: false
+enable-http2: true
 # backend-resolve-address: "1.2.3.4" # or "host:port"
-max-conns-per-host: 512
-max-idle-conns: 1024
-max-idle-conns-per-host: 512
+max-conns-per-host: 20
+max-idle-conns: 50
+max-idle-conns-per-host: 10
 
 # 其他配置项
 refresh-interval: 3000
 refresh-concurrency: 50
 startup-async-load: true
+startup-load-retry-interval: 10
+shutdown-timeout: 5
+auth-scan-interval: 30
+save-workers: 4
+cooldown-401-sec: 30
+cooldown-429-sec: 60
+refresh-single-timeout-sec: 30
+quota-check-concurrency: 50
+keepalive-interval: 60
+upstream-timeout-sec: 0
+empty-retry-max: 2
+selector: "round-robin" # or "quota-first"
+refresh-batch-size: 0
+
+# 这两个配置当前与 Go 一样仅保留配置面
+stream-idle-timeout-sec: 0
+enable-stream-idle-retry: true
 ```
 
 ### auth 文件示例（`auths/a.json`）
@@ -222,25 +239,28 @@ curl -N -X POST http://127.0.0.1:8080/refresh \
 
 ### thinking（通过模型名后缀控制）
 
-客户端可用 `model` 后缀表达“思考等级”，代理会将其写入上游请求的 `reasoning.effort`，并将去后缀的 base model 作为真实模型名：
+客户端可用 `model` 后缀表达“思考等级”，代理会将其写入上游请求的 `reasoning.effort`，并将去后缀的 base model 作为真实模型名。
+
+不同基础模型支持的 thinking 后缀并不完全相同；以当前 Go 版为准：
 
 - `gpt-5.4-low`
 - `gpt-5.4-medium`
 - `gpt-5.4-high`
 - `gpt-5.4-xhigh`
-- `gpt-5.4-max`
 - `gpt-5.4-none`
-- `gpt-5.4-auto`（等价映射到 `medium`）
+- `gpt-5.4-auto`
+- `gpt-5-low` / `gpt-5-medium` / `gpt-5-high` / `gpt-5-auto`
+- `gpt-5.1-codex-low|medium|high|max|auto`
+- `gpt-5.1-codex-max-low|medium|high|xhigh|auto`
 - `model-<budget>`（数字预算 > 100，会映射为等级）
 
-### fast（`-fast` 后缀，当前为 no-op）
+完整可用模型矩阵请直接调用 `GET /v1/models`。
 
-`-fast` 会被解析/剥离以保持兼容，但当前 **不影响** 上游请求（不会透传 `service_tier=fast`）。
+### fast（`-fast` 后缀）
 
-因此：
+`-fast` 会被解析并映射到上游 `service_tier: "priority"`，与最新 Go 版一致。
 
-- `gpt-5.4` 与 `gpt-5.4-fast` 行为一致
-- `/v1/models` 仍会列出 `*-fast` 变体用于兼容旧客户端
+因此 `gpt-5.4-fast`、`gpt-5.1-codex-max-high-fast` 这类变体都会在 `/v1/models` 中列出，并实际影响上游优先级。
 
 ## 流程图
 

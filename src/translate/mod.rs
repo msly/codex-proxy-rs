@@ -30,7 +30,7 @@ mod tests {
         assert_eq!(v["store"], false);
         assert_eq!(v["reasoning"]["effort"], "high");
         assert!(v.get("reasoning_effort").is_none());
-        assert!(v.get("service_tier").is_none()); // fast 不透传
+        assert_eq!(v["service_tier"], "fast");
         assert!(v["input"].is_array());
         assert_eq!(v["input"][0]["role"], "user");
         assert_eq!(v["input"][0]["content"][0]["text"], "hi");
@@ -57,5 +57,23 @@ mod tests {
         assert_eq!(v["input"][1]["role"], "user");
         assert_eq!(v["input"][2]["type"], "function_call_output");
         assert_eq!(v["input"][2]["call_id"], "c1");
+    }
+
+    #[test]
+    fn translate_json_object_adds_format_and_json_instruction() {
+        let input = json!({
+            "messages": [
+                {"role":"user","content":"return object"}
+            ],
+            "response_format": {
+                "type": "json_object"
+            }
+        });
+        let out =
+            convert_openai_request_to_codex("gpt-5.4", &serde_json::to_vec(&input).unwrap(), false);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(v["text"]["format"]["type"], "json_object");
+        assert_eq!(v["instructions"], "Respond in JSON format.");
     }
 }

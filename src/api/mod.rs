@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,12 +46,49 @@ pub struct AppState {
     pub manager: Arc<Manager>,
     pub quota_checker: Arc<QuotaChecker>,
     pub codex_client: Arc<CodexClient>,
+    pub request_stats: Arc<RequestStats>,
     pub api_keys: Arc<HashSet<String>>,
     pub max_retry: usize,
+    pub empty_retry_max: usize,
     pub refresher: Refresher,
     pub save_queue: SaveQueue,
     pub refresh_concurrency: usize,
     pub on_401: Option<crate::upstream::codex::On401Hook>,
+}
+
+#[derive(Debug, Default)]
+pub struct RequestStats {
+    last_minute_start: AtomicI64,
+    last_minute_count: AtomicI64,
+}
+
+impl RequestStats {
+    pub fn record_request(&self) {
+        let minute_start = crate::core::now_unix_ms() / 60_000;
+        loop {
+            let prev = self.last_minute_start.load(Ordering::Relaxed);
+            if prev == minute_start {
+                self.last_minute_count.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if self
+                .last_minute_start
+                .compare_exchange(prev, minute_start, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.last_minute_count.store(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    pub fn rpm(&self) -> i64 {
+        let minute_start = crate::core::now_unix_ms() / 60_000;
+        if self.last_minute_start.load(Ordering::Relaxed) != minute_start {
+            return 0;
+        }
+        self.last_minute_count.load(Ordering::Relaxed)
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -351,6 +389,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
     };
 
     account.record_success(crate::core::now_unix_ms());
+    state.request_stats.record_request();
 
     if stream {
         let status = upstream.status();
@@ -482,7 +521,10 @@ async fn handle_responses_ws(mut socket: WebSocket, state: AppState) {
                             forward_responses_sse_as_ws(&mut socket, &state, request_body, &model)
                                 .await;
                         match stream_result {
-                            Ok(()) => return,
+                            Ok(()) => {
+                                state.request_stats.record_request();
+                                return;
+                            }
                             Err(ResponsesWsError::EmptyResponse) => {
                                 write_ws_error(&mut socket, "invalid_response", "empty response")
                                     .await;
@@ -621,6 +663,7 @@ async fn forward_responses_sse_as_ws(
     }
 
     account.record_success(crate::core::now_unix_ms());
+    state.request_stats.record_request();
     Ok(())
 }
 
@@ -698,10 +741,9 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         Err(err) => return send_claude_upstream_error(err),
     };
 
-    account.record_success(crate::core::now_unix_ms());
-
     if stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
+        let request_stats = state.request_stats.clone();
         tokio::spawn(async move {
             let mut buf = Vec::<u8>::new();
             let mut state = ClaudeStreamState::new(&base_model);
@@ -741,6 +783,11 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                 if state.completed {
                     break;
                 }
+            }
+
+            if state.completed {
+                account.record_success(crate::core::now_unix_ms());
+                request_stats.record_request();
             }
         });
 
@@ -792,6 +839,9 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             "empty response",
         );
     }
+
+    account.record_success(crate::core::now_unix_ms());
+    state.request_stats.record_request();
 
     let mut resp = Response::new(Body::from(result.json));
     *resp.status_mut() = StatusCode::OK;
@@ -1001,30 +1051,29 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         }
     };
 
-    let (upstream, account, _attempts) = match state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            true,
-            state.max_retry,
-            state.on_401.clone(),
-        )
-        .await
-    {
-        Ok(v) => v,
-        Err(err) => return send_upstream_error(err),
-    };
-
-    account.record_success(crate::core::now_unix_ms());
-
     let reverse_tool_map = build_reverse_tool_name_map(&raw);
 
     if stream {
+        let (upstream, account, _attempts) = match state
+            .codex_client
+            .send_with_retry(
+                &state.manager,
+                &base_model,
+                url,
+                codex_body,
+                true,
+                state.max_retry,
+                state.on_401.clone(),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => return send_upstream_error(err),
+        };
+
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let account = account.clone();
+        let request_stats = state.request_stats.clone();
         tokio::spawn(async move {
             let mut buf = Vec::<u8>::new();
             let mut state = StreamState::new(&base_model);
@@ -1065,10 +1114,12 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 }
             }
 
-            if state.completed && (state.has_text || state.has_tool_call) {
+            if state.completed && (state.has_text || state.has_tool_call || state.has_reasoning) {
                 if state.usage_input > 0 || state.usage_output > 0 {
                     account.record_usage(state.usage_input, state.usage_output, state.usage_total);
                 }
+                account.record_success(crate::core::now_unix_ms());
+                request_stats.record_request();
                 let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
             }
         });
@@ -1095,17 +1146,86 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         return resp;
     }
 
-    let bytes = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(err) => {
-            return send_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("读取上游响应失败: {err}"),
-                "api_error",
-            );
-        }
-    };
+    let mut excluded_for_empty = HashSet::new();
+    for empty_attempt in 0..=state.empty_retry_max {
+        let (upstream, account, _attempts) = match state
+            .codex_client
+            .send_with_retry_excluding(
+                &state.manager,
+                &base_model,
+                url.clone(),
+                codex_body.clone(),
+                true,
+                state.max_retry,
+                state.on_401.clone(),
+                &excluded_for_empty,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => return send_upstream_error(err),
+        };
 
+        let bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(err) => {
+                return send_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("读取上游响应失败: {err}"),
+                    "api_error",
+                );
+            }
+        };
+
+        match parse_chat_non_stream_response(&bytes, &reverse_tool_map, account.as_ref()) {
+            ChatNonStreamOutcome::Success(out) => {
+                account.record_success(crate::core::now_unix_ms());
+                state.request_stats.record_request();
+                let mut resp = Response::new(Body::from(out));
+                *resp.status_mut() = StatusCode::OK;
+                resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/json"),
+                );
+                return resp;
+            }
+            ChatNonStreamOutcome::Empty => {
+                excluded_for_empty.insert(account.file_path().to_string());
+                if empty_attempt < state.empty_retry_max {
+                    tracing::warn!(
+                        account = account.file_path(),
+                        attempt = empty_attempt + 1,
+                        total = state.empty_retry_max + 1,
+                        "chat non-stream empty response; retrying with another account"
+                    );
+                    continue;
+                }
+                return send_error(StatusCode::BAD_REQUEST, "empty response", "invalid_response");
+            }
+            ChatNonStreamOutcome::MissingCompleted => {
+                return send_error(
+                    StatusCode::BAD_GATEWAY,
+                    "上游响应缺少 response.completed",
+                    "api_error",
+                );
+            }
+        }
+    }
+
+    send_error(StatusCode::BAD_REQUEST, "empty response", "invalid_response")
+}
+
+enum ChatNonStreamOutcome {
+    Success(String),
+    Empty,
+    MissingCompleted,
+}
+
+fn parse_chat_non_stream_response(
+    bytes: &[u8],
+    reverse_tool_map: &std::collections::HashMap<String, String>,
+    account: &crate::core::Account,
+) -> ChatNonStreamOutcome {
     for line in bytes.split(|&b| b == b'\n') {
         let line = trim_ascii(line);
         if !line.starts_with(b"data:") {
@@ -1116,30 +1236,22 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             continue;
         }
 
-        let (out, has_output) = convert_non_stream_response(payload, &reverse_tool_map);
-        if out.is_empty() {
-            continue;
-        }
-        if !has_output {
-            return send_error(
-                StatusCode::BAD_REQUEST,
-                "empty response",
-                "invalid_response",
-            );
-        }
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+            if v.get("type").and_then(|v| v.as_str()) != Some("response.completed") {
+                continue;
+            }
 
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
-            let usage = v.get("usage").unwrap_or(&serde_json::Value::Null);
+            let usage = v.get("response").and_then(|r| r.get("usage"));
             let input_tokens = usage
-                .get("prompt_tokens")
+                .and_then(|u| u.get("input_tokens"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             let output_tokens = usage
-                .get("completion_tokens")
+                .and_then(|u| u.get("output_tokens"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             let total_tokens = usage
-                .get("total_tokens")
+                .and_then(|u| u.get("total_tokens"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             if input_tokens > 0 || output_tokens > 0 {
@@ -1147,20 +1259,14 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             }
         }
 
-        let mut resp = Response::new(Body::from(out));
-        *resp.status_mut() = StatusCode::OK;
-        resp.headers_mut().insert(
-            header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
-        return resp;
+        let (out, has_output) = convert_non_stream_response(payload, reverse_tool_map);
+        if has_output && !out.is_empty() {
+            return ChatNonStreamOutcome::Success(out);
+        }
+        return ChatNonStreamOutcome::Empty;
     }
 
-    send_error(
-        StatusCode::BAD_GATEWAY,
-        "上游响应缺少 response.completed",
-        "api_error",
-    )
+    ChatNonStreamOutcome::MissingCompleted
 }
 
 fn trim_ascii(input: &[u8]) -> &[u8] {
@@ -1175,23 +1281,61 @@ fn trim_ascii(input: &[u8]) -> &[u8] {
     &input[start..end]
 }
 
-const BASE_MODEL_LIST: &[&str] = &[
-    "gpt-5",
-    "gpt-5-codex",
-    "gpt-5-codex-mini",
-    "gpt-5.1",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5.1-codex-max",
-    "gpt-5.2",
-    "gpt-5.2-codex",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "codex-mini",
-];
+struct ModelListEntry {
+    base: &'static str,
+    suffixes: &'static [&'static str],
+}
 
-const THINKING_SUFFIXES: &[&str] = &["low", "medium", "high", "xhigh", "max", "none", "auto"];
+const MODEL_LIST: &[ModelListEntry] = &[
+    ModelListEntry {
+        base: "gpt-5",
+        suffixes: &["low", "medium", "high", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5-codex",
+        suffixes: &["low", "medium", "high", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5-codex-mini",
+        suffixes: &["low", "medium", "high", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.1",
+        suffixes: &["low", "medium", "high", "none", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.1-codex",
+        suffixes: &["low", "medium", "high", "max", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.1-codex-mini",
+        suffixes: &["low", "medium", "high", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.1-codex-max",
+        suffixes: &["low", "medium", "high", "xhigh", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.2",
+        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.2-codex",
+        suffixes: &["low", "medium", "high", "xhigh", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.3-codex",
+        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.4",
+        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
+    },
+    ModelListEntry {
+        base: "gpt-5.4-mini",
+        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
+    },
+];
 
 #[derive(Debug, Serialize)]
 struct ModelItem {
@@ -1207,11 +1351,16 @@ struct ModelsResponse {
 }
 
 async fn v1_models() -> Json<ModelsResponse> {
-    let mut data = Vec::with_capacity(BASE_MODEL_LIST.len() * (2 + THINKING_SUFFIXES.len() * 2));
+    let mut capacity = 0usize;
+    for entry in MODEL_LIST {
+        capacity += 2 + entry.suffixes.len() * 2;
+    }
+    let mut data = Vec::with_capacity(capacity);
 
-    for base in BASE_MODEL_LIST {
+    for entry in MODEL_LIST {
+        let base = entry.base;
         data.push(ModelItem {
-            id: (*base).to_string(),
+            id: base.to_string(),
             object: "model",
             owned_by: "openai",
         });
@@ -1220,7 +1369,7 @@ async fn v1_models() -> Json<ModelsResponse> {
             object: "model",
             owned_by: "openai",
         });
-        for suffix in THINKING_SUFFIXES {
+        for suffix in entry.suffixes {
             data.push(ModelItem {
                 id: format!("{base}-{suffix}"),
                 object: "model",
@@ -1419,6 +1568,9 @@ struct StatsSummary {
     active: usize,
     cooldown: usize,
     disabled: usize,
+    rpm: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1479,6 +1631,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let mut active = 0usize;
     let mut cooldown = 0usize;
     let mut disabled = 0usize;
+    let mut total_input_tokens = 0i64;
+    let mut total_output_tokens = 0i64;
 
     for acc in accounts.iter() {
         let snap = acc.stats_snapshot();
@@ -1487,6 +1641,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
             crate::core::AccountStatus::Cooldown => cooldown += 1,
             crate::core::AccountStatus::Disabled => disabled += 1,
         }
+        total_input_tokens += snap.usage_input_tokens;
+        total_output_tokens += snap.usage_output_tokens;
 
         fn ms_to_rfc3339(ms: i64) -> Option<String> {
             if ms <= 0 {
@@ -1559,6 +1715,9 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
             active,
             cooldown,
             disabled,
+            rpm: state.request_stats.rpm(),
+            total_input_tokens,
+            total_output_tokens,
         },
         accounts: out,
     })
@@ -1593,8 +1752,10 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            request_stats: Arc::new(RequestStats::default()),
             api_keys: Arc::new(HashSet::new()),
             max_retry: 0,
+            empty_retry_max: 0,
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
@@ -1637,8 +1798,10 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            request_stats: Arc::new(RequestStats::default()),
             api_keys: Arc::new(HashSet::new()),
             max_retry: 0,
+            empty_retry_max: 0,
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,

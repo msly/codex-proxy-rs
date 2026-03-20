@@ -41,6 +41,36 @@ impl Selector for RoundRobinSelector {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct QuotaFirstSelector;
+
+impl QuotaFirstSelector {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Selector for QuotaFirstSelector {
+    fn pick(&self, _model: &str, accounts: &[Arc<Account>]) -> Result<Arc<Account>, String> {
+        let now_ms = now_unix_ms();
+        let mut available: Vec<Arc<Account>> = accounts
+            .iter()
+            .filter(|acc| acc.is_available(now_ms))
+            .cloned()
+            .collect();
+
+        if available.is_empty() {
+            return Err("没有可用的 Codex 账号".to_string());
+        }
+
+        if available.len() > 1 {
+            available.sort_by(|a, b| compare_used_percent(a, b));
+        }
+
+        Ok(available[0].clone())
+    }
+}
+
 fn compare_used_percent(a: &Account, b: &Account) -> Ordering {
     let pa = a.used_percent_x100();
     let pb = b.used_percent_x100();
@@ -119,5 +149,20 @@ mod tests {
 
         let picked = selector.pick("gpt-4.1", &accounts).expect("pick");
         assert_eq!(picked.file_path(), "ok.json");
+    }
+
+    #[test]
+    fn core_quota_first_selector_picks_lowest_used_percent() {
+        let selector = QuotaFirstSelector::new();
+
+        let acc_b = make_account("b.json");
+        acc_b.set_used_percent_for_test(Some(10.0));
+
+        let acc_a = make_account("a.json");
+        acc_a.set_used_percent_for_test(Some(50.0));
+
+        let accounts = vec![acc_a, acc_b.clone()];
+        let picked = selector.pick("gpt-4.1", &accounts).expect("pick");
+        assert_eq!(picked.file_path(), "b.json");
     }
 }

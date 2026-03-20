@@ -13,12 +13,15 @@ pub struct StreamState {
     pub function_call_index: i64,
     pub has_text: bool,
     pub has_tool_call: bool,
+    pub has_reasoning: bool,
     pub completed: bool,
     pub usage_input: i64,
     pub usage_output: i64,
     pub usage_total: i64,
     has_received_args_delta: bool,
     has_tool_call_announced: bool,
+    reasoning_delta_by_item: HashMap<String, String>,
+    has_reasoning_summary_delta: bool,
 }
 
 impl StreamState {
@@ -30,12 +33,15 @@ impl StreamState {
             function_call_index: -1,
             has_text: false,
             has_tool_call: false,
+            has_reasoning: false,
             completed: false,
             usage_input: 0,
             usage_output: 0,
             usage_total: 0,
             has_received_args_delta: false,
             has_tool_call_announced: false,
+            reasoning_delta_by_item: HashMap::new(),
+            has_reasoning_summary_delta: false,
         }
     }
 }
@@ -73,6 +79,9 @@ pub fn convert_stream_chunk(
                 state.model = m.to_string();
             }
         }
+        state.reasoning_delta_by_item.clear();
+        state.has_reasoning = false;
+        state.has_reasoning_summary_delta = false;
         return Vec::new();
     }
 
@@ -81,6 +90,11 @@ pub fn convert_stream_chunk(
     match typ {
         "response.reasoning_summary_text.delta" => {
             if let Some(delta) = root.get("delta").and_then(Value::as_str) {
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                state.has_reasoning_summary_delta = true;
+                state.has_reasoning = true;
                 set_delta_role_assistant(&mut chunk);
                 set_choice_delta(
                     &mut chunk,
@@ -93,21 +107,38 @@ pub fn convert_stream_chunk(
         }
         "response.reasoning_summary_text.done" => {
             set_delta_role_assistant(&mut chunk);
-            set_choice_delta(
-                &mut chunk,
-                "reasoning_content",
-                Value::String("\n\n".to_string()),
-            );
+            let text = root.get("text").and_then(Value::as_str).unwrap_or_default();
+            if !text.is_empty() && !state.has_reasoning_summary_delta {
+                state.has_reasoning = true;
+                set_choice_delta(
+                    &mut chunk,
+                    "reasoning_content",
+                    Value::String(text.to_string()),
+                );
+            } else {
+                set_choice_delta(
+                    &mut chunk,
+                    "reasoning_content",
+                    Value::String("\n\n".to_string()),
+                );
+            }
             vec![chunk.to_string()]
         }
         "response.reasoning.delta" | "response.reasoning_text.delta" => {
+            let item_key = reasoning_item_key(&root);
             let delta = root
                 .get("delta")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            state
+                .reasoning_delta_by_item
+                .entry(item_key)
+                .or_default()
+                .push_str(delta);
             if delta.is_empty() {
                 return Vec::new();
             }
+            state.has_reasoning = true;
             set_delta_role_assistant(&mut chunk);
             set_choice_delta(
                 &mut chunk,
@@ -115,6 +146,55 @@ pub fn convert_stream_chunk(
                 Value::String(delta.to_string()),
             );
             vec![chunk.to_string()]
+        }
+        "response.reasoning_text.done" => {
+            let full = root.get("text").and_then(Value::as_str).unwrap_or_default();
+            if full.is_empty() {
+                return Vec::new();
+            }
+
+            let item_key = reasoning_item_key(&root);
+            let accumulated = state
+                .reasoning_delta_by_item
+                .remove(&item_key)
+                .unwrap_or_default();
+
+            let to_emit = if accumulated.is_empty() {
+                full.to_string()
+            } else if full.starts_with(&accumulated) && full.len() > accumulated.len() {
+                full[accumulated.len()..].to_string()
+            } else if full != accumulated {
+                full.to_string()
+            } else {
+                String::new()
+            };
+
+            if to_emit.is_empty() {
+                return Vec::new();
+            }
+
+            state.has_reasoning = true;
+            set_delta_role_assistant(&mut chunk);
+            set_choice_delta(&mut chunk, "reasoning_content", Value::String(to_emit));
+            vec![chunk.to_string()]
+        }
+        "response.content_part.added" => {
+            let part = root.get("part").unwrap_or(&Value::Null);
+            if part.get("type").and_then(Value::as_str) == Some("reasoning_text") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        state.has_reasoning = true;
+                        set_delta_role_assistant(&mut chunk);
+                        set_choice_delta(
+                            &mut chunk,
+                            "reasoning_content",
+                            Value::String(text.to_string()),
+                        );
+                        return vec![chunk.to_string()];
+                    }
+                }
+            }
+            Vec::new()
         }
         "response.output_text.delta" => {
             if let Some(delta) = root.get("delta").and_then(Value::as_str) {
@@ -287,6 +367,7 @@ pub fn convert_stream_chunk(
                 if delta.is_empty() {
                     return Vec::new();
                 }
+                state.has_reasoning = true;
                 set_delta_role_assistant(&mut chunk);
                 set_choice_delta(
                     &mut chunk,
@@ -368,11 +449,28 @@ pub fn convert_non_stream_response(
         out["usage"] = usage_out;
     }
 
+    let mut reasoning = String::new();
+    if let Some(t) = resp
+        .get("reasoning_summary")
+        .and_then(|v| v.get("text"))
+        .and_then(Value::as_str)
+    {
+        if !t.is_empty() {
+            reasoning.push_str(t);
+        }
+    }
+    if reasoning.is_empty() {
+        if let Some(t) = resp.get("reasoning_summary").and_then(Value::as_str) {
+            if !t.is_empty() {
+                reasoning.push_str(t);
+            }
+        }
+    }
+
     let mut has_output = false;
 
     if let Some(output) = resp.get("output").and_then(Value::as_array) {
         let mut content = String::new();
-        let mut reasoning = String::new();
         let mut tool_calls: Vec<Value> = Vec::new();
 
         for item in output {
@@ -389,9 +487,49 @@ pub fn convert_non_stream_response(
                             }
                         }
                     }
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            match part.get("type").and_then(Value::as_str).unwrap_or_default() {
+                                "reasoning_text" | "text" => {
+                                    if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                        if !t.is_empty() {
+                                            reasoning.push_str(t);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     if let Some(t) = item.get("text").and_then(Value::as_str) {
                         if !t.is_empty() {
                             reasoning.push_str(t);
+                        }
+                    }
+                }
+                "reasoning_text" => {
+                    if let Some(t) = item.get("text").and_then(Value::as_str) {
+                        if !t.is_empty() {
+                            reasoning.push_str(t);
+                        }
+                    }
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                if !t.is_empty() {
+                                    reasoning.push_str(t);
+                                }
+                            }
+                        }
+                    }
+                }
+                "content_part" => {
+                    let part = item.get("part").unwrap_or(&Value::Null);
+                    if part.get("type").and_then(Value::as_str) == Some("reasoning_text") {
+                        if let Some(t) = part.get("text").and_then(Value::as_str) {
+                            if !t.is_empty() {
+                                reasoning.push_str(t);
+                            }
                         }
                     }
                 }
@@ -442,13 +580,15 @@ pub fn convert_non_stream_response(
             has_output = true;
             out["choices"][0]["message"]["content"] = Value::String(content);
         }
-        if !reasoning.is_empty() {
-            out["choices"][0]["message"]["reasoning_content"] = Value::String(reasoning);
-        }
         if !tool_calls.is_empty() {
             has_output = true;
             out["choices"][0]["message"]["tool_calls"] = Value::Array(tool_calls);
         }
+    }
+
+    if !reasoning.is_empty() {
+        has_output = true;
+        out["choices"][0]["message"]["reasoning_content"] = Value::String(reasoning);
     }
 
     if resp.get("status").and_then(Value::as_str) == Some("completed") {
@@ -456,6 +596,65 @@ pub fn convert_non_stream_response(
     }
 
     (out.to_string(), has_output)
+}
+
+fn reasoning_item_key(root: &Value) -> String {
+    if let Some(item_id) = root.get("item_id").and_then(Value::as_str) {
+        if !item_id.is_empty() {
+            return item_id.to_string();
+        }
+    }
+    format!(
+        "_idx:{}",
+        root.get("output_index").and_then(Value::as_i64).unwrap_or(0)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_stream_reasoning_text_done_emits_when_no_delta() {
+        let mut state = StreamState::new("gpt-5.4");
+        let reverse = HashMap::new();
+
+        let _ = convert_stream_chunk(
+            br#"data: {"type":"response.created","response":{"id":"r1","created_at":1,"model":"gpt-5.4"}}"#,
+            &mut state,
+            &reverse,
+        );
+        let out = convert_stream_chunk(
+            br#"data: {"type":"response.reasoning_text.done","item_id":"it1","text":"chain"}"#,
+            &mut state,
+            &reverse,
+        );
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains(r#""reasoning_content":"chain""#), "{}", out[0]);
+        assert!(state.has_reasoning);
+    }
+
+    #[test]
+    fn response_non_stream_reasoning_only_counts_as_output() {
+        let reverse = HashMap::new();
+        let raw = br#"{
+          "type":"response.completed",
+          "response":{
+            "id":"r1",
+            "created_at":1,
+            "model":"gpt-5.4",
+            "status":"completed",
+            "reasoning_summary":{"text":"think"},
+            "usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}
+          }
+        }"#;
+
+        let (out, has_output) = convert_non_stream_response(raw, &reverse);
+        assert!(has_output);
+        let value: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["choices"][0]["message"]["reasoning_content"], "think");
+    }
 }
 
 fn base_chunk(state: &StreamState) -> Value {

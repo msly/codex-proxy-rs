@@ -34,8 +34,10 @@ fn build_state(api_keys: &[&str]) -> AppState {
             )
             .unwrap(),
         ),
+        request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(keys),
         max_retry: 0,
+        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,

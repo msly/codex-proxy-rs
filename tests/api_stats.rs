@@ -66,6 +66,9 @@ async fn api_stats_returns_cached_quota_raw_json() {
         .into_bytes(),
         checked_at_ms: 123,
     });
+    let request_stats = Arc::new(api::RequestStats::default());
+    request_stats.record_request();
+    request_stats.record_request();
 
     let state = AppState {
         manager: manager.clone(),
@@ -85,8 +88,10 @@ async fn api_stats_returns_cached_quota_raw_json() {
             )
             .unwrap(),
         ),
+        request_stats: request_stats.clone(),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
+        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -111,6 +116,9 @@ async fn api_stats_returns_cached_quota_raw_json() {
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
     assert_eq!(v["summary"]["total"], 1);
+    assert_eq!(v["summary"]["rpm"], 2);
+    assert_eq!(v["summary"]["total_input_tokens"], 10);
+    assert_eq!(v["summary"]["total_output_tokens"], 20);
     assert_eq!(v["accounts"][0]["email"], "x@example.com");
     assert_eq!(v["accounts"][0]["plan_type"], "plus");
     assert_eq!(v["accounts"][0]["quota_exhausted"], true);

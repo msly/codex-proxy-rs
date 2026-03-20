@@ -5,15 +5,15 @@ use std::time::{Duration, Instant};
 
 use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig, KeepAlive, KeepAliveConfig};
 use codex_proxy_rs::refresh::{
-    RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue, refresh_account_with_remove_reason,
+    RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue, refresh_account_with_options,
 };
 use codex_proxy_rs::{
     api,
     config::Config,
-    core::{Account, Manager},
+    core::{Account, Manager, QuotaFirstSelector, RoundRobinSelector, Selector},
     net,
     quota::QuotaChecker,
-    upstream::codex::{CodexClient, On401Hook},
+    upstream::codex::{CodexClient, On401Hook, RetryPolicy},
 };
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -25,11 +25,17 @@ async fn main() -> Result<(), String> {
 
     init_tracing(&cfg.log_level);
 
-    let manager = Arc::new(Manager::new(&cfg.auth_dir));
+    let selector: Arc<dyn Selector> = if cfg.selector == "quota-first" {
+        Arc::new(QuotaFirstSelector::new())
+    } else {
+        Arc::new(RoundRobinSelector::new())
+    };
+    let manager = Arc::new(Manager::new_with_selector(&cfg.auth_dir, selector));
     if cfg.startup_async_load {
         tracing::info!("startup_async_load enabled; accounts will load in background");
         let manager = manager.clone();
         let auth_dir = cfg.auth_dir.clone();
+        let retry_interval = cfg.startup_load_retry_interval.max(1);
         tokio::spawn(async move {
             let start = Instant::now();
             loop {
@@ -39,9 +45,10 @@ async fn main() -> Result<(), String> {
                         if count == 0 {
                             tracing::warn!(
                                 auth_dir = %auth_dir,
-                                "后台加载账号失败: 未找到有效账号文件，10 秒后重试"
+                                retry_interval,
+                                "后台加载账号失败: 未找到有效账号文件，稍后重试"
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            tokio::time::sleep(Duration::from_secs(retry_interval)).await;
                             continue;
                         }
                         tracing::info!(
@@ -53,8 +60,8 @@ async fn main() -> Result<(), String> {
                         return;
                     }
                     Err(err) => {
-                        tracing::warn!("后台加载账号失败: {err}，10 秒后重试");
-                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        tracing::warn!(retry_interval, "后台加载账号失败: {err}，稍后重试");
+                        tokio::time::sleep(Duration::from_secs(retry_interval)).await;
                     }
                 }
             }
@@ -72,33 +79,61 @@ async fn main() -> Result<(), String> {
 
     let base_url = Url::parse(&cfg.base_url).map_err(|e| format!("base-url 无效: {e}"))?;
     let codex_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(5 * 60))?;
-    let codex_client = Arc::new(CodexClient::new_with_http(base_url.clone(), codex_http));
+    let codex_client = Arc::new(CodexClient::new_with_http_and_policy(
+        base_url.clone(),
+        codex_http,
+        RetryPolicy {
+            cooldown_401_ms: (cfg.cooldown_401_sec as i64).saturating_mul(1000),
+            default_cooldown_429_ms: (cfg.cooldown_429_sec as i64).saturating_mul(1000),
+            header_timeout: if cfg.upstream_timeout_sec > 0 {
+                Some(Duration::from_secs(cfg.upstream_timeout_sec))
+            } else {
+                None
+            },
+        },
+    ));
 
     let quota_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(20))?;
-    let quota_checker = Arc::new(QuotaChecker::new_with_config(&cfg, 50, quota_http)?);
+    let quota_checker = Arc::new(QuotaChecker::new_with_config(
+        &cfg,
+        cfg.quota_check_concurrency as usize,
+        quota_http,
+    )?);
 
-    let refresh_http = net::build_generic_reqwest_client(&cfg, Duration::from_secs(30))?;
+    let refresh_http = net::build_generic_reqwest_client(
+        &cfg,
+        Duration::from_secs(cfg.refresh_single_timeout_sec.max(1)),
+    )?;
     let refresher = Refresher::new_with_http(refresh_http);
-    let save_queue = SaveQueue::start(4);
+    let save_queue = SaveQueue::start(cfg.save_workers as usize);
 
     let on_401: On401Hook = {
         let manager = manager.clone();
         let refresher = refresher.clone();
         let save_queue = save_queue.clone();
+        let refresh_timeout = Duration::from_secs(cfg.refresh_single_timeout_sec.max(1));
+        let cooldown_429_ms = (cfg.cooldown_429_sec as i64).saturating_mul(1000);
         Arc::new(move |acc: Arc<Account>| {
             let manager = manager.clone();
             let refresher = refresher.clone();
             let save_queue = save_queue.clone();
+            let refresh_timeout = refresh_timeout;
+            let cooldown_429_ms = cooldown_429_ms;
             tokio::spawn(async move {
-                let _ = refresh_account_with_remove_reason(
+                let file_path = acc.file_path().to_string();
+                let refresh = refresh_account_with_options(
                     manager.as_ref(),
                     &refresher,
                     &save_queue,
                     acc,
                     2,
                     "auth_401",
-                )
-                .await;
+                    cooldown_429_ms,
+                );
+                if tokio::time::timeout(refresh_timeout, refresh).await.is_err() {
+                    tracing::warn!(file_path, "401 background refresh timed out");
+                    manager.remove_account(&file_path, "auth_401");
+                }
             });
         })
     };
@@ -124,8 +159,10 @@ async fn main() -> Result<(), String> {
         manager: manager.clone(),
         quota_checker,
         codex_client: codex_client.clone(),
+        request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(api_keys),
         max_retry: cfg.max_retry,
+        empty_retry_max: cfg.empty_retry_max,
         refresher: refresher.clone(),
         save_queue: save_queue.clone(),
         refresh_concurrency: cfg.refresh_concurrency as usize,
@@ -139,7 +176,7 @@ async fn main() -> Result<(), String> {
 
     if cfg.refresh_interval > 0 {
         let refresh_interval = Duration::from_secs(cfg.refresh_interval);
-        let scan_interval = Duration::from_secs(30.min(cfg.refresh_interval));
+        let scan_interval = Duration::from_secs(cfg.auth_scan_interval.min(cfg.refresh_interval));
 
         match RefreshLoop::new(
             manager.clone(),
@@ -150,6 +187,8 @@ async fn main() -> Result<(), String> {
                 scan_interval,
                 refresh_concurrency: cfg.refresh_concurrency as usize,
                 max_retries: 3,
+                refresh_batch_size: cfg.refresh_batch_size as usize,
+                rate_limit_cooldown_ms: (cfg.cooldown_429_sec as i64).saturating_mul(1000),
             },
         ) {
             Ok(loop_) => {
@@ -207,7 +246,7 @@ async fn main() -> Result<(), String> {
                 ping_url,
                 keepalive_http,
                 KeepAliveConfig {
-                    interval: Duration::from_secs(60),
+                    interval: Duration::from_secs(cfg.keepalive_interval),
                     request_timeout: Duration::from_secs(10),
                 },
             );
@@ -219,16 +258,46 @@ async fn main() -> Result<(), String> {
         Err(err) => tracing::warn!("keepalive disabled: {err}"),
     }
 
-    let shutdown = async move {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("shutdown signal received");
-        let _ = shutdown_tx.send(true);
-    };
+    let mut server_shutdown = shutdown_rx.clone();
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                loop {
+                    if server_shutdown.changed().await.is_err() {
+                        break;
+                    }
+                    if *server_shutdown.borrow() {
+                        break;
+                    }
+                }
+            })
+            .await
+            .map_err(|e| format!("server error: {e}"))
+    });
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .map_err(|e| format!("server error: {e}"))?;
+    tokio::select! {
+        result = &mut server => {
+            return result.map_err(|e| format!("server task join failed: {e}"))?;
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("shutdown signal received");
+        }
+    }
+
+    let _ = shutdown_tx.send(true);
+    let shutdown_timeout = Duration::from_secs(cfg.shutdown_timeout.max(1));
+    match tokio::time::timeout(shutdown_timeout, &mut server).await {
+        Ok(result) => {
+            result
+                .map_err(|e| format!("server task join failed: {e}"))?
+                .map_err(|e| format!("server error: {e}"))?;
+        }
+        Err(_) => {
+            tracing::warn!(timeout = ?shutdown_timeout, "server shutdown timed out; aborting");
+            server.abort();
+            let _ = server.await;
+        }
+    }
 
     Ok(())
 }
