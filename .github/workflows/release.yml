@@ -28,11 +28,11 @@ jobs:
             artifact_name: windows-x86_64
             asset_name: codex-proxy-rs-windows-x86_64.exe
             binary_path: target/release/codex-proxy-rs.exe
-          - runner: macos-13
+          - runner: macos-15-intel
             artifact_name: darwin-x86_64
             asset_name: codex-proxy-rs-darwin-x86_64
             binary_path: target/release/codex-proxy-rs
-          - runner: macos-14
+          - runner: macos-15
             artifact_name: darwin-arm64
             asset_name: codex-proxy-rs-darwin-arm64
             binary_path: target/release/codex-proxy-rs
