@@ -355,6 +355,9 @@ async fn api_v1_chat_completions_stream_accepts_reasoning_only_output() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert!(body.contains("\"reasoning_content\":\"chain\""), "body: {body}");
+    assert!(
+        body.contains("\"reasoning_content\":\"chain\""),
+        "body: {body}"
+    );
     assert!(body.contains("data: [DONE]"), "body: {body}");
 }

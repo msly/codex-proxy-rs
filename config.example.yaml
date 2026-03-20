@@ -1,0 +1,60 @@
+# Listener address. Go-style ":8080" is supported.
+listen: ":8080"
+
+# Directory containing account JSON files.
+auth-dir: "./auths"
+
+# Upstream Codex base URL. If empty, Rust derives it from backend-domain.
+base-url: "https://chatgpt.com/backend-api/codex"
+backend-domain: "chatgpt.com"
+
+# Optional proxy used by upstream / quota / health / keepalive clients.
+proxy-url: ""
+
+# Logging: debug | info | warn | error
+log-level: "info"
+
+# Internal retry count. Total attempts = max-retry + 1.
+max-retry: 2
+
+# Optional API keys. Leave empty to disable auth.
+api-keys:
+  - "sk-your-custom-key"
+
+# Health checker. Set interval to 0 to disable.
+health-check-interval: 300
+health-check-max-failures: 3
+health-check-concurrency: 5
+health-check-start-delay: 45
+health-check-batch-size: 20
+health-check-request-timeout: 8
+
+# Network settings. See docs/network.md for Go parity notes.
+# enable-http2 controls outbound clients for Codex / wham / health / keepalive.
+enable-http2: true
+# backend-resolve-address: "1.2.3.4" # or "host:port"
+max-conns-per-host: 20
+max-idle-conns: 50
+max-idle-conns-per-host: 10
+
+# Other runtime settings.
+refresh-interval: 3000
+refresh-concurrency: 50
+startup-async-load: true
+startup-load-retry-interval: 10
+shutdown-timeout: 5
+auth-scan-interval: 30
+save-workers: 4
+cooldown-401-sec: 30
+cooldown-429-sec: 60
+refresh-single-timeout-sec: 30
+quota-check-concurrency: 50
+keepalive-interval: 60
+upstream-timeout-sec: 0
+empty-retry-max: 2
+selector: "round-robin" # or "quota-first"
+refresh-batch-size: 0
+
+# These options are currently kept for Go-compatible config parity only.
+stream-idle-timeout-sec: 0
+enable-stream-idle-retry: true

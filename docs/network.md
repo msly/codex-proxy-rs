@@ -20,6 +20,7 @@ OAuth refresh（`https://auth.openai.com/oauth/token`）使用“通用 client b
 - Go：`Transport.ForceAttemptHTTP2`
 - Rust：`enable-http2: false` 时启用 `reqwest::ClientBuilder::http1_only()`
 - 说明：默认 **true**，与当前 Go 版默认值一致；如遇上游 `GOAWAY ENHANCE_YOUR_CALM`，可按 Go 的建议调低连接池参数或关闭 HTTP/2。
+- 范围：该配置只影响出站到 Codex / wham / health checker / keepalive 的 HTTP client，不控制当前代理进程的入站监听协议。
 
 ### `backend-resolve-address`
 

@@ -19,10 +19,7 @@ impl Manager {
         Self::new_with_selector(auth_dir, Arc::new(RoundRobinSelector::new()))
     }
 
-    pub fn new_with_selector(
-        auth_dir: impl Into<PathBuf>,
-        selector: Arc<dyn Selector>,
-    ) -> Self {
+    pub fn new_with_selector(auth_dir: impl Into<PathBuf>, selector: Arc<dyn Selector>) -> Self {
         Self {
             auth_dir: auth_dir.into(),
             accounts: ArcSwap::from_pointee(Vec::new()),

@@ -310,6 +310,7 @@ mod tests {
         assert_eq!(cfg.backend_domain, "chatgpt.com");
         assert_eq!(cfg.base_url, "https://chatgpt.com/backend-api/codex");
         assert_eq!(cfg.log_level, "info");
+        assert!(cfg.enable_http2);
         assert_eq!(cfg.selector, "round-robin");
         assert_eq!(cfg.quota_check_concurrency, 50);
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8080");

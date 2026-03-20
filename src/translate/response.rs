@@ -606,7 +606,9 @@ fn reasoning_item_key(root: &Value) -> String {
     }
     format!(
         "_idx:{}",
-        root.get("output_index").and_then(Value::as_i64).unwrap_or(0)
+        root.get("output_index")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
     )
 }
 
@@ -631,7 +633,11 @@ mod tests {
         );
 
         assert_eq!(out.len(), 1);
-        assert!(out[0].contains(r#""reasoning_content":"chain""#), "{}", out[0]);
+        assert!(
+            out[0].contains(r#""reasoning_content":"chain""#),
+            "{}",
+            out[0]
+        );
         assert!(state.has_reasoning);
     }
 

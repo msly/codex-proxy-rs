@@ -31,10 +31,13 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
 
 ```bash
 cd codex-proxy-rs
+cp config.example.yaml config.yaml
 cargo run -- --config config.yaml
 ```
 
 ## Docker
+
+当前仓库只维护本地 `Dockerfile` / `docker-compose.yml` 工作流，不发布 GHCR 镜像。
 
 ```bash
 cd codex-proxy-rs
@@ -59,67 +62,27 @@ docker compose up --build
 
 ### 配置示例（`config.yaml`）
 
-```yaml
-# 监听地址（Go 兼容写法）
-listen: ":8080"
+完整示例见仓库根目录 [`config.example.yaml`](./config.example.yaml)。
 
-# 账号目录（里面放 *.json token 文件）
-auth-dir: "./auths"
+- `base-url` 优先级高于 `backend-domain`
+- `enable-http2: true` 默认开启，控制的是代理访问上游 Codex / quota / health / keepalive 的出站 HTTP client，不是入站监听协议
+- 如果上游出现 `GOAWAY ENHANCE_YOUR_CALM`，优先调低连接池参数，必要时再将 `enable-http2` 设为 `false`
+- `stream-idle-timeout-sec` / `enable-stream-idle-retry` 当前与 Go 一样仅保留配置面
 
-# 上游 Codex base url（不配则按 backend-domain 拼）
-base-url: "https://chatgpt.com/backend-api/codex"
-backend-domain: "chatgpt.com"
+更多网络配置说明见 [`docs/network.md`](./docs/network.md)。
 
-# 可选：全局代理（同时用于 upstream + quota + health + keepalive）
-proxy-url: ""
+## Release
 
-# 日志级别：debug|info|warn|error
-log-level: "info"
+推送匹配 `v*` 的 tag 会触发 GitHub Actions：
 
-# 内部重试次数（0 表示不重试；总尝试次数 = max-retry + 1）
-max-retry: 2
+- 构建原始二进制：Linux x86_64、Windows x86_64、macOS x86_64、macOS arm64
+- 创建 GitHub Release 资产：各平台二进制、`config.example.yaml`、`SHA256SUMS`
 
-# API key 鉴权（为空则不鉴权；支持 Authorization Bearer / x-api-key / api-key）
-api-keys:
-  - "your-api-key"
+当前 workflow：
 
-# health checker（0 禁用）
-health-check-interval: 300
-health-check-max-failures: 3
-health-check-concurrency: 5
-health-check-start-delay: 45
-health-check-batch-size: 20
-health-check-request-timeout: 8
-
-# 网络配置（对齐说明见 docs/network.md）
-enable-http2: true
-# backend-resolve-address: "1.2.3.4" # or "host:port"
-max-conns-per-host: 20
-max-idle-conns: 50
-max-idle-conns-per-host: 10
-
-# 其他配置项
-refresh-interval: 3000
-refresh-concurrency: 50
-startup-async-load: true
-startup-load-retry-interval: 10
-shutdown-timeout: 5
-auth-scan-interval: 30
-save-workers: 4
-cooldown-401-sec: 30
-cooldown-429-sec: 60
-refresh-single-timeout-sec: 30
-quota-check-concurrency: 50
-keepalive-interval: 60
-upstream-timeout-sec: 0
-empty-retry-max: 2
-selector: "round-robin" # or "quota-first"
-refresh-batch-size: 0
-
-# 这两个配置当前与 Go 一样仅保留配置面
-stream-idle-timeout-sec: 0
-enable-stream-idle-retry: true
-```
+- 不打 zip
+- 不发布 Docker 镜像
+- 可通过 `workflow_dispatch` 手动触发构建；只有 tag 触发会发布 Release
 
 ### auth 文件示例（`auths/a.json`）
 

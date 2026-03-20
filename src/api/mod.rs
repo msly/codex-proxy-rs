@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -1200,7 +1200,11 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     );
                     continue;
                 }
-                return send_error(StatusCode::BAD_REQUEST, "empty response", "invalid_response");
+                return send_error(
+                    StatusCode::BAD_REQUEST,
+                    "empty response",
+                    "invalid_response",
+                );
             }
             ChatNonStreamOutcome::MissingCompleted => {
                 return send_error(
@@ -1212,7 +1216,11 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         }
     }
 
-    send_error(StatusCode::BAD_REQUEST, "empty response", "invalid_response")
+    send_error(
+        StatusCode::BAD_REQUEST,
+        "empty response",
+        "invalid_response",
+    )
 }
 
 enum ChatNonStreamOutcome {

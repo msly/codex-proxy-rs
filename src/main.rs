@@ -130,7 +130,10 @@ async fn main() -> Result<(), String> {
                     "auth_401",
                     cooldown_429_ms,
                 );
-                if tokio::time::timeout(refresh_timeout, refresh).await.is_err() {
+                if tokio::time::timeout(refresh_timeout, refresh)
+                    .await
+                    .is_err()
+                {
                     tracing::warn!(file_path, "401 background refresh timed out");
                     manager.remove_account(&file_path, "auth_401");
                 }
