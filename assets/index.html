@@ -430,6 +430,7 @@
       </div>
       <div class="actions">
         <button id="refreshBtn">刷新数据</button>
+        <button id="checkQuotaBtn" class="secondary">查额度</button>
         <button id="clearBtn" class="secondary">清空缓存</button>
         <button id="settingsBtn" class="ghost">设置接口</button>
         <span class="pill" id="cacheState">缓存：未加载</span>
@@ -531,7 +532,7 @@
             <th>最终失败</th>
             <th><button type="button" class="sort-btn" data-sort-key="last_used_ms">最后使用 <span class="sort-indicator" data-indicator-for="last_used_ms">-</span></button></th>
             <th>Token 过期</th>
-            <th>额度</th>
+            <th><button type="button" class="sort-btn" data-sort-key="quota_remaining_sort">额度 <span class="sort-indicator" data-indicator-for="quota_remaining_sort">-</span></button></th>
           </tr>
         </thead>
         <tbody id="tableBody"></tbody>
@@ -579,6 +580,7 @@
       prevBtn: document.getElementById("prevBtn"),
       nextBtn: document.getElementById("nextBtn"),
       refreshBtn: document.getElementById("refreshBtn"),
+      checkQuotaBtn: document.getElementById("checkQuotaBtn"),
       clearBtn: document.getElementById("clearBtn"),
       updatedAt: document.getElementById("updatedAt"),
       cacheState: document.getElementById("cacheState"),
@@ -652,6 +654,30 @@
       return { active: 0, cooldown: 1, disabled: 2 }[String(status || "").toLowerCase()] ?? 9;
     }
 
+    function clampPercent(value) {
+      return Math.max(0, Math.min(100, Number(value) || 0));
+    }
+
+    function formatPercent(value) {
+      return `${clampPercent(value).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}%`;
+    }
+
+    function quotaRemainingSortValue(row) {
+      if (row?.quota_exhausted) return 0;
+      const used = Number(row?.used_percent);
+      if (!Number.isFinite(used) || used < 0) return 0.001;
+      return clampPercent(100 - used);
+    }
+
+    function formatQuotaCell(row) {
+      if (row?.quota_exhausted) return "已用尽";
+      const used = Number(row?.used_percent);
+      if (!Number.isFinite(used) || used < 0) return "未查询";
+      const remaining = clampPercent(100 - used);
+      if (remaining <= 0) return "已用尽";
+      return formatPercent(remaining);
+    }
+
     function setCache(data, meta) {
       cache = { data, meta };
       memoryOnlyCache = false;
@@ -716,6 +742,24 @@
       const origin = window.location.origin || "";
       if (origin && origin !== "null") return `${origin}/stats`;
       return "http://127.0.0.1/stats";
+    }
+
+    function buildAuthHeaders(token) {
+      const headers = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+      return headers;
+    }
+
+    function deriveManagementUrl(apiUrl, endpoint) {
+      const url = new URL(apiUrl, window.location.href);
+      const statsSuffix = "/stats";
+      const basePath = url.pathname.endsWith(statsSuffix)
+        ? url.pathname.slice(0, -statsSuffix.length)
+        : url.pathname.replace(/\/+$/, "");
+      url.pathname = `${basePath}/${endpoint}`.replace(/\/{2,}/g, "/");
+      url.search = "";
+      url.hash = "";
+      return url.toString();
     }
 
     function showLogin(show) {
@@ -963,6 +1007,7 @@
       if (key === "status") return statusRank(row.status);
       if (key === "successful_requests") return Number(row.successful_requests || 0);
       if (key === "last_used_ms") return Number(row.last_used_ms || 0);
+      if (key === "quota_remaining_sort") return quotaRemainingSortValue(row);
       return row[key] ?? "";
     }
 
@@ -1024,7 +1069,7 @@
           <td>${formatNumber(row.failed_requests)}</td>
           <td>${formatDate(row.last_used_at)}</td>
           <td>${formatDate(row.token_expire)}</td>
-          <td>${row.quota_exhausted ? "已用尽" : "可用"}</td>
+          <td>${formatQuotaCell(row)}</td>
         `;
         fragment.appendChild(tr);
       }
@@ -1074,8 +1119,7 @@
           showLogin(true);
           return;
         }
-        const headers = {};
-        if (cred.token) headers.Authorization = `Bearer ${cred.token}`;
+        const headers = buildAuthHeaders(cred.token);
         const res = await fetch(cred.apiUrl, { method: "GET", headers });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
@@ -1095,6 +1139,39 @@
       applyTableState();
       showPlaceholder(false);
       updateCacheBadge();
+    }
+
+    async function checkQuota() {
+      const cred = getCredentials();
+      if (!cred?.apiUrl) {
+        showLogin(true);
+        return;
+      }
+
+      const originalText = els.checkQuotaBtn.textContent;
+      els.checkQuotaBtn.disabled = true;
+      els.checkQuotaBtn.textContent = "查额度中...";
+      els.cacheState.textContent = "缓存：查额度中...";
+      setLoading(true);
+
+      try {
+        const res = await fetch(deriveManagementUrl(cred.apiUrl, "check-quota"), {
+          method: "POST",
+          headers: buildAuthHeaders(cred.token)
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await res.text();
+        clearCache();
+        showPlaceholder(true);
+        await fetchStats();
+      } catch (err) {
+        if (!cache) showPlaceholder(true);
+        updateCacheBadge();
+      } finally {
+        els.checkQuotaBtn.disabled = false;
+        els.checkQuotaBtn.textContent = originalText;
+        setLoading(false);
+      }
     }
 
     function init() {
@@ -1128,6 +1205,9 @@
       clearCache();
       showPlaceholder(true);
       fetchStats();
+    });
+    els.checkQuotaBtn.addEventListener("click", () => {
+      checkQuota();
     });
     els.clearBtn.addEventListener("click", () => {
       clearCache();
