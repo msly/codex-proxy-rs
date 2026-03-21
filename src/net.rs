@@ -63,10 +63,6 @@ fn pick_pool_max_idle_per_host(cfg: &Config) -> Option<usize> {
     if per_host > 0 {
         return Some(per_host);
     }
-    let total = cfg.max_idle_conns as usize;
-    if total > 0 {
-        return Some(total);
-    }
     None
 }
 
@@ -145,5 +141,13 @@ mod tests {
         let resp = client.get("http://backend.test/ping").send().await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    #[test]
+    fn net_pool_max_idle_per_host_does_not_fallback_to_removed_global_limit() {
+        let mut cfg = Config::default();
+        cfg.max_idle_conns_per_host = 0;
+
+        assert_eq!(pick_pool_max_idle_per_host(&cfg), None);
     }
 }

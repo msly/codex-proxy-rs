@@ -93,19 +93,39 @@ impl RequestStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageTokens {
+    input_tokens: i64,
+    output_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    total_tokens: i64,
+}
+
+impl UsageTokens {
+    fn has_activity(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cached_tokens > 0
+            || self.reasoning_tokens > 0
+            || self.total_tokens > 0
+    }
+}
+
 fn record_hourly_request(runtime_state: &RuntimeStateStore, now_ms: i64) {
     runtime_state.record_hourly_request(now_ms);
 }
 
-fn record_hourly_usage(
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    total_tokens: i64,
-) {
-    if input_tokens > 0 || output_tokens > 0 {
-        runtime_state.record_hourly_usage(now_ms, input_tokens, output_tokens, total_tokens);
+fn record_hourly_usage(runtime_state: &RuntimeStateStore, now_ms: i64, usage: UsageTokens) {
+    if usage.has_activity() {
+        runtime_state.record_hourly_usage(
+            now_ms,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_tokens,
+            usage.reasoning_tokens,
+            usage.total_tokens,
+        );
     }
 }
 
@@ -121,17 +141,43 @@ fn record_client_success(
     record_hourly_request(runtime_state, now_ms);
 }
 
-fn extract_usage_tokens(value: &serde_json::Value) -> Option<(i64, i64, i64)> {
-    let usage = value
-        .get("usage")
-        .or_else(|| value.get("response").and_then(|response| response.get("usage")))?;
+fn extract_usage_tokens(value: &serde_json::Value) -> Option<UsageTokens> {
+    let usage = value.get("usage").or_else(|| {
+        value
+            .get("response")
+            .and_then(|response| response.get("usage"))
+    })?;
     let input_tokens = usage
         .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .max(0);
     let output_tokens = usage
         .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let cached_tokens = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let reasoning_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .or_else(|| {
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+        })
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .max(0);
@@ -141,11 +187,19 @@ fn extract_usage_tokens(value: &serde_json::Value) -> Option<(i64, i64, i64)> {
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens))
         .max(0);
 
-    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+    let usage = UsageTokens {
+        input_tokens,
+        output_tokens,
+        cached_tokens,
+        reasoning_tokens,
+        total_tokens,
+    };
+
+    if !usage.has_activity() {
         return None;
     }
 
-    Some((input_tokens, output_tokens, total_tokens))
+    Some(usage)
 }
 
 fn record_usage_from_value(
@@ -154,17 +208,17 @@ fn record_usage_from_value(
     now_ms: i64,
     value: &serde_json::Value,
 ) {
-    let Some((input_tokens, output_tokens, total_tokens)) = extract_usage_tokens(value) else {
+    let Some(usage) = extract_usage_tokens(value) else {
         return;
     };
-    account.record_usage(input_tokens, output_tokens, total_tokens);
-    record_hourly_usage(
-        runtime_state,
-        now_ms,
-        input_tokens,
-        output_tokens,
-        total_tokens,
+    account.record_usage_detail(
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_tokens,
+        usage.reasoning_tokens,
+        usage.total_tokens,
     );
+    record_hourly_usage(runtime_state, now_ms, usage);
 }
 
 fn record_usage_from_json_bytes(
@@ -1352,15 +1406,22 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
             if state.completed && (state.has_text || state.has_tool_call || state.has_reasoning) {
                 let now_ms = crate::core::now_unix_ms();
-                if state.usage_input > 0 || state.usage_output > 0 {
-                    account.record_usage(state.usage_input, state.usage_output, state.usage_total);
-                    record_hourly_usage(
-                        runtime_state.as_ref(),
-                        now_ms,
-                        state.usage_input,
-                        state.usage_output,
-                        state.usage_total,
+                let usage = UsageTokens {
+                    input_tokens: state.usage_input,
+                    output_tokens: state.usage_output,
+                    cached_tokens: state.usage_cached,
+                    reasoning_tokens: state.usage_reasoning,
+                    total_tokens: state.usage_total,
+                };
+                if usage.has_activity() {
+                    account.record_usage_detail(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_tokens,
+                        usage.reasoning_tokens,
+                        usage.total_tokens,
                     );
+                    record_hourly_usage(runtime_state.as_ref(), now_ms, usage);
                 }
                 record_client_success(
                     account.as_ref(),
@@ -1510,28 +1571,15 @@ fn parse_chat_non_stream_response(
                 continue;
             }
 
-            let usage = v.get("response").and_then(|r| r.get("usage"));
-            let input_tokens = usage
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let output_tokens = usage
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let total_tokens = usage
-                .and_then(|u| u.get("total_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if input_tokens > 0 || output_tokens > 0 {
-                account.record_usage(input_tokens, output_tokens, total_tokens);
-                record_hourly_usage(
-                    runtime_state,
-                    now_ms,
-                    input_tokens,
-                    output_tokens,
-                    total_tokens,
+            if let Some(usage) = extract_usage_tokens(&v) {
+                account.record_usage_detail(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_tokens,
+                    usage.reasoning_tokens,
+                    usage.total_tokens,
                 );
+                record_hourly_usage(runtime_state, now_ms, usage);
             }
         }
 
@@ -1847,6 +1895,8 @@ struct StatsSummary {
     rpm: i64,
     total_input_tokens: i64,
     total_output_tokens: i64,
+    total_cached_tokens: i64,
+    total_reasoning_tokens: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1863,6 +1913,8 @@ struct StatsUsage {
     total_completions: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
     total_tokens: i64,
 }
 
@@ -1873,6 +1925,8 @@ struct StatsTrendPoint {
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
     total_tokens: i64,
 }
 
@@ -1929,6 +1983,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let mut disabled = 0usize;
     let mut total_input_tokens = 0i64;
     let mut total_output_tokens = 0i64;
+    let mut total_cached_tokens = 0i64;
+    let mut total_reasoning_tokens = 0i64;
 
     for acc in accounts.iter() {
         let snap = acc.stats_snapshot();
@@ -1939,6 +1995,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         }
         total_input_tokens += snap.usage_input_tokens;
         total_output_tokens += snap.usage_output_tokens;
+        total_cached_tokens += snap.usage_cached_tokens;
+        total_reasoning_tokens += snap.usage_reasoning_tokens;
 
         fn ms_to_rfc3339(ms: i64) -> Option<String> {
             if ms <= 0 {
@@ -2003,6 +2061,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
                 total_completions: snap.usage_total_completions,
                 input_tokens: snap.usage_input_tokens,
                 output_tokens: snap.usage_output_tokens,
+                cached_tokens: snap.usage_cached_tokens,
+                reasoning_tokens: snap.usage_reasoning_tokens,
                 total_tokens: snap.usage_total_tokens,
             },
             quota,
@@ -2034,6 +2094,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
                 requests: point.requests,
                 input_tokens: point.input_tokens,
                 output_tokens: point.output_tokens,
+                cached_tokens: point.cached_tokens,
+                reasoning_tokens: point.reasoning_tokens,
                 total_tokens: point.total_tokens,
             })
             .collect(),
@@ -2048,6 +2110,8 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
             rpm: state.request_stats.rpm(),
             total_input_tokens,
             total_output_tokens,
+            total_cached_tokens,
+            total_reasoning_tokens,
         },
         trend,
         accounts: out,

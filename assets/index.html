@@ -179,6 +179,33 @@
       text-transform: uppercase;
       letter-spacing: 1px;
     }
+    .chart-legend {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .legend-item {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .legend-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      display: inline-block;
+      border: 1px solid rgba(20, 19, 19, 0.12);
+    }
+    .legend-swatch.line {
+      width: 14px;
+      height: 0;
+      border-radius: 0;
+      border: 0;
+      border-top: 3px solid currentColor;
+    }
     .chart-svg {
       width: 100%;
       height: 220px;
@@ -414,7 +441,7 @@
       <div class="trend-header">
         <div>
           <h2>小时趋势</h2>
-          <p class="subtitle">展示 requests 与 total tokens 的最近小时走势</p>
+          <p class="subtitle">展示 requests 与 token breakdown 的最近小时走势</p>
         </div>
         <div class="segmented" id="trendRange">
           <button type="button" data-hours="24" class="active">24h</button>
@@ -432,8 +459,15 @@
         </div>
         <div class="chart-card">
           <div class="chart-meta">
-            <h3>Tokens / Hour</h3>
+            <h3>Token Breakdown / Hour</h3>
             <span class="muted" id="tokensChartMeta">--</span>
+          </div>
+          <div class="chart-legend" aria-label="token legend">
+            <span class="legend-item"><span class="legend-swatch" style="background:#1b9aaa"></span>Input</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:#ffb703"></span>Cached</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:#ef476f"></span>Output</span>
+            <span class="legend-item"><span class="legend-swatch" style="background:#2d6a4f"></span>Reasoning</span>
+            <span class="legend-item"><span class="legend-swatch line" style="color:#141313"></span>Total</span>
           </div>
           <svg id="tokensChart" class="chart-svg" viewBox="0 0 560 220" preserveAspectRatio="none"></svg>
         </div>
@@ -697,16 +731,33 @@
 
     function renderSummary(summary, accounts) {
       const safe = summary || {};
+      const usageTotals = (accounts || []).reduce((totals, account) => {
+        const usage = account?.usage || {};
+        totals.input_tokens += Number(usage.input_tokens || 0);
+        totals.output_tokens += Number(usage.output_tokens || 0);
+        totals.cached_tokens += Number(usage.cached_tokens || 0);
+        totals.reasoning_tokens += Number(usage.reasoning_tokens || 0);
+        return totals;
+      }, {
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        reasoning_tokens: 0
+      });
       const cards = [
-        { label: "总账号", value: safe.total ?? accounts.length },
-        { label: "活跃", value: safe.active ?? 0 },
-        { label: "冷却中", value: safe.cooldown ?? 0 },
-        { label: "禁用", value: safe.disabled ?? 0 }
+        { label: "总账号", value: safe.total ?? accounts.length, formatter: formatNumber },
+        { label: "活跃", value: safe.active ?? 0, formatter: formatNumber },
+        { label: "冷却中", value: safe.cooldown ?? 0, formatter: formatNumber },
+        { label: "禁用", value: safe.disabled ?? 0, formatter: formatNumber },
+        { label: "Input Tokens", value: safe.total_input_tokens ?? usageTotals.input_tokens, formatter: formatCompactNumber },
+        { label: "Output Tokens", value: safe.total_output_tokens ?? usageTotals.output_tokens, formatter: formatCompactNumber },
+        { label: "Cached Tokens", value: safe.total_cached_tokens ?? usageTotals.cached_tokens, formatter: formatCompactNumber },
+        { label: "Reasoning Tokens", value: safe.total_reasoning_tokens ?? usageTotals.reasoning_tokens, formatter: formatCompactNumber }
       ];
       els.summaryCards.innerHTML = cards.map(card => `
         <div class="card">
           <h3>${card.label}</h3>
-          <div class="value">${card.raw ? card.value : formatNumber(card.value)}</div>
+          <div class="value">${(card.formatter || formatNumber)(card.value)}</div>
         </div>
       `).join("");
     }
@@ -722,6 +773,8 @@
           requests: Number(point.requests || 0),
           input_tokens: Number(point.input_tokens || 0),
           output_tokens: Number(point.output_tokens || 0),
+          cached_tokens: Number(point.cached_tokens || 0),
+          reasoning_tokens: Number(point.reasoning_tokens || 0),
           total_tokens: Number(point.total_tokens || 0)
         });
       }
@@ -736,6 +789,8 @@
           requests: 0,
           input_tokens: 0,
           output_tokens: 0,
+          cached_tokens: 0,
+          reasoning_tokens: 0,
           total_tokens: 0
         });
       }
@@ -799,10 +854,109 @@
       `;
     }
 
+    function buildTokenStacks(series) {
+      return series.map(item => {
+        const input = Number(item.input_tokens || 0);
+        const output = Number(item.output_tokens || 0);
+        const cached = Math.min(Number(item.cached_tokens || 0), input);
+        const reasoning = Math.min(Number(item.reasoning_tokens || 0), output);
+        return {
+          ...item,
+          input_layer: Math.max(0, input - cached),
+          cached_layer: cached,
+          output_layer: Math.max(0, output - reasoning),
+          reasoning_layer: reasoning,
+          total_layer: Number(item.total_tokens || 0)
+        };
+      });
+    }
+
+    function renderStackedTokenChart(svgEl, metaEl, series) {
+      const width = 560;
+      const height = 220;
+      const padLeft = 42;
+      const padRight = 12;
+      const padTop = 12;
+      const padBottom = 28;
+      const plotWidth = width - padLeft - padRight;
+      const plotHeight = height - padTop - padBottom;
+      const layers = buildTokenStacks(series);
+      const maxValue = Math.max(1, ...layers.map(item => item.total_layer));
+      const total = layers.reduce((sum, item) => sum + item.total_layer, 0);
+      const peak = Math.max(...layers.map(item => item.total_layer), 0);
+      const stackKeys = [
+        { key: "input_layer", color: "#1b9aaa" },
+        { key: "cached_layer", color: "#ffb703" },
+        { key: "output_layer", color: "#ef476f" },
+        { key: "reasoning_layer", color: "#2d6a4f" }
+      ];
+
+      metaEl.textContent = `合计 ${formatCompactNumber(total)} · 峰值 ${formatCompactNumber(peak)} · 分类已去重`;
+
+      const points = layers.map((item, index) => {
+        const x = padLeft + (layers.length === 1 ? plotWidth / 2 : index * (plotWidth / (layers.length - 1)));
+        const totalY = padTop + plotHeight - (item.total_layer / maxValue) * plotHeight;
+        return {
+          x,
+          label: item.hour_label || formatHour(item.hour_start_ms),
+          totalY
+        };
+      });
+
+      const yTicks = [1, 0.5, 0];
+      const yGrid = yTicks.map(tick => {
+        const y = padTop + plotHeight - tick * plotHeight;
+        const label = formatCompactNumber(Math.round(maxValue * tick));
+        return `
+          <line x1="${padLeft}" y1="${y}" x2="${padLeft + plotWidth}" y2="${y}" stroke="#eadfcb" stroke-dasharray="3 4"></line>
+          <text x="${padLeft - 8}" y="${y + 4}" text-anchor="end" class="axis-text">${label}</text>
+        `;
+      }).join("");
+
+      const xTickIndexes = Array.from(new Set([
+        0,
+        Math.floor((layers.length - 1) / 3),
+        Math.floor(((layers.length - 1) * 2) / 3),
+        Math.max(layers.length - 1, 0)
+      ])).filter(index => index >= 0 && index < layers.length);
+
+      const xTicks = xTickIndexes.map(index => {
+        const point = points[index];
+        return `<text x="${point.x}" y="${height - 6}" text-anchor="middle" class="axis-text">${escapeHtml(point.label)}</text>`;
+      }).join("");
+
+      const barWidth = Math.max(3, Math.min(18, plotWidth / Math.max(layers.length, 1) - 2));
+      const bars = layers.map((item, index) => {
+        let cumulative = 0;
+        const x = points[index].x - barWidth / 2;
+        return stackKeys.map(layer => {
+          const value = Number(item[layer.key] || 0);
+          if (value <= 0) return "";
+          const y1 = padTop + plotHeight - ((cumulative + value) / maxValue) * plotHeight;
+          const y0 = padTop + plotHeight - (cumulative / maxValue) * plotHeight;
+          cumulative += value;
+          return `<rect x="${x.toFixed(2)}" y="${y1.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${Math.max(1, y0 - y1).toFixed(2)}" rx="2" fill="${layer.color}" opacity="0.85"></rect>`;
+        }).join("");
+      }).join("");
+
+      const totalLinePath = points
+        .map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.totalY.toFixed(2)}`)
+        .join(" ");
+
+      svgEl.innerHTML = `
+        <rect x="0" y="0" width="${width}" height="${height}" rx="12" fill="#fff"></rect>
+        ${yGrid}
+        ${bars}
+        <path d="${totalLinePath}" fill="none" stroke="#141313" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+        ${points.map(point => `<circle cx="${point.x}" cy="${point.totalY}" r="2.5" fill="#141313"></circle>`).join("")}
+        ${xTicks}
+      `;
+    }
+
     function renderTrend(trend) {
       const series = buildContinuousTrend(trend?.hourly || [], chartRangeHours);
       renderLineChart(els.requestsChart, els.requestsChartMeta, series, "requests", "#1b9aaa");
-      renderLineChart(els.tokensChart, els.tokensChartMeta, series, "total_tokens", "#ff6b35");
+      renderStackedTokenChart(els.tokensChart, els.tokensChartMeta, series);
     }
 
     function rowSortValue(row, key) {

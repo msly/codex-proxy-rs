@@ -48,6 +48,19 @@ async fn upstream_responses(
                 )
             }
         }
+        "Bearer at3" => {
+            if accept.contains("text/event-stream") {
+                (
+                    axum::http::StatusCode::OK,
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r3\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens\":8,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":20}}}\n\n",
+                )
+            } else {
+                (
+                    axum::http::StatusCode::OK,
+                    r#"{"id":"r3","object":"response","usage":{"input_tokens":12,"input_tokens_details":{"cached_tokens":4},"output_tokens":8,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":20}}"#,
+                )
+            }
+        }
         _ => (axum::http::StatusCode::FORBIDDEN, "forbidden"),
     }
 }
@@ -329,4 +342,166 @@ async fn api_v1_responses_non_retryable_failure_counts_as_failed_request() {
     assert_eq!(stats.total_errors, 1);
     assert_eq!(stats.successful_requests, 0);
     assert_eq!(stats.failed_requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_responses_stats_expose_cached_and_reasoning_tokens() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+    let runtime_state = Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path()));
+    let request_stats = Arc::new(api::RequestStats::default());
+
+    let post_app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url.clone(), "").unwrap()),
+        request_stats: request_stats.clone(),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
+        on_401: None,
+    });
+
+    let res = post_app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+    let stats_app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats,
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
+        on_401: None,
+    });
+
+    let stats_res = stats_app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri("/stats")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_res.status(), axum::http::StatusCode::OK);
+
+    let body = axum::body::to_bytes(stats_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["summary"]["total_input_tokens"], 12);
+    assert_eq!(json["summary"]["total_output_tokens"], 8);
+    assert_eq!(json["summary"]["total_cached_tokens"], 4);
+    assert_eq!(json["summary"]["total_reasoning_tokens"], 2);
+    assert_eq!(json["accounts"][0]["usage"]["input_tokens"], 12);
+    assert_eq!(json["accounts"][0]["usage"]["output_tokens"], 8);
+    assert_eq!(json["accounts"][0]["usage"]["cached_tokens"], 4);
+    assert_eq!(json["accounts"][0]["usage"]["reasoning_tokens"], 2);
+    assert_eq!(json["trend"]["hourly"][0]["input_tokens"], 12);
+    assert_eq!(json["trend"]["hourly"][0]["output_tokens"], 8);
+    assert_eq!(json["trend"]["hourly"][0]["cached_tokens"], 4);
+    assert_eq!(json["trend"]["hourly"][0]["reasoning_tokens"], 2);
+}
+
+#[tokio::test]
+async fn api_v1_responses_persist_cached_and_reasoning_tokens_to_state_file() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+    let runtime_state = Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path()));
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
+        on_401: None,
+    });
+
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+    runtime_state.save_now(&manager).unwrap();
+
+    let state_path = dir.path().join(".codex-proxy-state.json");
+    let bytes = std::fs::read(state_path).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let account = json["accounts"]
+        .as_object()
+        .and_then(|accounts| accounts.values().next())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    assert_eq!(account["usage_input_tokens"], 12);
+    assert_eq!(account["usage_output_tokens"], 8);
+    assert_eq!(account["usage_cached_tokens"], 4);
+    assert_eq!(account["usage_reasoning_tokens"], 2);
+    assert_eq!(json["hourly"][0]["input_tokens"], 12);
+    assert_eq!(json["hourly"][0]["output_tokens"], 8);
+    assert_eq!(json["hourly"][0]["cached_tokens"], 4);
+    assert_eq!(json["hourly"][0]["reasoning_tokens"], 2);
 }

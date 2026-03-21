@@ -28,6 +28,10 @@ pub struct HourlyTrendPoint {
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    #[serde(default)]
+    pub cached_tokens: i64,
+    #[serde(default)]
+    pub reasoning_tokens: i64,
     pub total_tokens: i64,
 }
 
@@ -91,6 +95,8 @@ impl RuntimeStateStore {
         now_ms: i64,
         input_tokens: i64,
         output_tokens: i64,
+        cached_tokens: i64,
+        reasoning_tokens: i64,
         total_tokens: i64,
     ) {
         let mut inner = self.inner.write().expect("runtime state lock poisoned");
@@ -104,6 +110,8 @@ impl RuntimeStateStore {
             });
         entry.input_tokens += input_tokens.max(0);
         entry.output_tokens += output_tokens.max(0);
+        entry.cached_tokens += cached_tokens.max(0);
+        entry.reasoning_tokens += reasoning_tokens.max(0);
         entry.total_tokens += total_tokens.max(0);
         trim_hourly_map(&mut inner.hourly);
     }

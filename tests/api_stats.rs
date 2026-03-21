@@ -68,11 +68,13 @@ async fn api_stats_returns_cached_quota_raw_json() {
             usage_total_completions: 0,
             usage_input_tokens: 0,
             usage_output_tokens: 0,
+            usage_cached_tokens: 0,
+            usage_reasoning_tokens: 0,
             usage_total_tokens: 0,
         },
         now,
     );
-    acc.record_usage(10, 20, 30);
+    acc.record_usage_detail(10, 20, 4, 2, 30);
 
     acc.set_quota_info(QuotaInfo {
         valid: true,
@@ -89,7 +91,7 @@ async fn api_stats_returns_cached_quota_raw_json() {
     request_stats.record_request();
     let runtime_state = Arc::new(RuntimeStateStore::new(dir.path()));
     runtime_state.record_hourly_request(now);
-    runtime_state.record_hourly_usage(now, 10, 20, 30);
+    runtime_state.record_hourly_usage(now, 10, 20, 4, 2, 30);
 
     let state = AppState {
         manager: manager.clone(),
@@ -141,6 +143,8 @@ async fn api_stats_returns_cached_quota_raw_json() {
     assert_eq!(v["summary"]["rpm"], 2);
     assert_eq!(v["summary"]["total_input_tokens"], 10);
     assert_eq!(v["summary"]["total_output_tokens"], 20);
+    assert_eq!(v["summary"]["total_cached_tokens"], 4);
+    assert_eq!(v["summary"]["total_reasoning_tokens"], 2);
     assert_eq!(v["accounts"][0]["email"], "x@example.com");
     assert_eq!(v["accounts"][0]["plan_type"], "plus");
     assert_eq!(v["accounts"][0]["quota_exhausted"], true);
@@ -149,11 +153,23 @@ async fn api_stats_returns_cached_quota_raw_json() {
     assert_eq!(v["accounts"][0]["attempt_requests"], 5);
     assert_eq!(v["accounts"][0]["attempt_errors"], 2);
     assert!(v["accounts"][0]["last_used_at"].is_string());
-    assert!(v["accounts"][0]["last_used_ms"].as_i64().unwrap_or_default() > 0);
-    assert!(v["accounts"][0]["cooldown_until_ms"].as_i64().unwrap_or_default() > now);
+    assert!(
+        v["accounts"][0]["last_used_ms"]
+            .as_i64()
+            .unwrap_or_default()
+            > 0
+    );
+    assert!(
+        v["accounts"][0]["cooldown_until_ms"]
+            .as_i64()
+            .unwrap_or_default()
+            > now
+    );
     assert_eq!(v["accounts"][0]["usage"]["total_completions"], 1);
     assert_eq!(v["accounts"][0]["usage"]["input_tokens"], 10);
     assert_eq!(v["accounts"][0]["usage"]["output_tokens"], 20);
+    assert_eq!(v["accounts"][0]["usage"]["cached_tokens"], 4);
+    assert_eq!(v["accounts"][0]["usage"]["reasoning_tokens"], 2);
     assert_eq!(v["accounts"][0]["usage"]["total_tokens"], 30);
     assert_eq!(v["accounts"][0]["quota"]["valid"], true);
     assert_eq!(v["accounts"][0]["quota"]["status_code"], 200);
@@ -166,5 +182,7 @@ async fn api_stats_returns_cached_quota_raw_json() {
     assert_eq!(v["trend"]["hourly"][0]["requests"], 1);
     assert_eq!(v["trend"]["hourly"][0]["input_tokens"], 10);
     assert_eq!(v["trend"]["hourly"][0]["output_tokens"], 20);
+    assert_eq!(v["trend"]["hourly"][0]["cached_tokens"], 4);
+    assert_eq!(v["trend"]["hourly"][0]["reasoning_tokens"], 2);
     assert_eq!(v["trend"]["hourly"][0]["total_tokens"], 30);
 }

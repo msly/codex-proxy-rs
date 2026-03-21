@@ -66,8 +66,7 @@ docker compose up --build
 
 - `base-url` 优先级高于 `backend-domain`
 - `enable-http2: true` 默认开启，控制的是代理访问上游 Codex / quota / health / keepalive 的出站 HTTP client，不是入站监听协议
-- 如果上游出现 `GOAWAY ENHANCE_YOUR_CALM`，优先调低连接池参数，必要时再将 `enable-http2` 设为 `false`
-- `stream-idle-timeout-sec` / `enable-stream-idle-retry` 当前与 Go 一样仅保留配置面
+- 如果上游出现 `GOAWAY ENHANCE_YOUR_CALM`，优先调低 `max-idle-conns-per-host`，必要时再将 `enable-http2` 设为 `false`
 
 更多网络配置说明见 [`docs/network.md`](./docs/network.md)。
 

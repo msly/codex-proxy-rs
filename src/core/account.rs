@@ -116,6 +116,8 @@ pub struct Account {
     total_completions: AtomicI64,
     input_tokens: AtomicI64,
     output_tokens: AtomicI64,
+    cached_tokens: AtomicI64,
+    reasoning_tokens: AtomicI64,
     total_tokens: AtomicI64,
 
     refreshing: AtomicI32,
@@ -142,6 +144,8 @@ impl Account {
             total_completions: AtomicI64::new(0),
             input_tokens: AtomicI64::new(0),
             output_tokens: AtomicI64::new(0),
+            cached_tokens: AtomicI64::new(0),
+            reasoning_tokens: AtomicI64::new(0),
             total_tokens: AtomicI64::new(0),
             refreshing: AtomicI32::new(0),
             last_refresh_ms: AtomicI64::new(0),
@@ -208,6 +212,17 @@ impl Account {
     }
 
     pub fn record_usage(&self, input_tokens: i64, output_tokens: i64, total_tokens: i64) {
+        self.record_usage_detail(input_tokens, output_tokens, 0, 0, total_tokens);
+    }
+
+    pub fn record_usage_detail(
+        &self,
+        input_tokens: i64,
+        output_tokens: i64,
+        cached_tokens: i64,
+        reasoning_tokens: i64,
+        total_tokens: i64,
+    ) {
         self.total_completions.fetch_add(1, Ordering::Relaxed);
         if input_tokens > 0 {
             self.input_tokens.fetch_add(input_tokens, Ordering::Relaxed);
@@ -215,6 +230,14 @@ impl Account {
         if output_tokens > 0 {
             self.output_tokens
                 .fetch_add(output_tokens, Ordering::Relaxed);
+        }
+        if cached_tokens > 0 {
+            self.cached_tokens
+                .fetch_add(cached_tokens, Ordering::Relaxed);
+        }
+        if reasoning_tokens > 0 {
+            self.reasoning_tokens
+                .fetch_add(reasoning_tokens, Ordering::Relaxed);
         }
         if total_tokens > 0 {
             self.total_tokens.fetch_add(total_tokens, Ordering::Relaxed);
@@ -334,6 +357,10 @@ impl Account {
             .store(snapshot.usage_input_tokens.max(0), Ordering::Relaxed);
         self.output_tokens
             .store(snapshot.usage_output_tokens.max(0), Ordering::Relaxed);
+        self.cached_tokens
+            .store(snapshot.usage_cached_tokens.max(0), Ordering::Relaxed);
+        self.reasoning_tokens
+            .store(snapshot.usage_reasoning_tokens.max(0), Ordering::Relaxed);
         self.total_tokens
             .store(snapshot.usage_total_tokens.max(0), Ordering::Relaxed);
 
@@ -454,6 +481,8 @@ impl Account {
             usage_total_completions: self.total_completions.load(Ordering::Relaxed),
             usage_input_tokens: self.input_tokens.load(Ordering::Relaxed),
             usage_output_tokens: self.output_tokens.load(Ordering::Relaxed),
+            usage_cached_tokens: self.cached_tokens.load(Ordering::Relaxed),
+            usage_reasoning_tokens: self.reasoning_tokens.load(Ordering::Relaxed),
             usage_total_tokens: self.total_tokens.load(Ordering::Relaxed),
             token_expire: token.expired.clone(),
         }
@@ -480,6 +509,8 @@ pub struct AccountStatsSnapshot {
     pub usage_total_completions: i64,
     pub usage_input_tokens: i64,
     pub usage_output_tokens: i64,
+    pub usage_cached_tokens: i64,
+    pub usage_reasoning_tokens: i64,
     pub usage_total_tokens: i64,
     pub token_expire: String,
 }
@@ -499,8 +530,15 @@ pub struct AccountRuntimeSnapshot {
     pub quota_exhausted: bool,
     pub quota_resets_at_ms: i64,
     pub usage_total_completions: i64,
+    #[serde(default)]
     pub usage_input_tokens: i64,
+    #[serde(default)]
     pub usage_output_tokens: i64,
+    #[serde(default)]
+    pub usage_cached_tokens: i64,
+    #[serde(default)]
+    pub usage_reasoning_tokens: i64,
+    #[serde(default)]
     pub usage_total_tokens: i64,
 }
 
@@ -520,6 +558,8 @@ impl AccountStatsSnapshot {
             usage_total_completions: self.usage_total_completions,
             usage_input_tokens: self.usage_input_tokens,
             usage_output_tokens: self.usage_output_tokens,
+            usage_cached_tokens: self.usage_cached_tokens,
+            usage_reasoning_tokens: self.usage_reasoning_tokens,
             usage_total_tokens: self.usage_total_tokens,
         }
     }
@@ -713,6 +753,8 @@ mod tests {
                 usage_total_completions: 5,
                 usage_input_tokens: 100,
                 usage_output_tokens: 40,
+                usage_cached_tokens: 25,
+                usage_reasoning_tokens: 12,
                 usage_total_tokens: 140,
             },
             now_ms,
@@ -728,6 +770,8 @@ mod tests {
         assert_eq!(snap.usage_total_completions, 5);
         assert_eq!(snap.usage_input_tokens, 100);
         assert_eq!(snap.usage_output_tokens, 40);
+        assert_eq!(snap.usage_cached_tokens, 25);
+        assert_eq!(snap.usage_reasoning_tokens, 12);
         assert_eq!(snap.usage_total_tokens, 140);
         assert!(snap.quota_exhausted);
         assert_eq!(snap.cooldown_until_ms, now_ms + 60_000);
@@ -764,6 +808,8 @@ mod tests {
                 usage_total_completions: 2,
                 usage_input_tokens: 10,
                 usage_output_tokens: 20,
+                usage_cached_tokens: 3,
+                usage_reasoning_tokens: 4,
                 usage_total_tokens: 30,
             },
             now_ms,

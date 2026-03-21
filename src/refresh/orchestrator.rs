@@ -138,8 +138,8 @@ mod tests {
     use reqwest::Url;
     use serde::Deserialize;
     use serde_json::json;
-    use std::io;
     use std::fs;
+    use std::io;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::sync::Arc;

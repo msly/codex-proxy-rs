@@ -17,6 +17,8 @@ pub struct StreamState {
     pub completed: bool,
     pub usage_input: i64,
     pub usage_output: i64,
+    pub usage_cached: i64,
+    pub usage_reasoning: i64,
     pub usage_total: i64,
     has_received_args_delta: bool,
     has_tool_call_announced: bool,
@@ -37,6 +39,8 @@ impl StreamState {
             completed: false,
             usage_input: 0,
             usage_output: 0,
+            usage_cached: 0,
+            usage_reasoning: 0,
             usage_total: 0,
             has_received_args_delta: false,
             has_tool_call_announced: false,
@@ -82,6 +86,11 @@ pub fn convert_stream_chunk(
         state.reasoning_delta_by_item.clear();
         state.has_reasoning = false;
         state.has_reasoning_summary_delta = false;
+        state.usage_input = 0;
+        state.usage_output = 0;
+        state.usage_cached = 0;
+        state.usage_reasoning = 0;
+        state.usage_total = 0;
         return Vec::new();
     }
 
@@ -320,6 +329,16 @@ pub fn convert_stream_chunk(
                     .unwrap_or(0);
                 state.usage_output = usage
                     .get("output_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                state.usage_cached = usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                state.usage_reasoning = usage
+                    .get("output_tokens_details")
+                    .and_then(|d| d.get("reasoning_tokens"))
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
                 state.usage_total = usage

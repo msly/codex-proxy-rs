@@ -85,7 +85,5 @@
 
 ## 语义差异（已知）
 
-- `max-conns-per-host`：Go 使用 `Transport.MaxConnsPerHost`；Rust（reqwest）暂无等价项，当前不强制限制（已在 `docs/network.md` 标注）。
 - `/check-quota`：Rust 会更新 used_percent 排序缓存；Go 当前实现只更新 quota raw_data（不刷新 used_percent cache）。如需严格对齐，可单独调整为 Go 行为并补测试。
-- `stream-idle-timeout-sec` / `enable-stream-idle-retry`：当前 Go/Rust 都保留了配置面，但执行层尚未真正消费这两个参数。
 - Chat Completions 响应转换：已实现基础 text/tool_calls/usage 映射，但可能与 Go 在边界事件顺序/细节上仍有差异（需要更多 fixture 回归）。

@@ -54,12 +54,6 @@ pub struct Config {
     #[serde(rename = "refresh-concurrency")]
     pub refresh_concurrency: u64,
 
-    #[serde(rename = "max-conns-per-host")]
-    pub max_conns_per_host: u64,
-
-    #[serde(rename = "max-idle-conns")]
-    pub max_idle_conns: u64,
-
     #[serde(rename = "max-idle-conns-per-host")]
     pub max_idle_conns_per_host: u64,
 
@@ -99,22 +93,13 @@ pub struct Config {
     #[serde(rename = "upstream-timeout-sec")]
     pub upstream_timeout_sec: u64,
 
-    #[serde(rename = "stream-idle-timeout-sec")]
-    pub stream_idle_timeout_sec: u64,
-
     #[serde(rename = "empty-retry-max")]
     pub empty_retry_max: usize,
-
-    #[serde(rename = "enable-stream-idle-retry")]
-    pub enable_stream_idle_retry: bool,
 
     pub selector: String,
 
     #[serde(rename = "refresh-batch-size")]
     pub refresh_batch_size: u64,
-
-    #[serde(default)]
-    pub accounts: Vec<String>,
 
     #[serde(rename = "api-keys")]
     #[serde(default)]
@@ -140,8 +125,6 @@ impl Default for Config {
             health_check_batch_size: 20,
             health_check_request_timeout: 8,
             refresh_concurrency: 50,
-            max_conns_per_host: 20,
-            max_idle_conns: 50,
             max_idle_conns_per_host: 10,
             enable_http2: true,
             startup_async_load: true,
@@ -155,12 +138,9 @@ impl Default for Config {
             quota_check_concurrency: 0,
             keepalive_interval: 60,
             upstream_timeout_sec: 0,
-            stream_idle_timeout_sec: 0,
             empty_retry_max: 2,
-            enable_stream_idle_retry: true,
             selector: "round-robin".to_string(),
             refresh_batch_size: 0,
-            accounts: Vec::new(),
             api_keys: Vec::new(),
         }
     }

@@ -32,8 +32,6 @@ OAuth refresh（`https://auth.openai.com/oauth/token`）使用“通用 client b
 ### 连接池与超时
 
 - `max-idle-conns-per-host` → `pool_max_idle_per_host`
-- `max-idle-conns`：当 `max-idle-conns-per-host=0` 时，作为 `pool_max_idle_per_host` 的回退值（`reqwest` 没有“全局 MaxIdleConns”配置）
-- `max-conns-per-host`：`reqwest` 当前无等价参数，暂不强制限制（会在 README 里标注）
 - `upstream-timeout-sec`：作为上游首包/响应头等待超时，包裹 `req.send()`；不会额外截断已建立的 SSE body 读取
 - `keepalive-interval`：映射到 keepalive ping 循环间隔
 - 固定值（对齐 Go）：
@@ -41,9 +39,4 @@ OAuth refresh（`https://auth.openai.com/oauth/token`）使用“通用 client b
   - `tcp_keepalive = 60s`
   - `connect_timeout = 10s`
 
-### 当前仅保留配置面的参数
-
-- `stream-idle-timeout-sec`
-- `enable-stream-idle-retry`
-
-这两个参数当前在 Go/Rust 两边都已经进入配置结构，但执行层尚未真正消费；Rust 目前保持相同状态，不额外扩展语义。
+Rust 版当前只保留与 `reqwest` 实际能力直接对应的连接池参数，不再暴露无效或误导性的 Go 对齐配置项。
