@@ -12,7 +12,14 @@ pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 #[derive(Debug, Clone)]
+pub enum RefreshErrorKind {
+    Generic,
+    MissingRefreshToken,
+}
+
+#[derive(Debug, Clone)]
 pub struct RefreshError {
+    kind: RefreshErrorKind,
     pub status_code: Option<u16>,
     pub msg: String,
 }
@@ -20,13 +27,26 @@ pub struct RefreshError {
 impl RefreshError {
     pub fn new(status_code: Option<u16>, msg: impl Into<String>) -> Self {
         Self {
+            kind: RefreshErrorKind::Generic,
             status_code,
             msg: msg.into(),
         }
     }
 
+    pub fn missing_refresh_token() -> Self {
+        Self {
+            kind: RefreshErrorKind::MissingRefreshToken,
+            status_code: None,
+            msg: "缺少 refresh_token".to_string(),
+        }
+    }
+
     pub fn is_rate_limited(&self) -> bool {
         self.status_code == Some(429)
+    }
+
+    pub fn is_missing_refresh_token(&self) -> bool {
+        matches!(self.kind, RefreshErrorKind::MissingRefreshToken)
     }
 
     pub fn is_non_retryable(&self) -> bool {

@@ -21,9 +21,10 @@ use serde::Serialize;
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 
-use crate::core::Manager;
+use crate::core::{Account, Manager};
 use crate::quota::QuotaChecker;
 use crate::refresh::{Refresher, SaveQueue, refresh_account};
+use crate::state::RuntimeStateStore;
 use crate::thinking::apply_thinking;
 use crate::translate::{
     ClaudeStreamState, StreamState, build_reverse_tool_name_map, convert_claude_request_to_openai,
@@ -53,6 +54,7 @@ pub struct AppState {
     pub refresher: Refresher,
     pub save_queue: SaveQueue,
     pub refresh_concurrency: usize,
+    pub runtime_state: Arc<RuntimeStateStore>,
     pub on_401: Option<crate::upstream::codex::On401Hook>,
 }
 
@@ -89,6 +91,194 @@ impl RequestStats {
         }
         self.last_minute_count.load(Ordering::Relaxed)
     }
+}
+
+fn record_hourly_request(runtime_state: &RuntimeStateStore, now_ms: i64) {
+    runtime_state.record_hourly_request(now_ms);
+}
+
+fn record_hourly_usage(
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+) {
+    if input_tokens > 0 || output_tokens > 0 {
+        runtime_state.record_hourly_usage(now_ms, input_tokens, output_tokens, total_tokens);
+    }
+}
+
+fn record_client_success(
+    account: &Account,
+    request_stats: &RequestStats,
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
+) {
+    account.record_success(now_ms);
+    account.record_client_success();
+    request_stats.record_request();
+    record_hourly_request(runtime_state, now_ms);
+}
+
+fn extract_usage_tokens(value: &serde_json::Value) -> Option<(i64, i64, i64)> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("response").and_then(|response| response.get("usage")))?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens))
+        .max(0);
+
+    if input_tokens == 0 && output_tokens == 0 && total_tokens == 0 {
+        return None;
+    }
+
+    Some((input_tokens, output_tokens, total_tokens))
+}
+
+fn record_usage_from_value(
+    account: &Account,
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
+    value: &serde_json::Value,
+) {
+    let Some((input_tokens, output_tokens, total_tokens)) = extract_usage_tokens(value) else {
+        return;
+    };
+    account.record_usage(input_tokens, output_tokens, total_tokens);
+    record_hourly_usage(
+        runtime_state,
+        now_ms,
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    );
+}
+
+fn record_usage_from_json_bytes(
+    account: &Account,
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
+    bytes: &[u8],
+) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    record_usage_from_value(account, runtime_state, now_ms, &value);
+}
+
+fn record_usage_from_sse_line(
+    account: &Account,
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
+    line: &[u8],
+) -> bool {
+    if !line.starts_with(b"data:") {
+        return false;
+    }
+    let payload = trim_ascii(&line[5..]);
+    if payload.is_empty() || payload == b"[DONE]" {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let had_usage = extract_usage_tokens(&value).is_some();
+    if had_usage {
+        record_usage_from_value(account, runtime_state, now_ms, &value);
+    }
+    had_usage
+}
+
+fn build_passthrough_sse_response(
+    upstream: reqwest::Response,
+    account: Arc<Account>,
+    runtime_state: Arc<RuntimeStateStore>,
+    headers: HeaderMap,
+) -> Response {
+    let status = upstream.status();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
+
+    tokio::spawn(async move {
+        let mut upstream_stream = upstream.bytes_stream();
+        let mut buf = Vec::<u8>::new();
+        let mut recorded_usage = false;
+
+        while let Some(chunk) = upstream_stream.next().await {
+            let chunk = match chunk {
+                Ok(b) => b,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
+                        .await;
+                    return;
+                }
+            };
+
+            if tx.send(Ok(chunk.to_vec())).await.is_err() {
+                return;
+            }
+
+            if recorded_usage {
+                continue;
+            }
+
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line = buf.drain(..pos).collect::<Vec<u8>>();
+                let _ = buf.drain(..1);
+                let line = trim_ascii(&line);
+                if line.is_empty() {
+                    continue;
+                }
+                if record_usage_from_sse_line(
+                    account.as_ref(),
+                    runtime_state.as_ref(),
+                    crate::core::now_unix_ms(),
+                    line,
+                ) {
+                    recorded_usage = true;
+                    break;
+                }
+            }
+        }
+
+        if !recorded_usage {
+            let line = trim_ascii(&buf);
+            if !line.is_empty() {
+                let _ = record_usage_from_sse_line(
+                    account.as_ref(),
+                    runtime_state.as_ref(),
+                    crate::core::now_unix_ms(),
+                    line,
+                );
+            }
+        }
+    });
+
+    let stream = unfold(rx, |mut rx| async move {
+        let item = rx.recv().await?;
+        Some((item, rx))
+    });
+
+    let mut resp = Response::new(Body::from_stream(stream));
+    *resp.status_mut() = status;
+    for (k, v) in headers.iter() {
+        resp.headers_mut().append(k.clone(), v.clone());
+    }
+    resp
 }
 
 pub fn router(state: AppState) -> Router {
@@ -388,30 +578,33 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         Err(err) => return send_upstream_error(err),
     };
 
-    account.record_success(crate::core::now_unix_ms());
-    state.request_stats.record_request();
-
     if stream {
-        let status = upstream.status();
-        let stream = upstream
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-
-        let mut resp = Response::new(Body::from_stream(stream));
-        *resp.status_mut() = status;
-        resp.headers_mut().insert(
+        let now_ms = crate::core::now_unix_ms();
+        record_client_success(
+            account.as_ref(),
+            state.request_stats.as_ref(),
+            state.runtime_state.as_ref(),
+            now_ms,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
             header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("text/event-stream"),
         );
-        resp.headers_mut().insert(
+        headers.insert(
             header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-cache"),
         );
-        resp.headers_mut().insert(
+        headers.insert(
             header::CONNECTION,
             axum::http::HeaderValue::from_static("keep-alive"),
         );
-        return resp;
+        return build_passthrough_sse_response(
+            upstream,
+            account,
+            state.runtime_state.clone(),
+            headers,
+        );
     }
 
     let status = upstream.status();
@@ -425,6 +618,19 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             );
         }
     };
+    let now_ms = crate::core::now_unix_ms();
+    record_usage_from_json_bytes(
+        account.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+        bytes.as_ref(),
+    );
+    record_client_success(
+        account.as_ref(),
+        state.request_stats.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+    );
 
     let mut resp = Response::new(Body::from(bytes));
     *resp.status_mut() = status;
@@ -662,8 +868,13 @@ async fn forward_responses_sse_as_ws(
         return Err(ResponsesWsError::EmptyResponse);
     }
 
-    account.record_success(crate::core::now_unix_ms());
-    state.request_stats.record_request();
+    let now_ms = crate::core::now_unix_ms();
+    record_client_success(
+        account.as_ref(),
+        state.request_stats.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+    );
     Ok(())
 }
 
@@ -744,6 +955,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
     if stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let request_stats = state.request_stats.clone();
+        let runtime_state = state.runtime_state.clone();
         tokio::spawn(async move {
             let mut buf = Vec::<u8>::new();
             let mut state = ClaudeStreamState::new(&base_model);
@@ -786,8 +998,13 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             }
 
             if state.completed {
-                account.record_success(crate::core::now_unix_ms());
-                request_stats.record_request();
+                let now_ms = crate::core::now_unix_ms();
+                record_client_success(
+                    account.as_ref(),
+                    request_stats.as_ref(),
+                    runtime_state.as_ref(),
+                    now_ms,
+                );
             }
         });
 
@@ -840,8 +1057,13 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         );
     }
 
-    account.record_success(crate::core::now_unix_ms());
-    state.request_stats.record_request();
+    let now_ms = crate::core::now_unix_ms();
+    record_client_success(
+        account.as_ref(),
+        state.request_stats.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+    );
 
     let mut resp = Response::new(Body::from(result.json));
     *resp.status_mut() = StatusCode::OK;
@@ -916,21 +1138,21 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         Err(err) => return send_upstream_error(err),
     };
 
-    account.record_success(crate::core::now_unix_ms());
-
     if stream {
-        let status = upstream.status();
         let headers = upstream.headers().clone();
-        let stream = upstream
-            .bytes_stream()
-            .map(|chunk| chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-
-        let mut resp = Response::new(Body::from_stream(stream));
-        *resp.status_mut() = status;
-        for (k, v) in headers.iter() {
-            resp.headers_mut().append(k.clone(), v.clone());
-        }
-        return resp;
+        let now_ms = crate::core::now_unix_ms();
+        record_client_success(
+            account.as_ref(),
+            state.request_stats.as_ref(),
+            state.runtime_state.as_ref(),
+            now_ms,
+        );
+        return build_passthrough_sse_response(
+            upstream,
+            account,
+            state.runtime_state.clone(),
+            headers,
+        );
     }
 
     let bytes = match upstream.bytes().await {
@@ -943,6 +1165,19 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             );
         }
     };
+    let now_ms = crate::core::now_unix_ms();
+    record_usage_from_json_bytes(
+        account.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+        bytes.as_ref(),
+    );
+    record_client_success(
+        account.as_ref(),
+        state.request_stats.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+    );
 
     let mut resp = Response::new(Body::from(bytes));
     *resp.status_mut() = StatusCode::OK;
@@ -1074,6 +1309,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let account = account.clone();
         let request_stats = state.request_stats.clone();
+        let runtime_state = state.runtime_state.clone();
         tokio::spawn(async move {
             let mut buf = Vec::<u8>::new();
             let mut state = StreamState::new(&base_model);
@@ -1115,11 +1351,23 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             }
 
             if state.completed && (state.has_text || state.has_tool_call || state.has_reasoning) {
+                let now_ms = crate::core::now_unix_ms();
                 if state.usage_input > 0 || state.usage_output > 0 {
                     account.record_usage(state.usage_input, state.usage_output, state.usage_total);
+                    record_hourly_usage(
+                        runtime_state.as_ref(),
+                        now_ms,
+                        state.usage_input,
+                        state.usage_output,
+                        state.usage_total,
+                    );
                 }
-                account.record_success(crate::core::now_unix_ms());
-                request_stats.record_request();
+                record_client_success(
+                    account.as_ref(),
+                    request_stats.as_ref(),
+                    runtime_state.as_ref(),
+                    now_ms,
+                );
                 let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
             }
         });
@@ -1177,10 +1425,21 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             }
         };
 
-        match parse_chat_non_stream_response(&bytes, &reverse_tool_map, account.as_ref()) {
+        let now_ms = crate::core::now_unix_ms();
+        match parse_chat_non_stream_response(
+            &bytes,
+            &reverse_tool_map,
+            account.as_ref(),
+            state.runtime_state.as_ref(),
+            now_ms,
+        ) {
             ChatNonStreamOutcome::Success(out) => {
-                account.record_success(crate::core::now_unix_ms());
-                state.request_stats.record_request();
+                record_client_success(
+                    account.as_ref(),
+                    state.request_stats.as_ref(),
+                    state.runtime_state.as_ref(),
+                    now_ms,
+                );
                 let mut resp = Response::new(Body::from(out));
                 *resp.status_mut() = StatusCode::OK;
                 resp.headers_mut().insert(
@@ -1233,6 +1492,8 @@ fn parse_chat_non_stream_response(
     bytes: &[u8],
     reverse_tool_map: &std::collections::HashMap<String, String>,
     account: &crate::core::Account,
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
 ) -> ChatNonStreamOutcome {
     for line in bytes.split(|&b| b == b'\n') {
         let line = trim_ascii(line);
@@ -1264,6 +1525,13 @@ fn parse_chat_non_stream_response(
                 .unwrap_or(0);
             if input_tokens > 0 || output_tokens > 0 {
                 account.record_usage(input_tokens, output_tokens, total_tokens);
+                record_hourly_usage(
+                    runtime_state,
+                    now_ms,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                );
             }
         }
 
@@ -1599,6 +1867,21 @@ struct StatsUsage {
 }
 
 #[derive(Debug, Serialize)]
+struct StatsTrendPoint {
+    hour_start_ms: i64,
+    hour_label: String,
+    requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsTrend {
+    hourly: Vec<StatsTrendPoint>,
+}
+
+#[derive(Debug, Serialize)]
 struct StatsAccount {
     file_path: String,
     email: String,
@@ -1606,11 +1889,15 @@ struct StatsAccount {
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_type: Option<String>,
     used_percent: f64,
-    total_requests: i64,
-    total_errors: i64,
+    successful_requests: i64,
+    failed_requests: i64,
+    attempt_requests: i64,
+    attempt_errors: i64,
     consecutive_failures: i64,
+    last_used_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used_at: Option<String>,
+    cooldown_until_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_refreshed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1628,6 +1915,7 @@ struct StatsAccount {
 #[derive(Debug, Serialize)]
 struct StatsResponse {
     summary: StatsSummary,
+    trend: StatsTrend,
     accounts: Vec<StatsAccount>,
 }
 
@@ -1690,10 +1978,14 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
                 Some(snap.plan_type)
             },
             used_percent: snap.used_percent,
-            total_requests: snap.total_requests,
-            total_errors: snap.total_errors,
+            successful_requests: snap.successful_requests,
+            failed_requests: snap.failed_requests,
+            attempt_requests: snap.total_requests,
+            attempt_errors: snap.total_errors,
             consecutive_failures: snap.consecutive_failures,
+            last_used_ms: snap.last_used_ms,
             last_used_at: ms_to_rfc3339(snap.last_used_ms),
+            cooldown_until_ms: snap.cooldown_until_ms,
             last_refreshed_at: ms_to_rfc3339(snap.last_refreshed_ms),
             cooldown_until: ms_to_rfc3339(snap.cooldown_until_ms),
             quota_exhausted,
@@ -1717,6 +2009,36 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
         });
     }
 
+    fn hour_label(ms: i64) -> String {
+        if ms <= 0 {
+            return String::new();
+        }
+        let Ok(dt) = time::OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
+        else {
+            return String::new();
+        };
+        let Ok(fmt) = time::format_description::parse("[month]-[day] [hour]:00") else {
+            return String::new();
+        };
+        dt.format(&fmt).unwrap_or_else(|_| String::new())
+    }
+
+    let trend = StatsTrend {
+        hourly: state
+            .runtime_state
+            .hourly_trend()
+            .into_iter()
+            .map(|point| StatsTrendPoint {
+                hour_start_ms: point.hour_start_ms,
+                hour_label: hour_label(point.hour_start_ms),
+                requests: point.requests,
+                input_tokens: point.input_tokens,
+                output_tokens: point.output_tokens,
+                total_tokens: point.total_tokens,
+            })
+            .collect(),
+    };
+
     Json(StatsResponse {
         summary: StatsSummary {
             total: accounts.len(),
@@ -1727,6 +2049,7 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
             total_input_tokens,
             total_output_tokens,
         },
+        trend,
         accounts: out,
     })
 }
@@ -1734,6 +2057,7 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::RuntimeStateStore;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::util::ServiceExt;
@@ -1767,6 +2091,7 @@ mod tests {
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
+            runtime_state: Arc::new(RuntimeStateStore::new(dir.path())),
             on_401: None,
         };
 
@@ -1813,6 +2138,7 @@ mod tests {
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
+            runtime_state: Arc::new(RuntimeStateStore::new(dir.path())),
             on_401: None,
         };
 

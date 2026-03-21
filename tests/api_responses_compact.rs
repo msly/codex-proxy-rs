@@ -48,13 +48,13 @@ async fn upstream_compact(
                 (
                     axum::http::StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    "data: compact\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"compact-1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":4,\"total_tokens\":9}}}\n\n",
                 )
             } else {
                 (
                     axum::http::StatusCode::OK,
                     [(axum::http::header::CONTENT_TYPE, "application/json")],
-                    r#"{"compact":true}"#,
+                    r#"{"compact":true,"usage":{"input_tokens":5,"output_tokens":4,"total_tokens":9}}"#,
                 )
             }
         }
@@ -110,6 +110,7 @@ async fn api_v1_responses_compact_stream_passthrough_uses_internal_retry_gate() 
 
     let manager = Arc::new(Manager::new(dir.path()));
     manager.load_accounts().unwrap();
+    let runtime_state = Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path()));
 
     let state = AppState {
         manager: manager.clone(),
@@ -122,6 +123,7 @@ async fn api_v1_responses_compact_stream_passthrough_uses_internal_retry_gate() 
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
         on_401: None,
     };
 
@@ -158,8 +160,24 @@ async fn api_v1_responses_compact_stream_passthrough_uses_internal_retry_gate() 
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(body, "data: compact\n\n");
+    assert_eq!(
+        body,
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"compact-1\",\"usage\":{\"input_tokens\":5,\"output_tokens\":4,\"total_tokens\":9}}}\n\n"
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let accounts = manager.accounts_snapshot();
+    let b = accounts
+        .iter()
+        .find(|acc| acc.file_path().ends_with("b.json"))
+        .expect("b.json account");
+    let stats = b.stats_snapshot();
+    assert_eq!(stats.successful_requests, 1);
+    assert_eq!(stats.usage_total_tokens, 9);
+    let trend = runtime_state.hourly_trend();
+    assert_eq!(trend.len(), 1);
+    assert_eq!(trend[0].requests, 1);
+    assert_eq!(trend[0].total_tokens, 9);
 }
 
 #[tokio::test]
@@ -173,6 +191,7 @@ async fn api_v1_responses_compact_non_stream_passthrough_returns_json() {
 
     let manager = Arc::new(Manager::new(dir.path()));
     manager.load_accounts().unwrap();
+    let runtime_state = Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path()));
 
     let state = AppState {
         manager: manager.clone(),
@@ -185,6 +204,7 @@ async fn api_v1_responses_compact_non_stream_passthrough_returns_json() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
         on_401: None,
     };
 
@@ -221,6 +241,23 @@ async fn api_v1_responses_compact_non_stream_passthrough_returns_json() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(body, r#"{"compact":true}"#);
+    assert_eq!(
+        body,
+        r#"{"compact":true,"usage":{"input_tokens":5,"output_tokens":4,"total_tokens":9}}"#
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let accounts = manager.accounts_snapshot();
+    let b = accounts
+        .iter()
+        .find(|acc| acc.file_path().ends_with("b.json"))
+        .expect("b.json account");
+    let stats = b.stats_snapshot();
+    assert_eq!(stats.successful_requests, 1);
+    assert_eq!(stats.failed_requests, 0);
+    assert_eq!(stats.usage_total_tokens, 9);
+    let trend = runtime_state.hourly_trend();
+    assert_eq!(trend.len(), 1);
+    assert_eq!(trend[0].requests, 1);
+    assert_eq!(trend[0].total_tokens, 9);
 }

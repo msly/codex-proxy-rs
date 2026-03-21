@@ -5,6 +5,7 @@ pub mod health;
 pub mod net;
 pub mod quota;
 pub mod refresh;
+pub mod state;
 pub mod thinking;
 pub mod translate;
 pub mod upstream;

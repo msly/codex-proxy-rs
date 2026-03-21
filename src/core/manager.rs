@@ -8,6 +8,8 @@ use arc_swap::ArcSwap;
 use super::account::{Account, TokenData, TokenFile, parse_id_token_claims};
 use super::selector::{RoundRobinSelector, Selector};
 
+const RUNTIME_STATE_FILE_NAME: &str = ".codex-proxy-state.json";
+
 pub struct Manager {
     auth_dir: PathBuf,
     accounts: ArcSwap<Vec<Arc<Account>>>,
@@ -42,10 +44,9 @@ impl Manager {
             match load_account_from_file(&path) {
                 Ok(acc) => accounts.push(acc),
                 Err(err) => {
-                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        tracing::warn!(file = name, "skip invalid auth file: {err}");
-                    } else {
-                        tracing::warn!("skip invalid auth file: {err}");
+                    warn_invalid_auth_file(&path, &err);
+                    if err.should_delete_file() {
+                        delete_invalid_auth_file(&path, "missing_access_token");
                     }
                 }
             }
@@ -172,10 +173,9 @@ impl Manager {
             match load_account_from_file(&path) {
                 Ok(acc) => added.push(acc),
                 Err(err) => {
-                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        tracing::warn!(file = name, "skip invalid auth file: {err}");
-                    } else {
-                        tracing::warn!("skip invalid auth file: {err}");
+                    warn_invalid_auth_file(&path, &err);
+                    if err.should_delete_file() {
+                        delete_invalid_auth_file(&path, "missing_access_token");
                     }
                 }
             }
@@ -196,17 +196,73 @@ impl Manager {
 }
 
 fn is_json_file(path: &Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name == RUNTIME_STATE_FILE_NAME)
+    {
+        return false;
+    }
     path.extension()
         .and_then(|s| s.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
-fn load_account_from_file(path: &Path) -> Result<Arc<Account>, String> {
-    let data = fs::read_to_string(path).map_err(|e| format!("读取文件失败: {e}"))?;
-    let tf: TokenFile = serde_json::from_str(&data).map_err(|e| format!("解析 JSON 失败: {e}"))?;
+#[derive(Debug)]
+enum LoadAccountError {
+    Read(String),
+    Parse(String),
+    MissingAccessToken,
+}
 
-    if tf.refresh_token.trim().is_empty() {
-        return Err("文件中缺少 refresh_token".to_string());
+impl LoadAccountError {
+    fn message(&self) -> String {
+        match self {
+            Self::Read(err) => format!("读取文件失败: {err}"),
+            Self::Parse(err) => format!("解析 JSON 失败: {err}"),
+            Self::MissingAccessToken => "文件中缺少 access_token".to_string(),
+        }
+    }
+
+    fn should_delete_file(&self) -> bool {
+        matches!(self, Self::MissingAccessToken)
+    }
+}
+
+fn warn_invalid_auth_file(path: &Path, err: &LoadAccountError) {
+    let err = err.message();
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        tracing::warn!(file = name, "skip invalid auth file: {err}");
+    } else {
+        tracing::warn!("skip invalid auth file: {err}");
+    }
+}
+
+fn delete_invalid_auth_file(path: &Path, reason: &str) {
+    match fs::remove_file(path) {
+        Ok(()) => tracing::warn!(file_path = %path.display(), reason, "invalid auth file deleted"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                file_path = %path.display(),
+                reason,
+                "invalid auth file already missing"
+            )
+        }
+        Err(err) => tracing::warn!(
+            file_path = %path.display(),
+            reason,
+            "failed to delete invalid auth file: {err}"
+        ),
+    }
+}
+
+fn load_account_from_file(path: &Path) -> Result<Arc<Account>, LoadAccountError> {
+    let data = fs::read_to_string(path).map_err(|e| LoadAccountError::Read(e.to_string()))?;
+    let tf: TokenFile =
+        serde_json::from_str(&data).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
+
+    if tf.access_token.trim().is_empty() {
+        return Err(LoadAccountError::MissingAccessToken);
     }
 
     let mut account_id = tf.account_id;
@@ -276,8 +332,8 @@ mod tests {
         fs::write(
             &invalid_path,
             r#"{
-  "access_token": "at-x",
-  "refresh_token": "",
+  "access_token": "",
+  "refresh_token": "rt-x",
   "account_id": "acc-x",
   "email": "x@example.com",
   "type": "codex",
@@ -310,14 +366,168 @@ mod tests {
     }
 
     #[test]
+    fn core_manager_loads_access_token_only_auth_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("a.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "access_token": "at-a",
+  "refresh_token": "",
+  "account_id": "acc-a",
+  "email": "a@example.com",
+  "type": "codex",
+  "expired": "2099-01-01T00:00:00Z"
+}"#,
+        )
+        .expect("write a.json");
+
+        let manager = Manager::new(dir.path());
+        let count = manager.load_accounts().expect("load accounts");
+        assert_eq!(count, 1);
+        assert_eq!(manager.account_count(), 1);
+        assert_eq!(manager.accounts_snapshot()[0].token().access_token, "at-a");
+        assert_eq!(manager.accounts_snapshot()[0].token().refresh_token, "");
+    }
+
+    #[test]
+    fn core_manager_scan_new_files_loads_access_token_only_auth_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = Manager::new(dir.path());
+
+        assert_eq!(manager.scan_new_files().expect("initial scan"), 0);
+
+        fs::write(
+            dir.path().join("a.json"),
+            r#"{
+  "access_token": "at-a",
+  "refresh_token": "",
+  "account_id": "acc-a",
+  "email": "a@example.com",
+  "type": "codex",
+  "expired": "2099-01-01T00:00:00Z"
+}"#,
+        )
+        .expect("write a.json");
+
+        assert_eq!(manager.scan_new_files().expect("hot load"), 1);
+        assert_eq!(manager.account_count(), 1);
+        assert_eq!(manager.accounts_snapshot()[0].token().access_token, "at-a");
+        assert_eq!(manager.accounts_snapshot()[0].token().refresh_token, "");
+    }
+
+    #[test]
+    fn core_manager_deletes_missing_access_token_file_on_startup_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let invalid_path = dir.path().join("invalid.json");
+        fs::write(
+            &invalid_path,
+            r#"{
+  "access_token": "",
+  "refresh_token": "rt-x",
+  "account_id": "acc-x",
+  "email": "x@example.com",
+  "type": "codex",
+  "expired": "2099-01-01T00:00:00Z"
+}"#,
+        )
+        .expect("write invalid.json");
+
+        let manager = Manager::new(dir.path());
+        let err = manager.load_accounts().expect_err("should error");
+        assert!(err.contains("未找到有效"), "got err: {err}");
+        assert!(
+            !invalid_path.exists(),
+            "missing-access-token auth file should be deleted"
+        );
+    }
+
+    #[test]
+    fn core_manager_deletes_missing_access_token_file_on_hot_load_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = Manager::new(dir.path());
+        let invalid_path = dir.path().join("invalid.json");
+        fs::write(
+            &invalid_path,
+            r#"{
+  "access_token": "",
+  "refresh_token": "rt-x",
+  "account_id": "acc-x",
+  "email": "x@example.com",
+  "type": "codex",
+  "expired": "2099-01-01T00:00:00Z"
+}"#,
+        )
+        .expect("write invalid.json");
+
+        assert_eq!(manager.scan_new_files().expect("scan"), 0);
+        assert!(
+            !invalid_path.exists(),
+            "missing-access-token auth file should be deleted"
+        );
+    }
+
+    #[test]
+    fn core_manager_keeps_malformed_json_file_on_startup_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let invalid_path = dir.path().join("invalid.json");
+        fs::write(&invalid_path, r#"{"access_token":"at""#).expect("write invalid json");
+
+        let manager = Manager::new(dir.path());
+        let err = manager.load_accounts().expect_err("should error");
+        assert!(err.contains("未找到有效"), "got err: {err}");
+        assert!(
+            invalid_path.exists(),
+            "malformed json should be skipped but not deleted"
+        );
+    }
+
+    #[test]
+    fn core_manager_ignores_runtime_state_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("a.json");
+        let state_path = dir.path().join(".codex-proxy-state.json");
+
+        fs::write(
+            &auth_path,
+            r#"{
+  "access_token": "at-a",
+  "refresh_token": "rt-a",
+  "account_id": "acc-a",
+  "email": "a@example.com",
+  "type": "codex",
+  "expired": "2099-01-01T00:00:00Z"
+}"#,
+        )
+        .expect("write a.json");
+        fs::write(
+            &state_path,
+            r#"{
+  "saved_at_ms": 123,
+  "accounts": {},
+  "hourly": []
+}"#,
+        )
+        .expect("write state file");
+
+        let manager = Manager::new(dir.path());
+        let count = manager.load_accounts().expect("load accounts");
+        assert_eq!(count, 1);
+        assert!(
+            state_path.exists(),
+            "runtime state file should be ignored instead of deleted"
+        );
+    }
+
+    #[test]
     fn core_manager_errors_when_no_valid_accounts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let invalid_path = dir.path().join("invalid.json");
         fs::write(
             &invalid_path,
             r#"{
-  "access_token": "at-x",
-  "refresh_token": "",
+  "access_token": "",
+  "refresh_token": "rt-x",
   "account_id": "acc-x",
   "email": "x@example.com",
   "type": "codex",

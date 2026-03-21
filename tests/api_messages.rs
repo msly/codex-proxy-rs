@@ -71,6 +71,9 @@ fn build_state(base_url: Url, manager: Arc<Manager>) -> AppState {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(
+            std::env::temp_dir(),
+        )),
         on_401: None,
     }
 }

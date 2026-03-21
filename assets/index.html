@@ -116,6 +116,83 @@
       overflow: hidden;
       box-shadow: var(--shadow);
     }
+    .trend-wrap {
+      background: #fffdf7;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: var(--shadow);
+      margin-bottom: 24px;
+      display: grid;
+      gap: 16px;
+    }
+    .trend-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .trend-header h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .segmented {
+      display: inline-flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .segmented button {
+      padding: 8px 14px;
+      font-size: 12px;
+      box-shadow: none;
+      background: #fff;
+      border: 1px solid var(--line);
+    }
+    .segmented button.active {
+      background: linear-gradient(135deg, #ffd166, #ff9f1c);
+    }
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .chart-card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px;
+      background: #fff;
+      display: grid;
+      gap: 10px;
+    }
+    .chart-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .chart-meta h3 {
+      margin: 0;
+      font-size: 14px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+    .chart-svg {
+      width: 100%;
+      height: 220px;
+      display: block;
+      overflow: visible;
+    }
+    .axis-text {
+      fill: var(--muted);
+      font-size: 11px;
+    }
+    .empty-text {
+      fill: var(--muted);
+      font-size: 13px;
+    }
     .table-toolbar {
       display: flex;
       gap: 12px;
@@ -156,6 +233,25 @@
       text-transform: uppercase;
       letter-spacing: 1px;
       background: #fffdf7;
+    }
+    .sort-btn {
+      appearance: none;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      padding: 0;
+      color: inherit;
+      font: inherit;
+      text-transform: inherit;
+      letter-spacing: inherit;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .sort-indicator {
+      font-size: 10px;
+      color: var(--muted);
     }
     tr:hover td { background: #fff6df; }
     .status {
@@ -288,6 +384,7 @@
     }
     @media (max-width: 980px) {
       .grid { grid-template-columns: repeat(2, 1fr); }
+      .chart-grid { grid-template-columns: 1fr; }
       header { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
@@ -313,6 +410,35 @@
     </header>
 
     <section class="grid" id="summaryCards"></section>
+    <section class="trend-wrap">
+      <div class="trend-header">
+        <div>
+          <h2>小时趋势</h2>
+          <p class="subtitle">展示 requests 与 total tokens 的最近小时走势</p>
+        </div>
+        <div class="segmented" id="trendRange">
+          <button type="button" data-hours="24" class="active">24h</button>
+          <button type="button" data-hours="72">72h</button>
+          <button type="button" data-hours="168">7d</button>
+        </div>
+      </div>
+      <div class="chart-grid">
+        <div class="chart-card">
+          <div class="chart-meta">
+            <h3>Requests / Hour</h3>
+            <span class="muted" id="requestsChartMeta">--</span>
+          </div>
+          <svg id="requestsChart" class="chart-svg" viewBox="0 0 560 220" preserveAspectRatio="none"></svg>
+        </div>
+        <div class="chart-card">
+          <div class="chart-meta">
+            <h3>Tokens / Hour</h3>
+            <span class="muted" id="tokensChartMeta">--</span>
+          </div>
+          <svg id="tokensChart" class="chart-svg" viewBox="0 0 560 220" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+    </section>
     <section id="placeholder" class="placeholder" aria-hidden="true">
       <div class="placeholder-row">
         <div class="skeleton big"></div>
@@ -347,6 +473,12 @@
           <span class="muted" id="rowsInfo">0 条记录</span>
         </div>
         <div class="toolbar-right">
+          <select id="statusFilter">
+            <option value="all">全部状态</option>
+            <option value="active">Active</option>
+            <option value="cooldown">Cooldown</option>
+            <option value="disabled">Disabled</option>
+          </select>
           <input id="searchInput" type="text" placeholder="邮箱搜索" />
           <div class="pagination">
             <button id="prevBtn">上一页</button>
@@ -359,11 +491,11 @@
         <thead>
           <tr>
             <th>邮箱</th>
-            <th>状态</th>
+            <th><button type="button" class="sort-btn" data-sort-key="status">状态 <span class="sort-indicator" data-indicator-for="status">-</span></button></th>
             <th>套餐</th>
-            <th>请求数</th>
-            <th>错误</th>
-            <th>最后使用</th>
+            <th><button type="button" class="sort-btn" data-sort-key="successful_requests">成功请求 <span class="sort-indicator" data-indicator-for="successful_requests">-</span></button></th>
+            <th>最终失败</th>
+            <th><button type="button" class="sort-btn" data-sort-key="last_used_ms">最后使用 <span class="sort-indicator" data-indicator-for="last_used_ms">-</span></button></th>
             <th>Token 过期</th>
             <th>额度</th>
           </tr>
@@ -402,6 +534,7 @@
   <script>
     const CACHE_KEY = "stats_cache_v1";
     const CRED_KEY = "stats_credentials_v1";
+    const HOUR_MS = 60 * 60 * 1000;
 
     const els = {
       summaryCards: document.getElementById("summaryCards"),
@@ -417,6 +550,7 @@
       cacheState: document.getElementById("cacheState"),
       cacheNote: document.getElementById("cacheNote"),
       searchInput: document.getElementById("searchInput"),
+      statusFilter: document.getElementById("statusFilter"),
       placeholder: document.getElementById("placeholder"),
       loadingOverlay: document.getElementById("loadingOverlay"),
       loginOverlay: document.getElementById("loginOverlay"),
@@ -424,7 +558,14 @@
       tokenInput: document.getElementById("tokenInput"),
       saveCredentialsBtn: document.getElementById("saveCredentialsBtn"),
       cancelCredentialsBtn: document.getElementById("cancelCredentialsBtn"),
-      settingsBtn: document.getElementById("settingsBtn")
+      settingsBtn: document.getElementById("settingsBtn"),
+      requestsChart: document.getElementById("requestsChart"),
+      tokensChart: document.getElementById("tokensChart"),
+      requestsChartMeta: document.getElementById("requestsChartMeta"),
+      tokensChartMeta: document.getElementById("tokensChartMeta"),
+      trendRangeButtons: Array.from(document.querySelectorAll("#trendRange button")),
+      sortButtons: Array.from(document.querySelectorAll(".sort-btn")),
+      sortIndicators: Array.from(document.querySelectorAll("[data-indicator-for]"))
     };
 
     let cache = null;
@@ -433,16 +574,48 @@
     let pageSize = Number(els.pageSize.value);
     let memoryOnlyCache = false;
     let credentials = null;
+    let chartRangeHours = 24;
+    let sortState = { key: "successful_requests", dir: "desc" };
 
     function formatNumber(n) {
       return new Intl.NumberFormat("zh-CN").format(n ?? 0);
     }
 
+    function formatCompactNumber(n) {
+      const value = Number(n ?? 0);
+      if (value >= 100000000) return `${(value / 100000000).toFixed(1)}亿`;
+      if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
+      return formatNumber(value);
+    }
+
     function formatDate(value) {
-      if (!value || value.startsWith("0001")) return "--";
+      if (!value || String(value).startsWith("0001")) return "--";
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return "--";
       return d.toLocaleString("zh-CN");
+    }
+
+    function formatHour(ms) {
+      const d = new Date(ms);
+      if (Number.isNaN(d.getTime())) return "--";
+      return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:00`;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function alignHour(ms) {
+      return Math.floor(ms / HOUR_MS) * HOUR_MS;
+    }
+
+    function statusRank(status) {
+      return { active: 0, cooldown: 1, disabled: 2 }[String(status || "").toLowerCase()] ?? 9;
     }
 
     function setCache(data, meta) {
@@ -479,6 +652,7 @@
       if (!cache) {
         els.cacheState.textContent = "缓存：未加载";
         els.cacheNote.textContent = "";
+        els.updatedAt.textContent = "上次更新：--";
         return;
       }
       const cachedAt = cache.meta?.cachedAt || "--";
@@ -486,7 +660,7 @@
       els.cacheNote.textContent = "";
       els.updatedAt.textContent = `上次更新：${cachedAt}`;
     }
-    
+
     function getCredentials() {
       if (credentials) return credentials;
       const raw = localStorage.getItem(CRED_KEY);
@@ -523,38 +697,177 @@
 
     function renderSummary(summary, accounts) {
       const safe = summary || {};
-      const total = safe.total ?? accounts.length;
       const cards = [
-        { label: "总账号", value: total, color: "#ff6b35" },
-        { label: "活跃", value: safe.active ?? 0, color: "#16a34a" },
-        { label: "冷却中", value: safe.cooldown ?? 0, color: "#db2777" },
-        { label: "禁用", value: safe.disabled ?? 0, color: "#475569" }
+        { label: "总账号", value: safe.total ?? accounts.length },
+        { label: "活跃", value: safe.active ?? 0 },
+        { label: "冷却中", value: safe.cooldown ?? 0 },
+        { label: "禁用", value: safe.disabled ?? 0 }
       ];
       els.summaryCards.innerHTML = cards.map(card => `
         <div class="card">
           <h3>${card.label}</h3>
-          <div class="value">${formatNumber(card.value)}</div>
+          <div class="value">${card.raw ? card.value : formatNumber(card.value)}</div>
         </div>
       `).join("");
+    }
+
+    function buildContinuousTrend(points, hours) {
+      const normalized = new Map();
+      for (const point of points || []) {
+        const hour = alignHour(Number(point?.hour_start_ms || 0));
+        if (!hour) continue;
+        normalized.set(hour, {
+          hour_start_ms: hour,
+          hour_label: point.hour_label || formatHour(hour),
+          requests: Number(point.requests || 0),
+          input_tokens: Number(point.input_tokens || 0),
+          output_tokens: Number(point.output_tokens || 0),
+          total_tokens: Number(point.total_tokens || 0)
+        });
+      }
+      const latestPoint = Math.max(Date.now(), ...Array.from(normalized.keys(), value => Number(value)));
+      const end = alignHour(latestPoint);
+      const start = end - (hours - 1) * HOUR_MS;
+      const out = [];
+      for (let ts = start; ts <= end; ts += HOUR_MS) {
+        out.push(normalized.get(ts) || {
+          hour_start_ms: ts,
+          hour_label: formatHour(ts),
+          requests: 0,
+          input_tokens: 0,
+          output_tokens: 0,
+          total_tokens: 0
+        });
+      }
+      return out;
+    }
+
+    function renderLineChart(svgEl, metaEl, series, valueKey, color) {
+      const width = 560;
+      const height = 220;
+      const padLeft = 42;
+      const padRight = 12;
+      const padTop = 12;
+      const padBottom = 28;
+      const plotWidth = width - padLeft - padRight;
+      const plotHeight = height - padTop - padBottom;
+      const values = series.map(item => Number(item[valueKey] || 0));
+      const maxValue = Math.max(1, ...values);
+      const total = values.reduce((sum, value) => sum + value, 0);
+      const peak = Math.max(...values, 0);
+
+      metaEl.textContent = `合计 ${formatCompactNumber(total)} · 峰值 ${formatCompactNumber(peak)}`;
+
+      const points = series.map((item, index) => {
+        const x = padLeft + (series.length === 1 ? plotWidth / 2 : index * (plotWidth / (series.length - 1)));
+        const y = padTop + plotHeight - (Number(item[valueKey] || 0) / maxValue) * plotHeight;
+        return { x, y, label: item.hour_label || formatHour(item.hour_start_ms) };
+      });
+
+      const linePath = points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ");
+      const areaPath = `M ${padLeft} ${padTop + plotHeight} ${points.map(point => `L ${point.x.toFixed(2)} ${point.y.toFixed(2)}`).join(" ")} L ${padLeft + plotWidth} ${padTop + plotHeight} Z`;
+
+      const yTicks = [1, 0.5, 0];
+      const yGrid = yTicks.map(tick => {
+        const y = padTop + plotHeight - tick * plotHeight;
+        const label = formatCompactNumber(Math.round(maxValue * tick));
+        return `
+          <line x1="${padLeft}" y1="${y}" x2="${padLeft + plotWidth}" y2="${y}" stroke="#eadfcb" stroke-dasharray="3 4"></line>
+          <text x="${padLeft - 8}" y="${y + 4}" text-anchor="end" class="axis-text">${label}</text>
+        `;
+      }).join("");
+
+      const xTickIndexes = Array.from(new Set([
+        0,
+        Math.floor((series.length - 1) / 3),
+        Math.floor(((series.length - 1) * 2) / 3),
+        Math.max(series.length - 1, 0)
+      ])).filter(index => index >= 0 && index < series.length);
+
+      const xTicks = xTickIndexes.map(index => {
+        const point = points[index];
+        return `<text x="${point.x}" y="${height - 6}" text-anchor="middle" class="axis-text">${escapeHtml(point.label)}</text>`;
+      }).join("");
+
+      svgEl.innerHTML = `
+        <rect x="0" y="0" width="${width}" height="${height}" rx="12" fill="#fff"></rect>
+        ${yGrid}
+        <path d="${areaPath}" fill="${color}" opacity="0.14"></path>
+        <path d="${linePath}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></path>
+        ${points.map(point => `<circle cx="${point.x}" cy="${point.y}" r="2.5" fill="${color}"></circle>`).join("")}
+        ${xTicks}
+      `;
+    }
+
+    function renderTrend(trend) {
+      const series = buildContinuousTrend(trend?.hourly || [], chartRangeHours);
+      renderLineChart(els.requestsChart, els.requestsChartMeta, series, "requests", "#1b9aaa");
+      renderLineChart(els.tokensChart, els.tokensChartMeta, series, "total_tokens", "#ff6b35");
+    }
+
+    function rowSortValue(row, key) {
+      if (key === "status") return statusRank(row.status);
+      if (key === "successful_requests") return Number(row.successful_requests || 0);
+      if (key === "last_used_ms") return Number(row.last_used_ms || 0);
+      return row[key] ?? "";
+    }
+
+    function compareValues(left, right) {
+      if (typeof left === "number" && typeof right === "number") return left - right;
+      return String(left).localeCompare(String(right), "zh-CN", { numeric: true, sensitivity: "base" });
+    }
+
+    function updateSortIndicators() {
+      for (const indicator of els.sortIndicators) {
+        const key = indicator.dataset.indicatorFor;
+        indicator.textContent = key === sortState.key ? (sortState.dir === "asc" ? "▲" : "▼") : "-";
+      }
+    }
+
+    function applyTableState() {
+      const keyword = els.searchInput.value.trim().toLowerCase();
+      const status = els.statusFilter.value;
+      const accounts = cache?.data?.accounts || [];
+      const filtered = accounts
+        .filter(account => {
+          if (status !== "all" && String(account.status || "").toLowerCase() !== status) return false;
+          if (!keyword) return true;
+          return String(account.email || "").toLowerCase().includes(keyword) || String(account.file_path || "").toLowerCase().includes(keyword);
+        })
+        .map((account, index) => ({ account, index }))
+        .sort((left, right) => {
+          const primary = compareValues(
+            rowSortValue(left.account, sortState.key),
+            rowSortValue(right.account, sortState.key)
+          );
+          if (primary !== 0) return sortState.dir === "asc" ? primary : -primary;
+          return left.index - right.index;
+        })
+        .map(item => item.account);
+
+      filteredAccounts = filtered;
+      currentPage = 1;
+      updateSortIndicators();
+      renderTablePage();
     }
 
     function renderTablePage() {
       const total = filteredAccounts.length;
       const totalPages = Math.max(1, Math.ceil(total / pageSize));
       currentPage = Math.min(currentPage, totalPages);
-      const start = (currentPage - 1) * pageSize;
-      const end = Math.min(start + pageSize, total);
+      const start = total === 0 ? 0 : (currentPage - 1) * pageSize;
+      const end = total === 0 ? 0 : Math.min(start + pageSize, total);
       const pageRows = filteredAccounts.slice(start, end);
 
       const fragment = document.createDocumentFragment();
       for (const row of pageRows) {
         const tr = document.createElement("tr");
         tr.innerHTML = `
-          <td>${row.email || "--"}</td>
-          <td><span class="status ${row.status || "disabled"}">${row.status || "--"}</span></td>
-          <td>${row.plan_type || "--"}</td>
-          <td>${formatNumber(row.total_requests)}</td>
-          <td>${formatNumber(row.total_errors)}</td>
+          <td>${escapeHtml(row.email || "--")}</td>
+          <td><span class="status ${escapeHtml(row.status || "disabled")}">${escapeHtml(row.status || "--")}</span></td>
+          <td>${escapeHtml(row.plan_type || "--")}</td>
+          <td>${formatNumber(row.successful_requests)}</td>
+          <td>${formatNumber(row.failed_requests)}</td>
           <td>${formatDate(row.last_used_at)}</td>
           <td>${formatDate(row.token_expire)}</td>
           <td>${row.quota_exhausted ? "已用尽" : "可用"}</td>
@@ -565,29 +878,24 @@
       els.tableBody.appendChild(fragment);
 
       els.pageInfo.textContent = `${currentPage} / ${totalPages}`;
-      els.rowsInfo.textContent = `${formatNumber(total)} 条记录，当前显示 ${formatNumber(start + 1)}-${formatNumber(end)}`;
-      els.prevBtn.disabled = currentPage === 1;
-      els.nextBtn.disabled = currentPage === totalPages;
-    }
-
-    function applyFilter() {
-      const kw = els.searchInput.value.trim().toLowerCase();
-      const accounts = cache?.data?.accounts || [];
-      if (!kw) {
-        filteredAccounts = accounts;
+      if (total === 0) {
+        els.rowsInfo.textContent = "0 条记录";
       } else {
-        filteredAccounts = accounts.filter(a => (a.email || "").toLowerCase().includes(kw));
+        els.rowsInfo.textContent = `${formatNumber(total)} 条记录，当前显示 ${formatNumber(start + 1)}-${formatNumber(end)}`;
       }
-      currentPage = 1;
-      renderTablePage();
+      els.prevBtn.disabled = currentPage === 1;
+      els.nextBtn.disabled = currentPage === totalPages || total === 0;
     }
 
     function setLoading(isLoading) {
-      if (isLoading) {
-        els.loadingOverlay.classList.add("active");
-      } else {
-        els.loadingOverlay.classList.remove("active");
-      }
+      els.loadingOverlay.classList.toggle("active", isLoading);
+    }
+
+    function clearCharts() {
+      els.requestsChart.innerHTML = `<text x="280" y="110" text-anchor="middle" class="empty-text">暂无数据</text>`;
+      els.tokensChart.innerHTML = `<text x="280" y="110" text-anchor="middle" class="empty-text">暂无数据</text>`;
+      els.requestsChartMeta.textContent = "--";
+      els.tokensChartMeta.textContent = "--";
     }
 
     function showPlaceholder(show) {
@@ -599,6 +907,7 @@
         els.pageInfo.textContent = "1 / 1";
         els.prevBtn.disabled = true;
         els.nextBtn.disabled = true;
+        clearCharts();
       }
     }
 
@@ -628,13 +937,15 @@
 
     function render(data) {
       renderSummary(data.summary, data.accounts || []);
-      filteredAccounts = data.accounts || [];
-      applyFilter();
+      renderTrend(data.trend || { hourly: [] });
+      applyTableState();
       showPlaceholder(false);
       updateCacheBadge();
     }
 
     function init() {
+      clearCharts();
+      updateSortIndicators();
       const existing = getCache();
       if (existing?.data) {
         render(existing.data);
@@ -684,8 +995,27 @@
     els.cancelCredentialsBtn.addEventListener("click", () => {
       showLogin(false);
     });
-    els.searchInput.addEventListener("input", () => {
-      applyFilter();
+    els.searchInput.addEventListener("input", applyTableState);
+    els.statusFilter.addEventListener("change", applyTableState);
+    els.sortButtons.forEach(button => {
+      button.addEventListener("click", () => {
+        const key = button.dataset.sortKey;
+        if (!key) return;
+        if (sortState.key === key) {
+          sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+        } else {
+          sortState.key = key;
+          sortState.dir = key === "status" ? "asc" : "desc";
+        }
+        applyTableState();
+      });
+    });
+    els.trendRangeButtons.forEach(button => {
+      button.addEventListener("click", () => {
+        chartRangeHours = Number(button.dataset.hours || 24);
+        els.trendRangeButtons.forEach(item => item.classList.toggle("active", item === button));
+        renderTrend(cache?.data?.trend || { hourly: [] });
+      });
     });
 
     init();

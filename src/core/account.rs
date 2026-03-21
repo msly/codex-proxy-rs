@@ -69,6 +69,29 @@ impl AccountStatus {
     }
 }
 
+impl Serialize for AccountStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AccountStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(match raw.trim().to_ascii_lowercase().as_str() {
+            "cooldown" => Self::Cooldown,
+            "disabled" => Self::Disabled,
+            _ => Self::Active,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Account {
     file_path: String,
@@ -87,6 +110,8 @@ pub struct Account {
     consecutive_failures: AtomicI64,
     total_requests: AtomicI64,
     total_errors: AtomicI64,
+    successful_requests: AtomicI64,
+    failed_requests: AtomicI64,
 
     total_completions: AtomicI64,
     input_tokens: AtomicI64,
@@ -112,6 +137,8 @@ impl Account {
             consecutive_failures: AtomicI64::new(0),
             total_requests: AtomicI64::new(0),
             total_errors: AtomicI64::new(0),
+            successful_requests: AtomicI64::new(0),
+            failed_requests: AtomicI64::new(0),
             total_completions: AtomicI64::new(0),
             input_tokens: AtomicI64::new(0),
             output_tokens: AtomicI64::new(0),
@@ -282,6 +309,69 @@ impl Account {
         self.refresh_used_percent_from_quota(&info);
     }
 
+    pub fn apply_runtime_snapshot(&self, snapshot: &AccountRuntimeSnapshot, now_ms: i64) {
+        self.total_requests
+            .store(snapshot.total_requests.max(0), Ordering::Relaxed);
+        self.total_errors
+            .store(snapshot.total_errors.max(0), Ordering::Relaxed);
+        self.successful_requests
+            .store(snapshot.successful_requests.max(0), Ordering::Relaxed);
+        self.failed_requests
+            .store(snapshot.failed_requests.max(0), Ordering::Relaxed);
+        self.consecutive_failures
+            .store(snapshot.consecutive_failures.max(0), Ordering::Relaxed);
+        self.last_used_ms
+            .store(snapshot.last_used_ms.max(0), Ordering::Relaxed);
+        self.quota_exhausted.store(
+            if snapshot.quota_exhausted { 1 } else { 0 },
+            Ordering::Relaxed,
+        );
+        self.quota_resets_at_ms
+            .store(snapshot.quota_resets_at_ms.max(0), Ordering::Relaxed);
+        self.total_completions
+            .store(snapshot.usage_total_completions.max(0), Ordering::Relaxed);
+        self.input_tokens
+            .store(snapshot.usage_input_tokens.max(0), Ordering::Relaxed);
+        self.output_tokens
+            .store(snapshot.usage_output_tokens.max(0), Ordering::Relaxed);
+        self.total_tokens
+            .store(snapshot.usage_total_tokens.max(0), Ordering::Relaxed);
+
+        let status = if snapshot.status == AccountStatus::Cooldown
+            && snapshot.cooldown_until_ms > 0
+            && snapshot.cooldown_until_ms > now_ms
+        {
+            AccountStatus::Cooldown
+        } else {
+            snapshot.status
+        };
+
+        match status {
+            AccountStatus::Active => {
+                self.status
+                    .store(AccountStatus::Active as i32, Ordering::Relaxed);
+                self.cooldown_until_ms.store(0, Ordering::Relaxed);
+            }
+            AccountStatus::Disabled => {
+                self.status
+                    .store(AccountStatus::Disabled as i32, Ordering::Relaxed);
+                self.cooldown_until_ms.store(0, Ordering::Relaxed);
+            }
+            AccountStatus::Cooldown => {
+                self.status
+                    .store(AccountStatus::Cooldown as i32, Ordering::Relaxed);
+                self.cooldown_until_ms
+                    .store(snapshot.cooldown_until_ms, Ordering::Relaxed);
+            }
+        }
+
+        if snapshot.status == AccountStatus::Cooldown && snapshot.cooldown_until_ms <= now_ms {
+            self.status
+                .store(AccountStatus::Active as i32, Ordering::Relaxed);
+            self.cooldown_until_ms.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn quota_info(&self) -> Option<QuotaInfo> {
         self.quota
             .read()
@@ -315,12 +405,28 @@ impl Account {
         failures
     }
 
+    pub fn record_client_success(&self) {
+        self.successful_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_client_failure(&self) {
+        self.failed_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn total_requests(&self) -> i64 {
         self.total_requests.load(Ordering::Relaxed)
     }
 
     pub fn total_errors(&self) -> i64 {
         self.total_errors.load(Ordering::Relaxed)
+    }
+
+    pub fn successful_requests(&self) -> i64 {
+        self.successful_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn failed_requests(&self) -> i64 {
+        self.failed_requests.load(Ordering::Relaxed)
     }
 
     pub fn consecutive_failures(&self) -> i64 {
@@ -337,6 +443,8 @@ impl Account {
             used_percent: self.used_percent(),
             total_requests: self.total_requests(),
             total_errors: self.total_errors(),
+            successful_requests: self.successful_requests(),
+            failed_requests: self.failed_requests(),
             consecutive_failures: self.consecutive_failures(),
             last_used_ms: self.last_used_ms(),
             last_refreshed_ms: self.last_refresh_ms(),
@@ -361,6 +469,8 @@ pub struct AccountStatsSnapshot {
     pub used_percent: f64,
     pub total_requests: i64,
     pub total_errors: i64,
+    pub successful_requests: i64,
+    pub failed_requests: i64,
     pub consecutive_failures: i64,
     pub last_used_ms: i64,
     pub last_refreshed_ms: i64,
@@ -372,6 +482,47 @@ pub struct AccountStatsSnapshot {
     pub usage_output_tokens: i64,
     pub usage_total_tokens: i64,
     pub token_expire: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountRuntimeSnapshot {
+    pub status: AccountStatus,
+    pub cooldown_until_ms: i64,
+    pub total_requests: i64,
+    pub total_errors: i64,
+    #[serde(default)]
+    pub successful_requests: i64,
+    #[serde(default)]
+    pub failed_requests: i64,
+    pub consecutive_failures: i64,
+    pub last_used_ms: i64,
+    pub quota_exhausted: bool,
+    pub quota_resets_at_ms: i64,
+    pub usage_total_completions: i64,
+    pub usage_input_tokens: i64,
+    pub usage_output_tokens: i64,
+    pub usage_total_tokens: i64,
+}
+
+impl AccountStatsSnapshot {
+    pub fn runtime_snapshot(&self) -> AccountRuntimeSnapshot {
+        AccountRuntimeSnapshot {
+            status: self.status,
+            cooldown_until_ms: self.cooldown_until_ms,
+            total_requests: self.total_requests,
+            total_errors: self.total_errors,
+            successful_requests: self.successful_requests,
+            failed_requests: self.failed_requests,
+            consecutive_failures: self.consecutive_failures,
+            last_used_ms: self.last_used_ms,
+            quota_exhausted: self.quota_exhausted,
+            quota_resets_at_ms: self.quota_resets_at_ms,
+            usage_total_completions: self.usage_total_completions,
+            usage_input_tokens: self.usage_input_tokens,
+            usage_output_tokens: self.usage_output_tokens,
+            usage_total_tokens: self.usage_total_tokens,
+        }
+    }
 }
 
 pub fn now_unix_ms() -> i64 {
@@ -471,6 +622,8 @@ mod tests {
         assert_eq!(acc.record_failure(now), 1);
         assert_eq!(acc.record_failure(now), 2);
         acc.record_success(now);
+        acc.record_client_success();
+        acc.record_client_failure();
 
         acc.set_used_percent_for_test(Some(12.34));
         acc.set_status_for_test(AccountStatus::Cooldown);
@@ -481,6 +634,8 @@ mod tests {
         assert_eq!(snap.status, AccountStatus::Cooldown);
         assert_eq!(snap.total_requests, 3);
         assert_eq!(snap.total_errors, 2);
+        assert_eq!(snap.successful_requests, 1);
+        assert_eq!(snap.failed_requests, 1);
         assert_eq!(snap.consecutive_failures, 0);
         assert!(
             (snap.used_percent - 12.34).abs() < 1e-6,
@@ -525,5 +680,101 @@ mod tests {
             "used={}",
             acc.used_percent()
         );
+    }
+
+    #[test]
+    fn core_account_apply_runtime_snapshot_restores_counters_and_cooldown() {
+        let acc = Account::new(
+            "a.json".to_string(),
+            TokenData {
+                id_token: String::new(),
+                access_token: String::new(),
+                refresh_token: "rt".to_string(),
+                account_id: String::new(),
+                email: "a@example.com".to_string(),
+                expired: "2099-01-01T00:00:00Z".to_string(),
+                plan_type: String::new(),
+            },
+        );
+
+        let now_ms = now_unix_ms();
+        acc.apply_runtime_snapshot(
+            &AccountRuntimeSnapshot {
+                status: AccountStatus::Cooldown,
+                cooldown_until_ms: now_ms + 60_000,
+                total_requests: 12,
+                total_errors: 3,
+                successful_requests: 8,
+                failed_requests: 1,
+                consecutive_failures: 2,
+                last_used_ms: now_ms - 1_000,
+                quota_exhausted: true,
+                quota_resets_at_ms: now_ms + 60_000,
+                usage_total_completions: 5,
+                usage_input_tokens: 100,
+                usage_output_tokens: 40,
+                usage_total_tokens: 140,
+            },
+            now_ms,
+        );
+
+        let snap = acc.stats_snapshot();
+        assert_eq!(snap.status, AccountStatus::Cooldown);
+        assert_eq!(snap.total_requests, 12);
+        assert_eq!(snap.total_errors, 3);
+        assert_eq!(snap.successful_requests, 8);
+        assert_eq!(snap.failed_requests, 1);
+        assert_eq!(snap.consecutive_failures, 2);
+        assert_eq!(snap.usage_total_completions, 5);
+        assert_eq!(snap.usage_input_tokens, 100);
+        assert_eq!(snap.usage_output_tokens, 40);
+        assert_eq!(snap.usage_total_tokens, 140);
+        assert!(snap.quota_exhausted);
+        assert_eq!(snap.cooldown_until_ms, now_ms + 60_000);
+    }
+
+    #[test]
+    fn core_account_apply_runtime_snapshot_clears_expired_cooldown() {
+        let acc = Account::new(
+            "a.json".to_string(),
+            TokenData {
+                id_token: String::new(),
+                access_token: String::new(),
+                refresh_token: "rt".to_string(),
+                account_id: String::new(),
+                email: "a@example.com".to_string(),
+                expired: "2099-01-01T00:00:00Z".to_string(),
+                plan_type: String::new(),
+            },
+        );
+
+        let now_ms = now_unix_ms();
+        acc.apply_runtime_snapshot(
+            &AccountRuntimeSnapshot {
+                status: AccountStatus::Cooldown,
+                cooldown_until_ms: now_ms - 1,
+                total_requests: 9,
+                total_errors: 1,
+                successful_requests: 7,
+                failed_requests: 1,
+                consecutive_failures: 1,
+                last_used_ms: now_ms - 5_000,
+                quota_exhausted: false,
+                quota_resets_at_ms: 0,
+                usage_total_completions: 2,
+                usage_input_tokens: 10,
+                usage_output_tokens: 20,
+                usage_total_tokens: 30,
+            },
+            now_ms,
+        );
+
+        let snap = acc.stats_snapshot();
+        assert_eq!(snap.status, AccountStatus::Active);
+        assert_eq!(snap.cooldown_until_ms, 0);
+        assert_eq!(snap.total_requests, 9);
+        assert_eq!(snap.total_errors, 1);
+        assert_eq!(snap.successful_requests, 7);
+        assert_eq!(snap.failed_requests, 1);
     }
 }

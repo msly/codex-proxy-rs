@@ -19,11 +19,11 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - `POST /refresh`（SSE，强制刷新所有账号 Token）
   - `GET /health`（不鉴权）
 - 多账号池 + 内部重试：
-  - 从 `auth-dir` 读取 `*.json`（access_token/refresh_token/account_id/email/expired）
+  - 从 `auth-dir` 读取 `*.json`（`access_token` 必填；`refresh_token` 可选）
   - 账号切换重试（400/403 不重试，其它可重试）
   - **SSE gate**：仅在拿到上游 **2xx** 后才向下游返回流式响应（客户端“无感重试”）
 - 后台任务（可取消）：
-  - refresh loop：定时扫描新增 auth 文件并并发刷新即将过期的 Token
+  - refresh loop：定时扫描新增 auth 文件，并并发刷新即将过期且带 `refresh_token` 的 Token
   - health checker：探测 `/responses` 并对 401/403/429 做移除/冷却处理
   - keepalive：周期性 HEAD ping 上游，保持连接池热度
 
@@ -85,6 +85,8 @@ docker compose up --build
 - 可通过 `workflow_dispatch` 手动触发构建；只有 tag 触发会发布 Release
 
 ### auth 文件示例（`auths/a.json`）
+
+`refresh_token` 是可选的：启动时加载和运行中热加载都支持只有 `access_token` 的账号文件；这类账号可用于请求，但不会参与 refresh。
 
 ```json
 {

@@ -8,6 +8,7 @@ use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::{Manager, QuotaInfo};
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
+use codex_proxy_rs::state::RuntimeStateStore;
 use codex_proxy_rs::upstream::codex::CodexClient;
 use tower::util::ServiceExt;
 use url::Url;
@@ -52,9 +53,26 @@ async fn api_stats_returns_cached_quota_raw_json() {
     let acc = manager.accounts_snapshot()[0].clone();
 
     let now = codex_proxy_rs::core::now_unix_ms();
-    acc.record_success(now);
+    acc.apply_runtime_snapshot(
+        &codex_proxy_rs::core::AccountRuntimeSnapshot {
+            status: codex_proxy_rs::core::AccountStatus::Cooldown,
+            cooldown_until_ms: now + 60_000,
+            total_requests: 5,
+            total_errors: 2,
+            successful_requests: 3,
+            failed_requests: 1,
+            consecutive_failures: 0,
+            last_used_ms: now,
+            quota_exhausted: true,
+            quota_resets_at_ms: now + 60_000,
+            usage_total_completions: 0,
+            usage_input_tokens: 0,
+            usage_output_tokens: 0,
+            usage_total_tokens: 0,
+        },
+        now,
+    );
     acc.record_usage(10, 20, 30);
-    acc.set_quota_cooldown(60_000, now);
 
     acc.set_quota_info(QuotaInfo {
         valid: true,
@@ -69,6 +87,9 @@ async fn api_stats_returns_cached_quota_raw_json() {
     let request_stats = Arc::new(api::RequestStats::default());
     request_stats.record_request();
     request_stats.record_request();
+    let runtime_state = Arc::new(RuntimeStateStore::new(dir.path()));
+    runtime_state.record_hourly_request(now);
+    runtime_state.record_hourly_usage(now, 10, 20, 30);
 
     let state = AppState {
         manager: manager.clone(),
@@ -95,6 +116,7 @@ async fn api_stats_returns_cached_quota_raw_json() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
         on_401: None,
     };
 
@@ -122,7 +144,13 @@ async fn api_stats_returns_cached_quota_raw_json() {
     assert_eq!(v["accounts"][0]["email"], "x@example.com");
     assert_eq!(v["accounts"][0]["plan_type"], "plus");
     assert_eq!(v["accounts"][0]["quota_exhausted"], true);
+    assert_eq!(v["accounts"][0]["successful_requests"], 3);
+    assert_eq!(v["accounts"][0]["failed_requests"], 1);
+    assert_eq!(v["accounts"][0]["attempt_requests"], 5);
+    assert_eq!(v["accounts"][0]["attempt_errors"], 2);
     assert!(v["accounts"][0]["last_used_at"].is_string());
+    assert!(v["accounts"][0]["last_used_ms"].as_i64().unwrap_or_default() > 0);
+    assert!(v["accounts"][0]["cooldown_until_ms"].as_i64().unwrap_or_default() > now);
     assert_eq!(v["accounts"][0]["usage"]["total_completions"], 1);
     assert_eq!(v["accounts"][0]["usage"]["input_tokens"], 10);
     assert_eq!(v["accounts"][0]["usage"]["output_tokens"], 20);
@@ -134,4 +162,9 @@ async fn api_stats_returns_cached_quota_raw_json() {
         v["accounts"][0]["quota"]["raw_data"]["rate_limit"]["primary_window"]["used_percent"],
         12.34
     );
+    assert_eq!(v["trend"]["hourly"].as_array().unwrap().len(), 1);
+    assert_eq!(v["trend"]["hourly"][0]["requests"], 1);
+    assert_eq!(v["trend"]["hourly"][0]["input_tokens"], 10);
+    assert_eq!(v["trend"]["hourly"][0]["output_tokens"], 20);
+    assert_eq!(v["trend"]["hourly"][0]["total_tokens"], 30);
 }

@@ -84,6 +84,7 @@ async fn api_refresh_no_accounts_emits_done_event() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
     };
 
@@ -159,6 +160,7 @@ async fn api_refresh_with_account_emits_item_and_done_events() {
         refresher: Refresher::new("").unwrap().with_token_url(token_url),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 2,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
     };
 

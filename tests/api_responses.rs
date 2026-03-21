@@ -37,11 +37,14 @@ async fn upstream_responses(
         "Bearer at1" => (axum::http::StatusCode::UNAUTHORIZED, "unauthorized"),
         "Bearer at2" => {
             if accept.contains("text/event-stream") {
-                (axum::http::StatusCode::OK, "data: ok\n\n")
+                (
+                    axum::http::StatusCode::OK,
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18}}}\n\n",
+                )
             } else {
                 (
                     axum::http::StatusCode::OK,
-                    r#"{"id":"r1","object":"response"}"#,
+                    r#"{"id":"r1","object":"response","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}"#,
                 )
             }
         }
@@ -90,6 +93,7 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
 
     let manager = Arc::new(Manager::new(dir.path()));
     manager.load_accounts().unwrap();
+    let runtime_state = Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path()));
 
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let seen = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -114,6 +118,7 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
         on_401: Some(on_401),
     };
 
@@ -150,7 +155,10 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(body, "data: ok\n\n");
+    assert_eq!(
+        body,
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18}}}\n\n"
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert_eq!(hook_calls.load(Ordering::Relaxed), 1);
     assert!(
@@ -160,6 +168,25 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
             .any(|p| p.ends_with("a.json")),
         "expected hook called with a.json"
     );
+
+    let accounts = manager.accounts_snapshot();
+    let a = accounts
+        .iter()
+        .find(|acc| acc.file_path().ends_with("a.json"))
+        .expect("a.json account");
+    let b = accounts
+        .iter()
+        .find(|acc| acc.file_path().ends_with("b.json"))
+        .expect("b.json account");
+    let a_stats = a.stats_snapshot();
+    let b_stats = b.stats_snapshot();
+    assert_eq!(a_stats.failed_requests, 0);
+    assert_eq!(b_stats.successful_requests, 1);
+    assert_eq!(b_stats.usage_total_tokens, 18);
+    let trend = runtime_state.hourly_trend();
+    assert_eq!(trend.len(), 1);
+    assert_eq!(trend[0].requests, 1);
+    assert_eq!(trend[0].total_tokens, 18);
 }
 
 #[tokio::test]
@@ -173,6 +200,7 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
 
     let manager = Arc::new(Manager::new(dir.path()));
     manager.load_accounts().unwrap();
+    let runtime_state = Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path()));
 
     let state = AppState {
         manager: manager.clone(),
@@ -185,6 +213,7 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
         on_401: None,
     };
 
@@ -221,6 +250,83 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
-    assert_eq!(body, r#"{"id":"r1","object":"response"}"#);
+    assert_eq!(
+        body,
+        r#"{"id":"r1","object":"response","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}"#
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    let accounts = manager.accounts_snapshot();
+    let b = accounts
+        .iter()
+        .find(|acc| acc.file_path().ends_with("b.json"))
+        .expect("b.json account");
+    let stats = b.stats_snapshot();
+    assert_eq!(stats.successful_requests, 1);
+    assert_eq!(stats.failed_requests, 0);
+    assert_eq!(stats.usage_input_tokens, 11);
+    assert_eq!(stats.usage_output_tokens, 7);
+    assert_eq!(stats.usage_total_tokens, 18);
+    let trend = runtime_state.hourly_trend();
+    assert_eq!(trend.len(), 1);
+    assert_eq!(trend[0].requests, 1);
+    assert_eq!(trend[0].input_tokens, 11);
+    assert_eq!(trend[0].output_tokens, 7);
+    assert_eq!(trend[0].total_tokens, 18);
+}
+
+#[tokio::test]
+async fn api_v1_responses_non_retryable_failure_counts_as_failed_request() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at403").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let state = AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 1,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+    };
+
+    let app = api::router(state);
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+    let stats = manager.accounts_snapshot()[0].stats_snapshot();
+    assert_eq!(stats.total_requests, 1);
+    assert_eq!(stats.total_errors, 1);
+    assert_eq!(stats.successful_requests, 0);
+    assert_eq!(stats.failed_requests, 1);
 }

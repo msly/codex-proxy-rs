@@ -13,6 +13,7 @@ use codex_proxy_rs::{
     core::{Account, Manager, QuotaFirstSelector, RoundRobinSelector, Selector},
     net,
     quota::QuotaChecker,
+    state::RuntimeStateStore,
     upstream::codex::{CodexClient, On401Hook, RetryPolicy},
 };
 use tracing_subscriber::EnvFilter;
@@ -31,10 +32,12 @@ async fn main() -> Result<(), String> {
         Arc::new(RoundRobinSelector::new())
     };
     let manager = Arc::new(Manager::new_with_selector(&cfg.auth_dir, selector));
+    let runtime_state = Arc::new(RuntimeStateStore::new(&cfg.auth_dir));
     if cfg.startup_async_load {
         tracing::info!("startup_async_load enabled; accounts will load in background");
         let manager = manager.clone();
         let auth_dir = cfg.auth_dir.clone();
+        let runtime_state = runtime_state.clone();
         let retry_interval = cfg.startup_load_retry_interval.max(1);
         tokio::spawn(async move {
             let start = Instant::now();
@@ -57,6 +60,9 @@ async fn main() -> Result<(), String> {
                             elapsed = ?start.elapsed(),
                             "accounts loaded"
                         );
+                        if let Err(err) = runtime_state.load_and_apply(manager.as_ref()) {
+                            tracing::warn!("restore runtime state failed: {err}");
+                        }
                         return;
                     }
                     Err(err) => {
@@ -69,6 +75,9 @@ async fn main() -> Result<(), String> {
     } else {
         let start = Instant::now();
         let count = manager.load_accounts()?;
+        if let Err(err) = runtime_state.load_and_apply(manager.as_ref()) {
+            tracing::warn!("restore runtime state failed: {err}");
+        }
         tracing::info!(
             auth_dir = %cfg.auth_dir,
             count,
@@ -106,6 +115,7 @@ async fn main() -> Result<(), String> {
     )?;
     let refresher = Refresher::new_with_http(refresh_http);
     let save_queue = SaveQueue::start(cfg.save_workers as usize);
+    runtime_state.clone().start_save_loop(manager.clone());
 
     let on_401: On401Hook = {
         let manager = manager.clone();
@@ -169,6 +179,7 @@ async fn main() -> Result<(), String> {
         refresher: refresher.clone(),
         save_queue: save_queue.clone(),
         refresh_concurrency: cfg.refresh_concurrency as usize,
+        runtime_state: runtime_state.clone(),
         on_401: Some(on_401),
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr())
@@ -300,6 +311,10 @@ async fn main() -> Result<(), String> {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    if let Err(err) = runtime_state.save_now(manager.as_ref()) {
+        tracing::warn!("final runtime state save failed: {err}");
     }
 
     Ok(())

@@ -173,6 +173,7 @@ impl CodexClient {
                         if attempt < max_attempts - 1 {
                             continue;
                         }
+                        account.record_client_failure();
                         break;
                     }
                 },
@@ -189,6 +190,7 @@ impl CodexClient {
                     if attempt < max_attempts - 1 {
                         continue;
                     }
+                    account.record_client_failure();
                     break;
                 }
             };
@@ -222,6 +224,7 @@ impl CodexClient {
                 continue;
             }
 
+            account.record_client_failure();
             let e = UpstreamError::Status {
                 code: status,
                 body: err_body,

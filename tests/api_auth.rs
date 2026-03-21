@@ -41,6 +41,7 @@ fn build_state(api_keys: &[&str]) -> AppState {
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
     }
 }

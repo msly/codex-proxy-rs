@@ -21,7 +21,7 @@ pub fn filter_need_refresh(accounts: &[Arc<Account>]) -> Vec<Arc<Account>> {
         }
 
         let token = acc.token();
-        if token.refresh_token.is_empty() {
+        if token.refresh_token.trim().is_empty() {
             continue;
         }
 
@@ -100,9 +100,11 @@ pub async fn refresh_account_with_options(
     let _guard = Guard(account.clone());
 
     let refresh_token = { account.token().refresh_token.clone() };
-    if refresh_token.is_empty() {
-        manager.remove_account(account.file_path(), "missing_refresh_token");
-        return Err(RefreshError::new(None, "缺少 refresh_token"));
+    if refresh_token.trim().is_empty() {
+        if remove_reason == "auth_401" {
+            manager.remove_account(account.file_path(), "auth_401_missing_refresh_token");
+        }
+        return Err(RefreshError::missing_refresh_token());
     }
 
     match refresher
@@ -136,10 +138,12 @@ mod tests {
     use reqwest::Url;
     use serde::Deserialize;
     use serde_json::json;
+    use std::io;
     use std::fs;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use tokio::net::TcpListener;
 
     use crate::core::{AccountStatus, TokenData};
@@ -201,6 +205,26 @@ mod tests {
         mode: &'static str,
     }
 
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedWriter {
+        fn snapshot(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
+        }
+    }
+
     #[derive(Debug, Deserialize)]
     struct TokenForm {
         refresh_token: String,
@@ -257,12 +281,17 @@ mod tests {
         Url::parse(&format!("http://{addr}/oauth/token")).unwrap()
     }
 
-    async fn write_auth_file(dir: &Path, name: &str, refresh_token: &str) -> String {
+    async fn write_auth_file_with_tokens(
+        dir: &Path,
+        name: &str,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> String {
         let path = dir.join(name);
         fs::write(
             &path,
             json!({
-                "access_token": "at0",
+                "access_token": access_token,
                 "refresh_token": refresh_token,
                 "account_id": "acc-file",
                 "email": "file@example.com",
@@ -273,6 +302,10 @@ mod tests {
         )
         .unwrap();
         path.to_string_lossy().to_string()
+    }
+
+    async fn write_auth_file(dir: &Path, name: &str, refresh_token: &str) -> String {
+        write_auth_file_with_tokens(dir, name, "at0", refresh_token).await
     }
 
     #[tokio::test]
@@ -353,5 +386,95 @@ mod tests {
 
         assert_eq!(manager.account_count(), 0);
         assert!(!Path::new(&file_path).exists());
+    }
+
+    #[tokio::test]
+    async fn refresh_refresh_account_without_refresh_token_skips_and_keeps_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = write_auth_file(dir.path(), "a.json", "rt0").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+        let acc = manager.accounts_snapshot()[0].clone();
+        let token = {
+            let token = acc.token();
+            TokenData {
+                id_token: token.id_token.clone(),
+                access_token: token.access_token.clone(),
+                refresh_token: String::new(),
+                account_id: token.account_id.clone(),
+                email: token.email.clone(),
+                expired: token.expired.clone(),
+                plan_type: token.plan_type.clone(),
+            }
+        };
+        acc.update_token(token, now_unix_ms());
+
+        let token_url = start_server("200").await;
+        let refresher = Refresher::new("").unwrap().with_token_url(token_url);
+        let save_queue = SaveQueue::start(1);
+
+        let err = refresh_account(&manager, &refresher, &save_queue, acc, 1)
+            .await
+            .expect_err("should skip refresh");
+
+        assert!(err.is_missing_refresh_token());
+        assert_eq!(manager.account_count(), 1);
+        assert!(Path::new(&file_path).exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_refresh_account_without_refresh_token_401_path_removes_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = write_auth_file(dir.path(), "a.json", "rt0").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+        let acc = manager.accounts_snapshot()[0].clone();
+        let token = {
+            let token = acc.token();
+            TokenData {
+                id_token: token.id_token.clone(),
+                access_token: token.access_token.clone(),
+                refresh_token: String::new(),
+                account_id: token.account_id.clone(),
+                email: token.email.clone(),
+                expired: token.expired.clone(),
+                plan_type: token.plan_type.clone(),
+            }
+        };
+        acc.update_token(token, now_unix_ms());
+
+        let token_url = start_server("200").await;
+        let refresher = Refresher::new("").unwrap().with_token_url(token_url);
+        let save_queue = SaveQueue::start(1);
+        let output = SharedWriter::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let err = refresh_account_with_remove_reason(
+            &manager,
+            &refresher,
+            &save_queue,
+            acc,
+            1,
+            "auth_401",
+        )
+        .await
+        .expect_err("should report missing refresh token");
+
+        assert!(err.is_missing_refresh_token());
+        assert_eq!(manager.account_count(), 0);
+        assert!(!Path::new(&file_path).exists());
+        let logs = output.snapshot();
+        assert!(
+            logs.contains("auth_401_missing_refresh_token"),
+            "unexpected logs: {logs}"
+        );
     }
 }
