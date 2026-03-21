@@ -18,6 +18,9 @@ use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
 const SSE_BODY: &str = concat!(
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
@@ -25,9 +28,23 @@ const SSE_BODY: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+const SSE_BODY_COMPLETED_WITH_OUTPUT: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const SSE_BODY_COMPLETED_ONLY_OUTPUT: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\"}}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n",
+    "data: [DONE]\n\n",
+);
+
 #[derive(Clone)]
 struct UpstreamState {
     calls: Arc<AtomicUsize>,
+    body: &'static str,
 }
 
 async fn upstream_responses(
@@ -41,15 +58,15 @@ async fn upstream_responses(
         .unwrap_or("");
     match auth {
         "Bearer at1" => (axum::http::StatusCode::UNAUTHORIZED, "unauthorized"),
-        "Bearer at2" => (axum::http::StatusCode::OK, SSE_BODY),
+        "Bearer at2" => (axum::http::StatusCode::OK, state.body),
         _ => (axum::http::StatusCode::FORBIDDEN, "forbidden"),
     }
 }
 
-async fn start_upstream(calls: Arc<AtomicUsize>) -> Url {
+async fn start_upstream(calls: Arc<AtomicUsize>, body: &'static str) -> Url {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
-        .with_state(UpstreamState { calls });
+        .with_state(UpstreamState { calls, body });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -76,10 +93,16 @@ async fn write_auth_file(dir: &std::path::Path, name: &str, access_token: &str) 
     .unwrap();
 }
 
-#[tokio::test]
-async fn api_v1_responses_websocket_fallback_forwards_sse_payloads() {
+async fn open_responses_ws(
+    sse_body: &'static str,
+) -> (
+    TestWs,
+    Arc<AtomicUsize>,
+    Arc<api::RequestStats>,
+    Arc<RuntimeStateStore>,
+) {
     let calls = Arc::new(AtomicUsize::new(0));
-    let base_url = start_upstream(calls.clone()).await;
+    let base_url = start_upstream(calls.clone(), sse_body).await;
 
     let dir = tempfile::tempdir().unwrap();
     write_auth_file(dir.path(), "a.json", "at1").await;
@@ -130,27 +153,101 @@ async fn api_v1_responses_websocket_fallback_forwards_sse_payloads() {
     .await
     .unwrap();
 
-    let mut got = Vec::<String>::new();
-    while got.len() < 3 {
-        let msg = timeout(Duration::from_secs(2), ws.next()).await.unwrap();
-        let msg = match msg {
-            Some(Ok(m)) => m,
-            Some(Err(err)) => panic!("ws error: {err}"),
-            None => break,
-        };
-        if let Message::Text(text) = msg {
-            got.push(text.to_string());
+    (ws, calls, request_stats, runtime_state)
+}
+
+async fn recv_text_json(ws: &mut TestWs) -> serde_json::Value {
+    let msg = timeout(Duration::from_secs(2), ws.next()).await.unwrap();
+    let msg = match msg {
+        Some(Ok(m)) => m,
+        Some(Err(err)) => panic!("ws error: {err}"),
+        None => panic!("websocket closed unexpectedly"),
+    };
+    match msg {
+        Message::Text(text) => serde_json::from_str(&text).unwrap(),
+        other => panic!("expected text frame, got {other:?}"),
+    }
+}
+
+async fn assert_no_extra_text_frames(ws: &mut TestWs) {
+    match timeout(Duration::from_millis(300), ws.next()).await {
+        Err(_) => {}
+        Ok(None) => {}
+        Ok(Some(Ok(Message::Close(_)))) => {}
+        Ok(Some(Err(_))) => {}
+        Ok(Some(Ok(Message::Text(text)))) => {
+            panic!("unexpected extra text frame: {text}");
+        }
+        Ok(Some(Ok(other))) => {
+            panic!("unexpected extra websocket frame: {other:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn api_v1_responses_websocket_fallback_forwards_sse_payloads() {
+    let (mut ws, calls, request_stats, runtime_state) = open_responses_ws(SSE_BODY).await;
 
     assert_eq!(
-        got,
         vec![
-            "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}".to_string(),
-            "{\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}".to_string(),
-            "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}".to_string(),
+            recv_text_json(&mut ws).await,
+            recv_text_json(&mut ws).await,
+            recv_text_json(&mut ws).await,
+        ],
+        vec![
+            serde_json::json!({"type":"response.created","response":{"id":"r1"}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"hi"}),
+            serde_json::json!({"type":"response.completed","response":{"id":"r1"}}),
         ]
     );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(request_stats.rpm(), 1);
+    assert_eq!(runtime_state.hourly_trend().len(), 1);
+    assert_eq!(runtime_state.hourly_trend()[0].requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_responses_websocket_fallback_strips_completed_output_after_delta() {
+    let (mut ws, calls, request_stats, runtime_state) =
+        open_responses_ws(SSE_BODY_COMPLETED_WITH_OUTPUT).await;
+
+    assert_eq!(
+        vec![
+            recv_text_json(&mut ws).await,
+            recv_text_json(&mut ws).await,
+            recv_text_json(&mut ws).await,
+        ],
+        vec![
+            serde_json::json!({"type":"response.created","response":{"id":"r1"}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"hi"}),
+            serde_json::json!({"type":"response.completed","response":{"id":"r1"}}),
+        ]
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(request_stats.rpm(), 1);
+    assert_eq!(runtime_state.hourly_trend().len(), 1);
+    assert_eq!(runtime_state.hourly_trend()[0].requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_responses_websocket_fallback_accepts_completed_only_output() {
+    let (mut ws, calls, request_stats, runtime_state) =
+        open_responses_ws(SSE_BODY_COMPLETED_ONLY_OUTPUT).await;
+
+    assert_eq!(
+        vec![recv_text_json(&mut ws).await, recv_text_json(&mut ws).await,],
+        vec![
+            serde_json::json!({"type":"response.created","response":{"id":"r2"}}),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"r2",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+                }
+            }),
+        ]
+    );
+    assert_no_extra_text_frames(&mut ws).await;
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert_eq!(request_stats.rpm(), 1);
     assert_eq!(runtime_state.hourly_trend().len(), 1);

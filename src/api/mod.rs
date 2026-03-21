@@ -859,6 +859,7 @@ async fn forward_responses_sse_as_ws(
 
     let mut has_text = false;
     let mut has_tool = false;
+    let mut has_completed_output = false;
     let mut buf = Vec::<u8>::new();
     let mut upstream_stream = upstream.bytes_stream();
 
@@ -881,31 +882,50 @@ async fn forward_responses_sse_as_ws(
                 continue;
             }
 
-            if !has_text || !has_tool {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
-                    if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
-                        match typ {
-                            "response.output_text.delta" => {
-                                if v.get("delta").and_then(|v| v.as_str()).unwrap_or_default() != ""
-                                {
-                                    has_text = true;
-                                }
+            let mut outbound_text = None;
+            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                let had_stream_output = has_text || has_tool;
+                if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
+                    match typ {
+                        "response.output_text.delta" => {
+                            if v.get("delta").and_then(|v| v.as_str()).unwrap_or_default() != "" {
+                                has_text = true;
                             }
-                            "response.output_item.added"
-                            | "response.function_call_arguments.delta"
-                            | "response.function_call_arguments.done"
-                            | "response.output_item.done" => {
-                                has_tool = true;
-                            }
-                            _ => {}
                         }
+                        "response.output_item.added"
+                        | "response.function_call_arguments.delta"
+                        | "response.function_call_arguments.done"
+                        | "response.output_item.done" => {
+                            has_tool = true;
+                        }
+                        "response.completed" => {
+                            let (_, completed_has_output) = convert_non_stream_response(
+                                payload,
+                                &std::collections::HashMap::new(),
+                            );
+                            if completed_has_output {
+                                has_completed_output = true;
+                            }
+                            if completed_has_output && had_stream_output {
+                                if let Some(response) = v
+                                    .get_mut("response")
+                                    .and_then(|value| value.as_object_mut())
+                                {
+                                    response.remove("output");
+                                }
+                                outbound_text = Some(v.to_string());
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
 
             if socket
                 .send(Message::Text(
-                    String::from_utf8_lossy(payload).into_owned().into(),
+                    outbound_text
+                        .unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
+                        .into(),
                 ))
                 .await
                 .is_err()
@@ -915,7 +935,7 @@ async fn forward_responses_sse_as_ws(
         }
     }
 
-    if !has_text && !has_tool {
+    if !has_text && !has_tool && !has_completed_output {
         return Err(ResponsesWsError::EmptyResponse);
     }
 
