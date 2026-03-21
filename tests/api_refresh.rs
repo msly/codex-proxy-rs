@@ -6,7 +6,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::{get, post};
 use codex_proxy_rs::api::{self, AppState};
-use codex_proxy_rs::core::Manager;
+use codex_proxy_rs::core::{AccountStatus, Manager, now_unix_ms};
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::CodexClient;
@@ -202,4 +202,77 @@ async fn api_refresh_with_account_emits_item_and_done_events() {
         body.contains("\"success\":true"),
         "expected success=true, got body: {body}"
     );
+}
+
+#[tokio::test]
+async fn api_refresh_preserves_existing_cooldown_when_refresh_cannot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.json"),
+        serde_json::json!({
+            "access_token": "at-old",
+            "refresh_token": "",
+            "account_id": "",
+            "email": "a@example.com",
+            "type": "codex",
+            "expired": "2000-01-01T00:00:00Z"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+    let acc = manager.accounts_snapshot()[0].clone();
+    acc.set_quota_cooldown(60_000, now_unix_ms());
+
+    let state = AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(
+            QuotaChecker::new(
+                "https://chatgpt.com/backend-api/codex",
+                "chatgpt.com",
+                "",
+                1,
+            )
+            .unwrap(),
+        ),
+        codex_client: Arc::new(
+            CodexClient::new(
+                Url::parse("https://chatgpt.com/backend-api/codex").unwrap(),
+                "",
+            )
+            .unwrap(),
+        ),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+    };
+
+    let app = api::router(state);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/refresh")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+
+    let acc = manager.accounts_snapshot()[0].clone();
+    assert_eq!(acc.status(), AccountStatus::Cooldown);
+    assert!(acc.quota_exhausted());
 }

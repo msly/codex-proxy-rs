@@ -10,6 +10,7 @@ use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::Manager;
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
+use codex_proxy_rs::state::RuntimeStateStore;
 use codex_proxy_rs::upstream::codex::CodexClient;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
@@ -86,19 +87,21 @@ async fn api_v1_responses_websocket_fallback_forwards_sse_payloads() {
 
     let manager = Arc::new(Manager::new(dir.path()));
     manager.load_accounts().unwrap();
+    let request_stats = Arc::new(api::RequestStats::default());
+    let runtime_state = Arc::new(RuntimeStateStore::new(dir.path()));
 
     let state = AppState {
         manager: manager.clone(),
         quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
         codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
-        request_stats: Arc::new(api::RequestStats::default()),
+        request_stats: request_stats.clone(),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 1,
         empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
-        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        runtime_state: runtime_state.clone(),
         on_401: None,
     };
 
@@ -149,4 +152,7 @@ async fn api_v1_responses_websocket_fallback_forwards_sse_payloads() {
         ]
     );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(request_stats.rpm(), 1);
+    assert_eq!(runtime_state.hourly_trend().len(), 1);
+    assert_eq!(runtime_state.hourly_trend()[0].requests, 1);
 }

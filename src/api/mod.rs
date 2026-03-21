@@ -781,10 +781,7 @@ async fn handle_responses_ws(mut socket: WebSocket, state: AppState) {
                             forward_responses_sse_as_ws(&mut socket, &state, request_body, &model)
                                 .await;
                         match stream_result {
-                            Ok(()) => {
-                                state.request_stats.record_request();
-                                return;
-                            }
+                            Ok(()) => return,
                             Err(ResponsesWsError::EmptyResponse) => {
                                 write_ws_error(&mut socket, "invalid_response", "empty response")
                                     .await;
@@ -1794,10 +1791,6 @@ fn force_refresh_all_stream(
                 })
                 .await;
             return;
-        }
-
-        for acc in accounts.iter() {
-            acc.set_active();
         }
 
         let start = Instant::now();

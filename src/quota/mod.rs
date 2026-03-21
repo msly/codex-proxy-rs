@@ -142,7 +142,10 @@ impl QuotaChecker {
             checked_at_ms: now_ms,
         });
 
-        CheckOutcome::Invalid { email }
+        match status {
+            401 | 403 => CheckOutcome::Invalid { email },
+            _ => CheckOutcome::Failed { email },
+        }
     }
 
     pub fn check_all_stream(
@@ -370,13 +373,16 @@ mod tests {
             "Bearer at-ok" => serde_json::json!({
                 "rate_limit": { "primary_window": { "used_percent": 12.34 } }
             }),
+            "Bearer at429" => serde_json::json!({
+                "error": { "resets_in_seconds": 7 }
+            }),
             _ => serde_json::json!({ "error": "invalid" }),
         };
 
-        let status = if auth == "Bearer at-ok" {
-            axum::http::StatusCode::OK
-        } else {
-            axum::http::StatusCode::UNAUTHORIZED
+        let status = match auth {
+            "Bearer at-ok" => axum::http::StatusCode::OK,
+            "Bearer at429" => axum::http::StatusCode::TOO_MANY_REQUESTS,
+            _ => axum::http::StatusCode::UNAUTHORIZED,
         };
 
         (status, Json(body))
@@ -457,5 +463,30 @@ mod tests {
         assert_eq!(manager.account_count(), 0);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert!(!Path::new(acc.file_path()).exists());
+    }
+
+    #[tokio::test]
+    async fn quota_temporary_error_does_not_remove_account() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = start_server(calls.clone()).await;
+        let base_url = base.join("/backend-api/codex").expect("join base url");
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at429").await;
+
+        let manager = Arc::new(Manager::new(dir.path()));
+        manager.load_accounts().unwrap();
+
+        let qc = QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap();
+        let mut rx = qc.check_all_stream(manager.clone());
+        while let Some(evt) = rx.recv().await {
+            if evt.event_type == "done" {
+                break;
+            }
+        }
+
+        assert_eq!(manager.account_count(), 1);
+        assert!(dir.path().join("a.json").exists());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

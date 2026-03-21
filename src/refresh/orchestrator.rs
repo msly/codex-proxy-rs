@@ -16,6 +16,9 @@ pub fn filter_need_refresh(accounts: &[Arc<Account>]) -> Vec<Arc<Account>> {
         if acc.is_refreshing() {
             continue;
         }
+        if !acc.is_available(now_ms) {
+            continue;
+        }
         if acc.last_refresh_ms() > 0 && (now_ms - acc.last_refresh_ms()) < 60_000 {
             continue;
         }
@@ -183,6 +186,10 @@ mod tests {
         let acc_refreshing = make_account("refreshing.json", "rt", &near);
         assert!(acc_refreshing.try_begin_refresh());
 
+        let acc_cooldown = make_account("cooldown.json", "rt", &near);
+        acc_cooldown.set_status_for_test(AccountStatus::Cooldown);
+        acc_cooldown.set_cooldown_until_ms_for_test(now_unix_ms() + 60_000);
+
         let got = filter_need_refresh(&[
             acc_far,
             acc_near.clone(),
@@ -190,6 +197,7 @@ mod tests {
             acc_no_rt,
             acc_recent,
             acc_refreshing,
+            acc_cooldown,
         ]);
 
         let mut paths: Vec<String> = got.iter().map(|a| a.file_path().to_string()).collect();
