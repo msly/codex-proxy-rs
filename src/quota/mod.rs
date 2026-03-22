@@ -7,13 +7,17 @@ use reqwest::Url;
 use serde::Serialize;
 
 use crate::core::{Account, Manager, QuotaInfo, now_unix_ms};
+use crate::state::RuntimeStateStore;
 use crate::upstream::codex::CODEX_USER_AGENT;
+
+const DEFAULT_QUOTA_COOLDOWN_MS: i64 = 60_000;
 
 #[derive(Debug, Clone)]
 pub struct QuotaChecker {
     http: reqwest::Client,
     concurrency: usize,
     usage_url: Url,
+    runtime_state: Option<Arc<RuntimeStateStore>>,
 }
 
 impl QuotaChecker {
@@ -45,7 +49,13 @@ impl QuotaChecker {
             http,
             concurrency: concurrency.max(1),
             usage_url,
+            runtime_state: None,
         }
+    }
+
+    pub fn with_runtime_state(mut self, runtime_state: Arc<RuntimeStateStore>) -> Self {
+        self.runtime_state = Some(runtime_state);
+        self
     }
 
     pub fn new_with_config(
@@ -113,6 +123,7 @@ impl QuotaChecker {
             } else {
                 Vec::new()
             };
+            let exhausted = quota_body_indicates_exhausted(&raw_data);
 
             acc.set_quota_info(QuotaInfo {
                 valid: true,
@@ -120,6 +131,19 @@ impl QuotaChecker {
                 raw_data,
                 checked_at_ms: now_ms,
             });
+
+            if acc.used_percent_x100() >= 10_000 || exhausted {
+                let cooldown_ms = parse_retry_after_ms(
+                    acc.quota_info()
+                        .as_ref()
+                        .map(|info| info.raw_data.as_slice())
+                        .unwrap_or_default(),
+                    DEFAULT_QUOTA_COOLDOWN_MS,
+                );
+                acc.set_quota_cooldown(cooldown_ms, now_ms);
+                self.mark_runtime_state_dirty();
+                return CheckOutcome::Failed { email };
+            }
 
             return CheckOutcome::Valid { email };
         }
@@ -143,9 +167,28 @@ impl QuotaChecker {
             checked_at_ms: now_ms,
         });
 
+        if status == 429 {
+            let cooldown_ms = parse_retry_after_ms(
+                acc.quota_info()
+                    .as_ref()
+                    .map(|info| info.raw_data.as_slice())
+                    .unwrap_or_default(),
+                DEFAULT_QUOTA_COOLDOWN_MS,
+            );
+            acc.set_quota_cooldown(cooldown_ms, now_ms);
+            self.mark_runtime_state_dirty();
+            return CheckOutcome::Failed { email };
+        }
+
         match status {
             401 | 403 => CheckOutcome::Invalid { email },
             _ => CheckOutcome::Failed { email },
+        }
+    }
+
+    fn mark_runtime_state_dirty(&self) {
+        if let Some(runtime_state) = &self.runtime_state {
+            runtime_state.mark_dirty();
         }
     }
 
@@ -339,6 +382,77 @@ async fn read_body_limited(resp: reqwest::Response, max_bytes: usize) -> Vec<u8>
         .await
 }
 
+fn quota_body_indicates_exhausted(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+
+    if value
+        .get("rate_limit")
+        .and_then(|value| value.get("primary_window"))
+        .and_then(|value| value.get("used_percent"))
+        .and_then(|value| value.as_f64())
+        .is_some_and(|used_percent| used_percent >= 100.0)
+    {
+        return true;
+    }
+
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(|value| value.as_str())
+        .is_some_and(|error_type| error_type == "usage_limit_reached")
+}
+
+fn parse_retry_after_ms(body: &[u8], default_ms: i64) -> i64 {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return default_ms;
+    };
+
+    for path in [
+        &["error", "resets_in_seconds"][..],
+        &["rate_limit", "primary_window", "resets_in_seconds"][..],
+    ] {
+        let mut current = &value;
+        let mut found = true;
+        for key in path {
+            match current.get(key) {
+                Some(next) => current = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found && let Some(seconds) = current.as_i64() && seconds > 0 {
+            return seconds.saturating_mul(1000);
+        }
+    }
+
+    let now_s = (now_unix_ms() / 1000).max(0);
+    for path in [
+        &["error", "resets_at"][..],
+        &["rate_limit", "primary_window", "resets_at"][..],
+    ] {
+        let mut current = &value;
+        let mut found = true;
+        for key in path {
+            match current.get(key) {
+                Some(next) => current = next,
+                None => {
+                    found = false;
+                    break;
+                }
+            }
+        }
+        if found && let Some(resets_at) = current.as_i64() && resets_at > now_s {
+            return (resets_at - now_s).saturating_mul(1000);
+        }
+    }
+
+    default_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,12 +486,17 @@ mod tests {
             "Bearer at429" => serde_json::json!({
                 "error": { "resets_in_seconds": 7 }
             }),
+            "Bearer at-full" => serde_json::json!({
+                "rate_limit": { "primary_window": { "used_percent": 100.0, "resets_in_seconds": 9 } },
+                "error": { "type": "usage_limit_reached", "resets_in_seconds": 9 }
+            }),
             _ => serde_json::json!({ "error": "invalid" }),
         };
 
         let status = match auth {
             "Bearer at-ok" => axum::http::StatusCode::OK,
             "Bearer at429" => axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "Bearer at-full" => axum::http::StatusCode::OK,
             _ => axum::http::StatusCode::UNAUTHORIZED,
         };
 
@@ -483,6 +602,72 @@ mod tests {
 
         assert_eq!(manager.account_count(), 1);
         assert!(dir.path().join("a.json").exists());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_429_sets_cooldown_and_persists_runtime_state() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = start_server(calls.clone()).await;
+        let base_url = base.join("/backend-api/codex").expect("join base url");
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at429").await;
+
+        let manager = Arc::new(Manager::new(dir.path()));
+        manager.load_accounts().unwrap();
+        let runtime_state = Arc::new(crate::state::RuntimeStateStore::new(dir.path()));
+
+        let qc = QuotaChecker::new(&base_url.to_string(), "", "", 1)
+            .unwrap()
+            .with_runtime_state(runtime_state.clone());
+        let outcome = qc.check_account(manager.accounts_snapshot()[0].clone()).await;
+        assert!(matches!(outcome, CheckOutcome::Failed { .. }));
+
+        let acc = manager.accounts_snapshot()[0].clone();
+        let now_ms = now_unix_ms();
+        assert_eq!(manager.account_count(), 1);
+        assert_eq!(acc.status(), crate::core::AccountStatus::Cooldown);
+        assert!(acc.quota_exhausted());
+        assert!(acc.cooldown_until_ms() > now_ms);
+
+        assert!(runtime_state.save_now_if_dirty(manager.as_ref()).unwrap());
+
+        let manager2 = Manager::new(dir.path());
+        manager2.load_accounts().unwrap();
+        let store2 = crate::state::RuntimeStateStore::new(dir.path());
+        store2.load_and_apply(&manager2).unwrap();
+
+        let restored = manager2.accounts_snapshot()[0].stats_snapshot();
+        assert_eq!(restored.status, crate::core::AccountStatus::Cooldown);
+        assert!(restored.quota_exhausted);
+        assert!(restored.cooldown_until_ms > now_ms);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_full_body_sets_cooldown_without_removing_account() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base = start_server(calls.clone()).await;
+        let base_url = base.join("/backend-api/codex").expect("join base url");
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at-full").await;
+
+        let manager = Arc::new(Manager::new(dir.path()));
+        manager.load_accounts().unwrap();
+        let acc = manager.accounts_snapshot()[0].clone();
+
+        let qc = QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap();
+        let outcome = qc.check_account(acc.clone()).await;
+        assert!(matches!(outcome, CheckOutcome::Failed { .. }));
+
+        let now_ms = now_unix_ms();
+        assert_eq!(manager.account_count(), 1);
+        assert_eq!(acc.status(), crate::core::AccountStatus::Cooldown);
+        assert!(acc.quota_exhausted());
+        assert!(acc.cooldown_until_ms() > now_ms);
+        assert!((acc.used_percent() - 100.0).abs() < 0.01);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

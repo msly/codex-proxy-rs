@@ -8,6 +8,7 @@ use reqwest::Url;
 use serde_json::Value;
 
 use crate::core::{Account, Manager, now_unix_ms};
+use crate::state::RuntimeStateStore;
 use crate::upstream::codex::CODEX_USER_AGENT;
 
 #[derive(Debug, Clone)]
@@ -26,6 +27,7 @@ pub struct HealthChecker {
     responses_url: Url,
     cfg: HealthCheckerConfig,
     cursor: Arc<AtomicU64>,
+    runtime_state: Option<Arc<RuntimeStateStore>>,
 }
 
 impl HealthChecker {
@@ -60,7 +62,13 @@ impl HealthChecker {
             responses_url: base_url,
             cfg,
             cursor: Arc::new(AtomicU64::new(0)),
+            runtime_state: None,
         }
+    }
+
+    pub fn with_runtime_state(mut self, runtime_state: Arc<RuntimeStateStore>) -> Self {
+        self.runtime_state = Some(runtime_state);
+        self
     }
 
     pub fn responses_url(&self) -> &Url {
@@ -186,6 +194,7 @@ impl HealthChecker {
         match status {
             401 => {
                 let failures = acc.record_failure(now_ms);
+                self.mark_runtime_state_dirty();
                 if failures >= self.cfg.max_consecutive_failures {
                     manager.remove_account(acc.file_path(), "auth_401");
                 } else {
@@ -199,6 +208,7 @@ impl HealthChecker {
             }
             403 => {
                 acc.set_cooldown(5 * 60_000, now_ms);
+                self.mark_runtime_state_dirty();
             }
             400 => {
                 if should_ignore_400(&body) {
@@ -208,10 +218,12 @@ impl HealthChecker {
             429 => {
                 let cooldown_ms = parse_retry_after_ms(&body, 60_000);
                 acc.set_quota_cooldown(cooldown_ms, now_ms);
+                self.mark_runtime_state_dirty();
                 tracing::info!(email, cooldown_ms, "health check 429 (cooldown)");
             }
             200..=299 => {
                 acc.record_success(now_ms);
+                self.mark_runtime_state_dirty();
             }
             500..=599 => {
                 tracing::debug!(email, status, "health check upstream 5xx");
@@ -228,6 +240,12 @@ impl HealthChecker {
                     "health check unexpected status"
                 );
             }
+        }
+    }
+
+    fn mark_runtime_state_dirty(&self) {
+        if let Some(runtime_state) = &self.runtime_state {
+            runtime_state.mark_dirty();
         }
     }
 }

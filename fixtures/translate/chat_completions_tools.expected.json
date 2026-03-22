@@ -1,0 +1,84 @@
+{
+  "instructions": "Respond in JSON format.",
+  "stream": true,
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "summary": "auto",
+    "effort": "low"
+  },
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "model": "gpt-5.4",
+  "store": false,
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "You are helpful."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Return structured data for Paris weather."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Calling tool"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "weather_lookup",
+      "arguments": "{\"city\":\"Paris\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "{\"temp\":20}"
+    }
+  ],
+  "text": {
+    "format": {
+      "type": "json_object"
+    }
+  },
+  "tools": [
+    {
+      "type": "function",
+      "name": "weather_lookup",
+      "description": "Look up weather",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "name": "weather_lookup"
+  }
+}

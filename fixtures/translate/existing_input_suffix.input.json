@@ -1,0 +1,26 @@
+{
+  "model": "gpt-5.2-high-fast",
+  "input": [
+    {
+      "type": "message",
+      "role": "system",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "You are a pirate."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Say hello."
+        }
+      ]
+    }
+  ],
+  "stream": false
+}

@@ -103,11 +103,10 @@ async fn main() -> Result<(), String> {
     ));
 
     let quota_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(20))?;
-    let quota_checker = Arc::new(QuotaChecker::new_with_config(
-        &cfg,
-        cfg.quota_check_concurrency as usize,
-        quota_http,
-    )?);
+    let quota_checker = Arc::new(
+        QuotaChecker::new_with_config(&cfg, cfg.quota_check_concurrency as usize, quota_http)?
+            .with_runtime_state(runtime_state.clone()),
+    );
 
     let refresh_http = net::build_generic_reqwest_client(
         &cfg,
@@ -222,18 +221,21 @@ async fn main() -> Result<(), String> {
             &cfg,
             Duration::from_secs(cfg.health_check_request_timeout),
         )?;
-        let hc = Arc::new(HealthChecker::new_with_http(
-            base_url.clone(),
-            health_http,
-            HealthCheckerConfig {
-                check_interval: Duration::from_secs(cfg.health_check_interval),
-                max_consecutive_failures: cfg.health_check_max_failures as i64,
-                concurrency: cfg.health_check_concurrency as usize,
-                start_delay: Duration::from_secs(cfg.health_check_start_delay),
-                batch_size: cfg.health_check_batch_size as usize,
-                request_timeout: Duration::from_secs(cfg.health_check_request_timeout),
-            },
-        ));
+        let hc = Arc::new(
+            HealthChecker::new_with_http(
+                base_url.clone(),
+                health_http,
+                HealthCheckerConfig {
+                    check_interval: Duration::from_secs(cfg.health_check_interval),
+                    max_consecutive_failures: cfg.health_check_max_failures as i64,
+                    concurrency: cfg.health_check_concurrency as usize,
+                    start_delay: Duration::from_secs(cfg.health_check_start_delay),
+                    batch_size: cfg.health_check_batch_size as usize,
+                    request_timeout: Duration::from_secs(cfg.health_check_request_timeout),
+                },
+            )
+            .with_runtime_state(runtime_state.clone()),
+        );
 
         let manager = manager.clone();
         let rx = shutdown_rx.clone();

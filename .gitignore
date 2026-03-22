@@ -1,5 +1,8 @@
 /target
 .codex-tasks
 plan.md
-fixtures
+fixtures/*
+!fixtures/translate/
+fixtures/translate/*
+!fixtures/translate/*.json
 */superpowers/

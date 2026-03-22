@@ -94,3 +94,41 @@ fn runtime_state_store_trims_hourly_buckets_to_retention_window() {
     assert!(trend.iter().all(|point| point.reasoning_tokens >= 1));
     assert!(trend.iter().all(|point| point.total_tokens >= 2));
 }
+
+#[test]
+fn runtime_state_store_save_now_if_dirty_persists_runtime_only_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("a.json");
+    std::fs::write(
+        &file_path,
+        r#"{
+  "access_token": "at-a",
+  "refresh_token": "rt-a",
+  "account_id": "acc-a",
+  "email": "a@example.com",
+  "type": "codex",
+  "expired": "2099-01-01T00:00:00Z"
+}"#,
+    )
+    .expect("write a.json");
+
+    let manager = Manager::new(dir.path());
+    manager.load_accounts().expect("load accounts");
+    let acc = manager.accounts_snapshot()[0].clone();
+    let now_ms = now_unix_ms();
+    acc.set_quota_cooldown(60_000, now_ms);
+
+    let store = RuntimeStateStore::new(dir.path());
+    store.mark_dirty();
+    assert!(store.save_now_if_dirty(&manager).expect("save if dirty"));
+
+    let manager2 = Manager::new(dir.path());
+    manager2.load_accounts().expect("load accounts again");
+    let store2 = RuntimeStateStore::new(dir.path());
+    store2.load_and_apply(&manager2).expect("restore state");
+
+    let restored = manager2.accounts_snapshot()[0].stats_snapshot();
+    assert_eq!(restored.status, AccountStatus::Cooldown);
+    assert!(restored.quota_exhausted);
+    assert!(restored.cooldown_until_ms > now_ms);
+}

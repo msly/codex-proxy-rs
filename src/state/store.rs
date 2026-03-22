@@ -138,6 +138,10 @@ impl RuntimeStateStore {
         inner.hourly.values().cloned().collect()
     }
 
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::Release);
+    }
+
     pub fn save_now(&self, manager: &Manager) -> Result<(), String> {
         let mut accounts = HashMap::new();
         for account in manager.accounts_snapshot().iter() {
@@ -167,16 +171,25 @@ impl RuntimeStateStore {
         Ok(())
     }
 
+    pub fn save_now_if_dirty(&self, manager: &Manager) -> Result<bool, String> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        match self.save_now(manager) {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                self.dirty.store(true, Ordering::Release);
+                Err(err)
+            }
+        }
+    }
+
     pub fn start_save_loop(self: Arc<Self>, manager: Arc<Manager>) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(self.save_interval);
             loop {
                 ticker.tick().await;
-                if !self.dirty.swap(false, Ordering::AcqRel) {
-                    continue;
-                }
-                if let Err(err) = self.save_now(manager.as_ref()) {
-                    self.dirty.store(true, Ordering::Release);
+                if let Err(err) = self.save_now_if_dirty(manager.as_ref()) {
                     tracing::warn!("runtime state save failed: {err}");
                 }
             }

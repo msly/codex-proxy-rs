@@ -1,0 +1,36 @@
+{
+  "model": "gpt-5.2",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "You are a pirate."
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Say hello."
+        }
+      ]
+    }
+  ],
+  "stream": false,
+  "reasoning": {
+    "effort": "high"
+  },
+  "service_tier": "priority",
+  "store": false,
+  "parallel_tool_calls": true,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "instructions": ""
+}
