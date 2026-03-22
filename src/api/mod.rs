@@ -15,8 +15,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use bytes::BytesMut;
 use futures_util::StreamExt;
 use futures_util::stream::unfold;
+use memchr::memchr;
 use serde::Serialize;
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
@@ -270,7 +272,7 @@ fn build_passthrough_sse_response(
 
     tokio::spawn(async move {
         let mut upstream_stream = upstream.bytes_stream();
-        let mut buf = Vec::<u8>::new();
+        let mut buf = BytesMut::new();
         let mut recorded_usage = false;
 
         while let Some(chunk) = upstream_stream.next().await {
@@ -293,10 +295,11 @@ fn build_passthrough_sse_response(
             }
 
             buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line = buf.drain(..pos).collect::<Vec<u8>>();
-                let _ = buf.drain(..1);
-                let line = trim_ascii(&line);
+            while let Some(pos) = memchr(b'\n', buf.as_ref()) {
+                let mut line = buf.split_to(pos + 1);
+                line.truncate(pos);
+
+                let line = trim_ascii(line.as_ref());
                 if line.is_empty() {
                     continue;
                 }
@@ -313,7 +316,7 @@ fn build_passthrough_sse_response(
         }
 
         if !recorded_usage {
-            let line = trim_ascii(&buf);
+            let line = trim_ascii(buf.as_ref());
             if !line.is_empty() {
                 let _ = record_usage_from_sse_line(
                     account.as_ref(),
@@ -867,17 +870,17 @@ async fn forward_responses_sse_as_ws(
     let mut has_text = false;
     let mut has_tool = false;
     let mut has_completed_output = false;
-    let mut buf = Vec::<u8>::new();
+    let mut buf = BytesMut::new();
     let mut upstream_stream = upstream.bytes_stream();
 
     while let Some(chunk) = upstream_stream.next().await {
         let chunk = chunk.map_err(|e| ResponsesWsError::Local(format!("读取上游响应失败: {e}")))?;
         buf.extend_from_slice(&chunk);
 
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line = buf.drain(..pos).collect::<Vec<u8>>();
-            let _ = buf.drain(..1);
-            let line = trim_ascii(&line);
+        while let Some(pos) = memchr(b'\n', buf.as_ref()) {
+            let mut line = buf.split_to(pos + 1);
+            line.truncate(pos);
+            let line = trim_ascii(line.as_ref());
             if line.is_empty() {
                 continue;
             }
@@ -1038,7 +1041,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
         tokio::spawn(async move {
-            let mut buf = Vec::<u8>::new();
+            let mut buf = BytesMut::new();
             let mut state = ClaudeStreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
 
@@ -1054,10 +1057,10 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                 };
 
                 buf.extend_from_slice(&chunk);
-                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line = buf.drain(..pos).collect::<Vec<u8>>();
-                    let _ = buf.drain(..1);
-                    let line = trim_ascii(&line);
+                while let Some(pos) = memchr(b'\n', buf.as_ref()) {
+                    let mut line = buf.split_to(pos + 1);
+                    line.truncate(pos);
+                    let line = trim_ascii(line.as_ref());
                     if line.is_empty() {
                         continue;
                     }
@@ -1389,7 +1392,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
         tokio::spawn(async move {
-            let mut buf = Vec::<u8>::new();
+            let mut buf = BytesMut::new();
             let mut state = StreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
 
@@ -1405,10 +1408,10 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 };
 
                 buf.extend_from_slice(&chunk);
-                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                    let line = buf.drain(..pos).collect::<Vec<u8>>();
-                    let _ = buf.drain(..1);
-                    let line = trim_ascii(&line);
+                while let Some(pos) = memchr(b'\n', buf.as_ref()) {
+                    let mut line = buf.split_to(pos + 1);
+                    line.truncate(pos);
+                    let line = trim_ascii(line.as_ref());
                     if line.is_empty() {
                         continue;
                     }
