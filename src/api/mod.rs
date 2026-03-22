@@ -345,6 +345,9 @@ pub fn router(state: AppState) -> Router {
     let mgmt = Router::new()
         .route("/stats", get(stats))
         .route("/refresh", post(refresh))
+        .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
+
+    let mgmt_sse = Router::new()
         .route("/check-quota", post(check_quota))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
@@ -364,6 +367,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .merge(non_v1)
+        .merge(mgmt_sse)
         .nest("/v1", v1)
         .layer(middleware::from_fn(cors_and_options))
         .with_state(state)
