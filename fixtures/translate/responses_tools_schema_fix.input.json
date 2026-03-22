@@ -1,0 +1,35 @@
+{
+  "model": "gpt-5.4",
+  "stream": false,
+  "input": [
+    {
+      "type": "message",
+      "role": "system",
+      "content": [{ "type": "input_text", "text": "hi" }]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "t1",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "a": { "type": "array" }
+          }
+        }
+      }
+    },
+    {
+      "type": "function",
+      "name": "t2",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "b": { "type": "array" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": [
+        {
+          "text": "hi",
+          "type": "input_text"
+        }
+      ],
+      "role": "developer",
+      "type": "message"
+    }
+  ],
+  "instructions": "",
+  "model": "gpt-5.4",
+  "parallel_tool_calls": true,
+  "store": false,
+  "stream": false,
+  "tools": [
+    {
+      "function": {
+        "name": "t1",
+        "parameters": {
+          "properties": {
+            "a": {
+              "items": {},
+              "type": "array"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "name": "t2",
+      "parameters": {
+        "properties": {
+          "b": {
+            "items": {},
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

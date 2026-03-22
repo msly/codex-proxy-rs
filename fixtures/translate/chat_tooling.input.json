@@ -1,0 +1,113 @@
+{
+  "model": "gpt-5.4-high",
+  "stream": true,
+  "messages": [
+    {
+      "role": "system",
+      "content": "sys"
+    },
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "hi" },
+        { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+        { "type": "file", "file": { "file_data": "ZmlsZQ==", "filename": "a.txt" } }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": "ok",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": {
+            "name": "mcp__server__tool__do_something_very_long_name_exceeding_limit_1234567890",
+            "arguments": "{\"x\":1}"
+          }
+        },
+        {
+          "id": "call_2",
+          "type": "function",
+          "function": {
+            "name": "mcp__client__tool__do_something_very_long_name_exceeding_limit_1234567890",
+            "arguments": "{\"y\":2}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_1",
+      "content": "tool output 1"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "mcp__server__tool__do_something_very_long_name_exceeding_limit_1234567890",
+        "description": "desc1",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "items": { "type": "array" },
+            "nested": {
+              "type": "object",
+              "properties": {
+                "arr": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "x": { "type": "array" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "strict": true
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "mcp__client__tool__do_something_very_long_name_exceeding_limit_1234567890",
+        "description": "desc2",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "list": { "type": "array" }
+          }
+        }
+      }
+    },
+    {
+      "type": "custom",
+      "name": "apply_patch",
+      "description": "Apply patch",
+      "format": "lark"
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "function": {
+      "name": "mcp__client__tool__do_something_very_long_name_exceeding_limit_1234567890"
+    }
+  },
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "resp",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a": { "type": "array" }
+        }
+      }
+    }
+  }
+}

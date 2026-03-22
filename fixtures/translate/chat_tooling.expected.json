@@ -1,0 +1,153 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": [
+        {
+          "text": "sys",
+          "type": "input_text"
+        }
+      ],
+      "role": "developer",
+      "type": "message"
+    },
+    {
+      "content": [
+        {
+          "text": "hi",
+          "type": "input_text"
+        },
+        {
+          "image_url": "https://example.com/a.png",
+          "type": "input_image"
+        },
+        {
+          "file_data": "ZmlsZQ==",
+          "filename": "a.txt",
+          "type": "input_file"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": [
+        {
+          "text": "ok",
+          "type": "output_text"
+        }
+      ],
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"x\":1}",
+      "call_id": "call_1",
+      "name": "mcp__do_something_very_long_name_exceeding_limit_1234567890",
+      "type": "function_call"
+    },
+    {
+      "arguments": "{\"y\":2}",
+      "call_id": "call_2",
+      "name": "mcp__do_something_very_long_name_exceeding_limit_1234567890_1",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_1",
+      "output": "tool output 1",
+      "type": "function_call_output"
+    }
+  ],
+  "instructions": "Respond in JSON format.",
+  "model": "gpt-5.4",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "high",
+    "summary": "auto"
+  },
+  "store": false,
+  "stream": true,
+  "text": {
+    "format": {
+      "name": "resp",
+      "schema": {
+        "properties": {
+          "a": {
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "strict": true,
+      "type": "json_schema"
+    }
+  },
+  "tool_choice": {
+    "name": "mcp__do_something_very_long_name_exceeding_limit_1234567890_1",
+    "type": "function"
+  },
+  "tools": [
+    {
+      "description": "desc1",
+      "name": "mcp__do_something_very_long_name_exceeding_limit_1234567890",
+      "parameters": {
+        "properties": {
+          "items": {
+            "items": {},
+            "type": "array"
+          },
+          "nested": {
+            "properties": {
+              "arr": {
+                "items": {
+                  "properties": {
+                    "x": {
+                      "items": {},
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "strict": true,
+      "type": "function"
+    },
+    {
+      "description": "desc2",
+      "name": "mcp__do_something_very_long_name_exceeding_limit_1234567890_1",
+      "parameters": {
+        "properties": {
+          "list": {
+            "items": {},
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "type": "function"
+    },
+    {
+      "description": "Apply patch",
+      "name": "apply_patch",
+      "parameters": {
+        "properties": {
+          "patch": {
+            "description": "The patch content",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

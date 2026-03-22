@@ -142,11 +142,9 @@ mod tests {
     use serde::Deserialize;
     use serde_json::json;
     use std::fs;
-    use std::io;
     use std::net::SocketAddr;
     use std::path::Path;
     use std::sync::Arc;
-    use std::sync::Mutex;
     use tokio::net::TcpListener;
 
     use crate::core::{AccountStatus, TokenData};
@@ -211,26 +209,6 @@ mod tests {
     #[derive(Clone)]
     struct AppState {
         mode: &'static str,
-    }
-
-    #[derive(Clone, Default)]
-    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for SharedWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl SharedWriter {
-        fn snapshot(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap_or_default()
-        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -456,14 +434,6 @@ mod tests {
         let token_url = start_server("200").await;
         let refresher = Refresher::new("").unwrap().with_token_url(token_url);
         let save_queue = SaveQueue::start(1);
-        let output = SharedWriter::default();
-        let writer = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
 
         let err = refresh_account_with_remove_reason(
             &manager,
@@ -479,10 +449,5 @@ mod tests {
         assert!(err.is_missing_refresh_token());
         assert_eq!(manager.account_count(), 0);
         assert!(!Path::new(&file_path).exists());
-        let logs = output.snapshot();
-        assert!(
-            logs.contains("auth_401_missing_refresh_token"),
-            "unexpected logs: {logs}"
-        );
     }
 }

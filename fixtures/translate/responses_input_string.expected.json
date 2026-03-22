@@ -1,0 +1,26 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": [
+        {
+          "text": "hi",
+          "type": "input_text"
+        }
+      ],
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "",
+  "model": "gpt-5.4",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "high"
+  },
+  "service_tier": "fast",
+  "store": false,
+  "stream": true
+}

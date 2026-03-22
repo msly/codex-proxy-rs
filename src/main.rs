@@ -205,6 +205,7 @@ async fn main() -> Result<(), String> {
             },
         ) {
             Ok(loop_) => {
+                let loop_ = loop_.with_runtime_state(runtime_state.clone());
                 let rx = shutdown_rx.clone();
                 tokio::spawn(async move {
                     loop_.start_loop(rx).await;

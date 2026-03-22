@@ -1,0 +1,20 @@
+{
+  "model": "gpt-5.4",
+  "input": "hi",
+  "stream": true,
+  "reasoning_effort": "high",
+  "service_tier": "fast",
+  "previous_response_id": "prev",
+  "stream_options": { "include_usage": true },
+  "prompt_cache_retention": "x",
+  "safety_identifier": "y",
+  "generate": true,
+  "max_output_tokens": 1,
+  "max_completion_tokens": 2,
+  "temperature": 0.5,
+  "top_p": 0.9,
+  "truncation": "auto",
+  "context_management": { "type": "x" },
+  "user": "u",
+  "variant": "low"
+}

@@ -10,6 +10,12 @@ use super::selector::{RoundRobinSelector, Selector};
 
 const RUNTIME_STATE_FILE_NAME: &str = ".codex-proxy-state.json";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanOutcome {
+    pub added: usize,
+    pub removed: usize,
+}
+
 pub struct Manager {
     auth_dir: PathBuf,
     accounts: ArcSwap<Vec<Arc<Account>>>,
@@ -150,7 +156,7 @@ impl Manager {
     /// Scan `auth_dir` and hot-load new `*.json` auth files.
     ///
     /// Unlike `load_accounts`, this will not replace existing in-memory accounts.
-    pub fn scan_new_files(&self) -> Result<usize, String> {
+    pub fn scan_new_files(&self) -> Result<ScanOutcome, String> {
         let entries = fs::read_dir(&self.auth_dir)
             .map_err(|e| format!("读取账号目录失败: {e}"))?
             .collect::<Result<Vec<_>, _>>()
@@ -158,6 +164,7 @@ impl Manager {
 
         let snap = self.accounts.load_full();
         let existing: HashSet<String> = snap.iter().map(|a| a.file_path().to_string()).collect();
+        let mut disk_files = HashSet::new();
 
         let mut added = Vec::new();
         for entry in entries {
@@ -166,6 +173,7 @@ impl Manager {
                 continue;
             }
             let file_path = path.to_string_lossy().to_string();
+            disk_files.insert(file_path.clone());
             if existing.contains(&file_path) {
                 continue;
             }
@@ -181,17 +189,27 @@ impl Manager {
             }
         }
 
-        if added.is_empty() {
-            return Ok(0);
+        let retained: Vec<Arc<Account>> = snap
+            .iter()
+            .filter(|acc| disk_files.contains(acc.file_path()))
+            .cloned()
+            .collect();
+        let removed = snap.len().saturating_sub(retained.len());
+        let added_count = added.len();
+
+        if added.is_empty() && removed == 0 {
+            return Ok(ScanOutcome::default());
         }
 
-        let mut merged = Vec::with_capacity(snap.len() + added.len());
-        merged.extend(snap.iter().cloned());
+        let mut merged = Vec::with_capacity(retained.len() + added.len());
+        merged.extend(retained);
         merged.extend(added);
 
-        let count = merged.len() - snap.len();
         self.accounts.store(Arc::new(merged));
-        Ok(count)
+        Ok(ScanOutcome {
+            added: added_count,
+            removed,
+        })
     }
 }
 
@@ -395,7 +413,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let manager = Manager::new(dir.path());
 
-        assert_eq!(manager.scan_new_files().expect("initial scan"), 0);
+        assert_eq!(manager.scan_new_files().expect("initial scan"), ScanOutcome::default());
 
         fs::write(
             dir.path().join("a.json"),
@@ -410,10 +428,47 @@ mod tests {
         )
         .expect("write a.json");
 
-        assert_eq!(manager.scan_new_files().expect("hot load"), 1);
+        assert_eq!(
+            manager.scan_new_files().expect("hot load"),
+            ScanOutcome {
+                added: 1,
+                removed: 0
+            }
+        );
         assert_eq!(manager.account_count(), 1);
         assert_eq!(manager.accounts_snapshot()[0].token().access_token, "at-a");
         assert_eq!(manager.accounts_snapshot()[0].token().refresh_token, "");
+    }
+
+    #[test]
+    fn core_manager_scan_new_files_prunes_deleted_auth_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a_path = dir.path().join("a.json");
+        let b_path = dir.path().join("b.json");
+        fs::write(
+            &a_path,
+            r#"{"access_token":"at-a","refresh_token":"rt-a","account_id":"","email":"a@example.com","type":"codex","expired":"2099-01-01T00:00:00Z"}"#,
+        )
+        .expect("write a.json");
+        fs::write(
+            &b_path,
+            r#"{"access_token":"at-b","refresh_token":"rt-b","account_id":"","email":"b@example.com","type":"codex","expired":"2099-01-01T00:00:00Z"}"#,
+        )
+        .expect("write b.json");
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().expect("load accounts");
+        fs::remove_file(&b_path).expect("remove b.json");
+
+        assert_eq!(
+            manager.scan_new_files().expect("scan after delete"),
+            ScanOutcome {
+                added: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(manager.account_count(), 1);
+        assert_eq!(manager.accounts_snapshot()[0].file_path(), a_path.to_string_lossy());
     }
 
     #[test]
@@ -460,7 +515,7 @@ mod tests {
         )
         .expect("write invalid.json");
 
-        assert_eq!(manager.scan_new_files().expect("scan"), 0);
+        assert_eq!(manager.scan_new_files().expect("scan"), ScanOutcome::default());
         assert!(
             !invalid_path.exists(),
             "missing-access-token auth file should be deleted"
