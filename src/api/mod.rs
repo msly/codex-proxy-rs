@@ -25,11 +25,14 @@ use crate::core::{Account, Manager};
 use crate::quota::QuotaChecker;
 use crate::refresh::{Refresher, SaveQueue, refresh_account};
 use crate::state::RuntimeStateStore;
-use crate::thinking::apply_thinking;
+use crate::thinking::apply::apply_thinking_to_value;
 use crate::translate::{
-    ClaudeStreamState, StreamState, build_reverse_tool_name_map, convert_claude_request_to_openai,
+    ClaudeStreamState, StreamState, convert_claude_request_to_openai,
     convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
-    convert_non_stream_response, convert_openai_request_to_codex, convert_stream_chunk,
+    convert_non_stream_response, convert_stream_chunk,
+};
+use crate::translate::request::{
+    build_reverse_tool_name_map_from_value, convert_openai_value_to_codex_value,
 };
 use crate::upstream::codex::CodexClient;
 use crate::upstream::codex::UpstreamError;
@@ -580,7 +583,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         }
     };
 
-    let body_value: serde_json::Value = serde_json::from_slice(&raw)
+    let mut body_value: serde_json::Value = serde_json::from_slice(&raw)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let model = body_value
         .get("model")
@@ -601,8 +604,9 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     tracing::info!(model = %model, stream, "received /v1/responses request");
 
-    let (body, base_model) = apply_thinking(&raw, &model);
-    let codex_body = convert_openai_request_to_codex(&base_model, &body, stream);
+    let base_model = apply_thinking_to_value(&mut body_value, &model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, stream);
+    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
     let url = match state.codex_client.responses_url() {
         Ok(u) => u,
@@ -835,8 +839,11 @@ async fn forward_responses_sse_as_ws(
 ) -> Result<(), ResponsesWsError> {
     tracing::info!(model = %model, "responses ws: fallback to HTTP/SSE forwarding");
 
-    let (body, base_model) = apply_thinking(&request_body, model);
-    let codex_body = convert_openai_request_to_codex(&base_model, &body, true);
+    let mut body_value: serde_json::Value = serde_json::from_slice(&request_body)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let base_model = apply_thinking_to_value(&mut body_value, model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
+    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
     let url = state
         .codex_client
@@ -992,8 +999,11 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
 
     tracing::info!(model = %model, stream, "received /v1/messages request");
 
-    let (body, base_model) = apply_thinking(&openai_body, &model);
-    let codex_body = convert_openai_request_to_codex(&base_model, &body, true);
+    let mut body_value: serde_json::Value = serde_json::from_slice(&openai_body)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let base_model = apply_thinking_to_value(&mut body_value, &model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
+    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
     let url = match state.codex_client.responses_url() {
         Ok(u) => u,
@@ -1157,7 +1167,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         }
     };
 
-    let body_value: serde_json::Value = serde_json::from_slice(&raw)
+    let mut body_value: serde_json::Value = serde_json::from_slice(&raw)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let model = body_value
         .get("model")
@@ -1178,8 +1188,8 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
 
     tracing::info!(model = %model, stream, "received /v1/responses/compact request");
 
-    let (body, base_model) = apply_thinking(&raw, &model);
-    let codex_body = clean_compact_body(&body, &base_model);
+    let base_model = apply_thinking_to_value(&mut body_value, &model);
+    let codex_body = clean_compact_value_to_vec(body_value, &base_model);
 
     let url = match state.codex_client.responses_compact_url() {
         Ok(u) => u,
@@ -1259,10 +1269,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
     resp
 }
 
-fn clean_compact_body(raw: &[u8], base_model: &str) -> Vec<u8> {
-    let mut v: serde_json::Value = serde_json::from_slice(raw)
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-
+fn clean_compact_value_to_vec(mut v: serde_json::Value, base_model: &str) -> Vec<u8> {
     let obj = match v.as_object_mut() {
         Some(m) => m,
         None => {
@@ -1322,7 +1329,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         }
     };
 
-    let body_value: serde_json::Value = serde_json::from_slice(&raw)
+    let mut body_value: serde_json::Value = serde_json::from_slice(&raw)
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let model = body_value
         .get("model")
@@ -1343,8 +1350,10 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
     tracing::info!(model = %model, stream, "received /v1/chat/completions request");
 
-    let (body, base_model) = apply_thinking(&raw, &model);
-    let codex_body = convert_openai_request_to_codex(&base_model, &body, true);
+    let reverse_tool_map = build_reverse_tool_name_map_from_value(&body_value);
+    let base_model = apply_thinking_to_value(&mut body_value, &model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
+    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
     let url = match state.codex_client.responses_url() {
         Ok(u) => u,
@@ -1356,8 +1365,6 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             );
         }
     };
-
-    let reverse_tool_map = build_reverse_tool_name_map(&raw);
 
     if stream {
         let (upstream, account, _attempts) = match state

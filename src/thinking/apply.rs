@@ -26,6 +26,26 @@ pub fn apply_thinking(body: &[u8], model: &str) -> (Vec<u8>, String) {
     )
 }
 
+pub fn apply_thinking_to_value(body_value: &mut Value, model: &str) -> String {
+    let parse = parse_model_suffix(model);
+    let base_model = parse.model_name.trim().to_string();
+
+    let effort = match parse.thinking_suffix.as_deref() {
+        Some(suffix) => effort_from_suffix(suffix),
+        None => extract_effort_from_body(body_value),
+    };
+
+    if let Some(effort) = effort {
+        set_reasoning_effort(body_value, &effort);
+    }
+
+    if parse.is_fast {
+        set_service_tier(body_value, "priority");
+    }
+
+    base_model
+}
+
 fn extract_effort_from_body(v: &Value) -> Option<String> {
     if let Some(effort) = v
         .get("reasoning")

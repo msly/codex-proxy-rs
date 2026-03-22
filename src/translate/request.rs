@@ -4,19 +4,26 @@ use serde_json::{Map, Value, json};
 
 pub fn convert_openai_request_to_codex(model_name: &str, raw_json: &[u8], stream: bool) -> Vec<u8> {
     let v: Value = serde_json::from_slice(raw_json).unwrap_or_else(|_| Value::Object(Map::new()));
-    let original_tool_name_map = build_tool_name_map(&v);
-    let out = if v.get("input").is_some() {
-        convert_existing_input(model_name, v, stream)
-    } else {
-        convert_chat_completions(model_name, v, stream, &original_tool_name_map)
-    };
+    let out = convert_openai_value_to_codex_value(model_name, v, stream);
     serde_json::to_vec(&out).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 pub fn build_reverse_tool_name_map(raw_json: &[u8]) -> HashMap<String, String> {
     let v: Value = serde_json::from_slice(raw_json).unwrap_or_else(|_| Value::Object(Map::new()));
-    let tool_name_map = build_tool_name_map(&v);
-    tool_name_map
+    build_reverse_tool_name_map_from_value(&v)
+}
+
+pub fn convert_openai_value_to_codex_value(model_name: &str, v: Value, stream: bool) -> Value {
+    let original_tool_name_map = build_tool_name_map(&v);
+    if v.get("input").is_some() {
+        convert_existing_input(model_name, v, stream)
+    } else {
+        convert_chat_completions(model_name, v, stream, &original_tool_name_map)
+    }
+}
+
+pub fn build_reverse_tool_name_map_from_value(v: &Value) -> HashMap<String, String> {
+    build_tool_name_map(v)
         .into_iter()
         .map(|(orig, short)| (short, orig))
         .collect()
