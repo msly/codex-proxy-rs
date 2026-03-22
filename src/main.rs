@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 
 use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig, KeepAlive, KeepAliveConfig};
 use codex_proxy_rs::refresh::{
-    RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue, refresh_account_with_options,
+    AuthScanLoop, AuthScanLoopConfig, RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue,
+    refresh_account_with_options,
 };
 use codex_proxy_rs::{
     api,
@@ -187,17 +188,30 @@ async fn main() -> Result<(), String> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    match AuthScanLoop::new(
+        manager.clone(),
+        AuthScanLoopConfig {
+            scan_interval: Duration::from_secs(cfg.auth_scan_interval),
+        },
+    ) {
+        Ok(loop_) => {
+            let loop_ = loop_.with_runtime_state(runtime_state.clone());
+            let rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                loop_.start_loop(rx).await;
+            });
+        }
+        Err(err) => tracing::warn!("auth scan loop disabled: {err}"),
+    }
+
     if cfg.refresh_interval > 0 {
         let refresh_interval = Duration::from_secs(cfg.refresh_interval);
-        let scan_interval = Duration::from_secs(cfg.auth_scan_interval.min(cfg.refresh_interval));
-
         match RefreshLoop::new(
             manager.clone(),
             refresher.clone(),
             save_queue.clone(),
             RefreshLoopConfig {
                 refresh_interval,
-                scan_interval,
                 refresh_concurrency: cfg.refresh_concurrency as usize,
                 max_retries: 3,
                 refresh_batch_size: cfg.refresh_batch_size as usize,
@@ -205,7 +219,6 @@ async fn main() -> Result<(), String> {
             },
         ) {
             Ok(loop_) => {
-                let loop_ = loop_.with_runtime_state(runtime_state.clone());
                 let rx = shutdown_rx.clone();
                 tokio::spawn(async move {
                     loop_.start_loop(rx).await;
