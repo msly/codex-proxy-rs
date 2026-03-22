@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream;
 use reqwest::Url;
 use serde_json::Value;
 
@@ -119,22 +121,18 @@ impl HealthChecker {
             return;
         }
 
-        let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.concurrency.max(1)));
-        let mut handles = Vec::with_capacity(selected.len());
+        let concurrency = self.cfg.concurrency.max(1);
+        let mut tasks = stream::iter(selected)
+            .map(|acc| {
+                let checker = self.clone();
+                let manager = manager.clone();
+                async move {
+                    checker.check_account(manager.as_ref(), acc).await;
+                }
+            })
+            .buffer_unordered(concurrency);
 
-        for acc in selected {
-            let checker = self.clone();
-            let manager = manager.clone();
-            let sem = sem.clone();
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
-                checker.check_account(&manager, acc).await;
-            }));
-        }
-
-        for h in handles {
-            let _ = h.await;
-        }
+        while tasks.next().await.is_some() {}
     }
 
     async fn check_account(&self, manager: &Manager, acc: Arc<Account>) {

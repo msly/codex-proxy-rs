@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::StreamExt;
+use futures_util::stream;
 use reqwest::Url;
 use serde::Serialize;
 
@@ -177,67 +178,62 @@ impl QuotaChecker {
             }
 
             let start = Instant::now();
-            let sem = Arc::new(tokio::sync::Semaphore::new(checker.concurrency));
             let valid_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let invalid_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let failed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-            let mut handles = Vec::with_capacity(total);
-            for acc in accounts.iter() {
-                let tx = tx.clone();
-                let sem = sem.clone();
-                let checker = checker.clone();
-                let manager = manager.clone();
-                let valid_count = valid_count.clone();
-                let invalid_count = invalid_count.clone();
-                let failed_count = failed_count.clone();
-                let current = current.clone();
-                let acc = acc.clone();
+            let mut tasks = stream::iter(accounts.iter().cloned())
+                .map(|acc| {
+                    let tx = tx.clone();
+                    let checker = checker.clone();
+                    let manager = manager.clone();
+                    let valid_count = valid_count.clone();
+                    let invalid_count = invalid_count.clone();
+                    let failed_count = failed_count.clone();
+                    let current = current.clone();
 
-                handles.push(tokio::spawn(async move {
-                    let _permit = sem.acquire_owned().await.unwrap();
-                    let outcome = checker.check_account(acc.clone()).await;
+                    async move {
+                        let outcome = checker.check_account(acc.clone()).await;
 
-                    let cur = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let (email, ok, invalid) = match outcome {
-                        CheckOutcome::Valid { email } => {
-                            valid_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            (email, true, false)
-                        }
-                        CheckOutcome::Invalid { email } => {
-                            invalid_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            manager.remove_account(acc.file_path(), "quota_invalid");
-                            (email, false, true)
-                        }
-                        CheckOutcome::Failed { email } => {
-                            failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            (email, false, false)
-                        }
-                    };
+                        let cur = current.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let (email, ok, invalid) = match outcome {
+                            CheckOutcome::Valid { email } => {
+                                valid_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                (email, true, false)
+                            }
+                            CheckOutcome::Invalid { email } => {
+                                invalid_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                manager.remove_account(acc.file_path(), "quota_invalid");
+                                (email, false, true)
+                            }
+                            CheckOutcome::Failed { email } => {
+                                failed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                (email, false, false)
+                            }
+                        };
 
-                    let _ = tx
-                        .send(ProgressEvent {
-                            event_type: "item",
-                            email: Some(email),
-                            success: Some(ok),
-                            message: None,
-                            total: Some(total),
-                            success_count: None,
-                            failed_count: None,
-                            remaining: None,
-                            duration: None,
-                            current: Some(cur),
-                        })
-                        .await;
+                        let _ = tx
+                            .send(ProgressEvent {
+                                event_type: "item",
+                                email: Some(email),
+                                success: Some(ok),
+                                message: None,
+                                total: Some(total),
+                                success_count: None,
+                                failed_count: None,
+                                remaining: None,
+                                duration: None,
+                                current: Some(cur),
+                            })
+                            .await;
 
-                    invalid
-                }));
-            }
+                        invalid
+                    }
+                })
+                .buffer_unordered(checker.concurrency);
 
-            for h in handles {
-                let _ = h.await;
-            }
+            while tasks.next().await.is_some() {}
 
             let vc = valid_count.load(std::sync::atomic::Ordering::Relaxed);
             let ic = invalid_count.load(std::sync::atomic::Ordering::Relaxed);

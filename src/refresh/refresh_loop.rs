@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 
@@ -117,36 +119,33 @@ impl RefreshLoop {
         };
 
         for batch in need_refresh.chunks(batch_size) {
-            let sem = Arc::new(tokio::sync::Semaphore::new(self.cfg.refresh_concurrency));
-            let mut handles = Vec::with_capacity(batch.len());
+            let manager = self.manager.clone();
+            let refresher = self.refresher.clone();
+            let save_queue = self.save_queue.clone();
+            let max_retries = self.cfg.max_retries;
+            let rate_limit_cooldown_ms = self.cfg.rate_limit_cooldown_ms;
 
-            for acc in batch {
-                let permit = sem.clone().acquire_owned().await.unwrap();
-                let manager = self.manager.clone();
-                let refresher = self.refresher.clone();
-                let save_queue = self.save_queue.clone();
-                let max_retries = self.cfg.max_retries;
-                let rate_limit_cooldown_ms = self.cfg.rate_limit_cooldown_ms;
-                let acc = acc.clone();
+            let mut tasks = stream::iter(batch.iter().cloned())
+                .map(|acc| {
+                    let manager = manager.clone();
+                    let refresher = refresher.clone();
+                    let save_queue = save_queue.clone();
+                    async move {
+                        let _ = refresh_account_with_options(
+                            manager.as_ref(),
+                            &refresher,
+                            &save_queue,
+                            acc,
+                            max_retries,
+                            "refresh_failed",
+                            rate_limit_cooldown_ms,
+                        )
+                        .await;
+                    }
+                })
+                .buffer_unordered(self.cfg.refresh_concurrency);
 
-                handles.push(tokio::spawn(async move {
-                    let _permit = permit;
-                    let _ = refresh_account_with_options(
-                        manager.as_ref(),
-                        &refresher,
-                        &save_queue,
-                        acc,
-                        max_retries,
-                        "refresh_failed",
-                        rate_limit_cooldown_ms,
-                    )
-                    .await;
-                }));
-            }
-
-            for h in handles {
-                let _ = h.await;
-            }
+            while tasks.next().await.is_some() {}
         }
 
         tracing::info!("refresh: batch done");
