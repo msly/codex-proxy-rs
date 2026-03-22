@@ -32,12 +32,15 @@ impl Selector for RoundRobinSelector {
             return Err("没有可用的 Codex 账号".to_string());
         }
 
+        let idx = self.cursor.fetch_add(1, AtomicOrdering::Relaxed) as usize;
+        let pick_idx = idx % available.len();
         if available.len() > 1 {
-            available.sort_by(|a, b| compare_used_percent(a, b));
+            let (_, picked, _) =
+                available.select_nth_unstable_by(pick_idx, |a, b| compare_used_percent(a, b));
+            return Ok(picked.clone());
         }
 
-        let idx = self.cursor.fetch_add(1, AtomicOrdering::Relaxed) as usize;
-        Ok(available[idx % available.len()].clone())
+        Ok(available[0].clone())
     }
 }
 
@@ -53,21 +56,23 @@ impl QuotaFirstSelector {
 impl Selector for QuotaFirstSelector {
     fn pick(&self, _model: &str, accounts: &[Arc<Account>]) -> Result<Arc<Account>, String> {
         let now_ms = now_unix_ms();
-        let mut available: Vec<Arc<Account>> = accounts
-            .iter()
-            .filter(|acc| acc.is_available(now_ms))
-            .cloned()
-            .collect();
+        let mut best: Option<Arc<Account>> = None;
 
-        if available.is_empty() {
-            return Err("没有可用的 Codex 账号".to_string());
+        for acc in accounts {
+            if !acc.is_available(now_ms) {
+                continue;
+            }
+            match &best {
+                None => best = Some(acc.clone()),
+                Some(current) => {
+                    if compare_used_percent(acc.as_ref(), current.as_ref()) == Ordering::Less {
+                        best = Some(acc.clone());
+                    }
+                }
+            }
         }
 
-        if available.len() > 1 {
-            available.sort_by(|a, b| compare_used_percent(a, b));
-        }
-
-        Ok(available[0].clone())
+        best.ok_or_else(|| "没有可用的 Codex 账号".to_string())
     }
 }
 
