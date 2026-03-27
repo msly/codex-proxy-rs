@@ -197,6 +197,8 @@ impl CodexClient {
 
             let status = resp.status().as_u16();
             if (200..300).contains(&status) {
+                let now_ms = crate::core::now_unix_ms();
+                account.apply_codex_rate_limit_headers(resp.headers(), now_ms);
                 return Ok((resp, account, attempt + 1));
             }
 
@@ -585,6 +587,137 @@ mod tests {
         assert_eq!(a.used_percent_x100(), 10000);
 
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_updates_used_percent_from_success_headers() {
+        async fn upstream_with_headers(
+            headers: HeaderMap,
+        ) -> Response {
+            let mut resp = Response::new(Body::from("ok"));
+            *resp.status_mut() = axum::http::StatusCode::OK;
+            resp.headers_mut().insert(
+                "x-codex-primary-used-percent",
+                axum::http::HeaderValue::from_static("12"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-primary-window-minutes",
+                axum::http::HeaderValue::from_static("10080"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-secondary-used-percent",
+                axum::http::HeaderValue::from_static("34"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-secondary-window-minutes",
+                axum::http::HeaderValue::from_static("300"),
+            );
+            let _ = headers;
+            resp
+        }
+
+        let app = Router::new().route("/backend-api/codex/responses", post(upstream_with_headers));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), false, 0, None)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let snap = manager.accounts_snapshot();
+        let a = snap
+            .iter()
+            .find(|a| a.file_path().ends_with("a.json"))
+            .unwrap();
+        assert!((a.used_percent() - 34.0).abs() < 0.01, "used={}", a.used_percent());
+        assert!(!a.quota_exhausted());
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_sets_quota_state_from_success_headers() {
+        async fn upstream_with_exhausted_headers(
+            headers: HeaderMap,
+        ) -> Response {
+            let mut resp = Response::new(Body::from("ok"));
+            *resp.status_mut() = axum::http::StatusCode::OK;
+            resp.headers_mut().insert(
+                "x-codex-primary-used-percent",
+                axum::http::HeaderValue::from_static("100"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-primary-window-minutes",
+                axum::http::HeaderValue::from_static("10080"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-primary-reset-after-seconds",
+                axum::http::HeaderValue::from_static("7200"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-secondary-used-percent",
+                axum::http::HeaderValue::from_static("3"),
+            );
+            resp.headers_mut().insert(
+                "x-codex-secondary-window-minutes",
+                axum::http::HeaderValue::from_static("300"),
+            );
+            let _ = headers;
+            resp
+        }
+
+        let app = Router::new().route(
+            "/backend-api/codex/responses",
+            post(upstream_with_exhausted_headers),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let base_url = Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), false, 0, None)
+            .await
+            .expect("should succeed");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let snap = manager.accounts_snapshot();
+        let a = snap
+            .iter()
+            .find(|a| a.file_path().ends_with("a.json"))
+            .unwrap();
+        assert_eq!(a.status(), crate::core::AccountStatus::Cooldown);
+        assert!(a.quota_exhausted());
+        assert_eq!(a.used_percent_x100(), 10000);
+        assert!(a.quota_resets_at_ms() > crate::core::now_unix_ms());
     }
 
     #[tokio::test]

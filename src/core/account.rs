@@ -3,6 +3,7 @@ use std::sync::{RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -332,6 +333,45 @@ impl Account {
         self.refresh_used_percent_from_quota(&info);
     }
 
+    pub fn apply_codex_rate_limit_headers(&self, headers: &HeaderMap, now_ms: i64) -> bool {
+        let primary = parse_codex_header_window(headers, "primary");
+        let secondary = parse_codex_header_window(headers, "secondary");
+        if primary.is_none() && secondary.is_none() {
+            return false;
+        }
+
+        let used_percent_x100 = [primary.as_ref(), secondary.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|window| window.used_percent_x100)
+            .max()
+            .unwrap_or(-100);
+        self.used_percent_x100
+            .store(used_percent_x100, Ordering::Relaxed);
+
+        let exhausted_window = [primary.as_ref(), secondary.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter(|window| window.used_percent_x100.unwrap_or(-100) >= 10_000)
+            .filter_map(|window| window.reset_after_seconds.map(|seconds| (seconds, window.window_minutes)))
+            .max_by_key(|(seconds, minutes)| (*seconds, *minutes));
+
+        if let Some((reset_after_seconds, _)) = exhausted_window {
+            self.set_quota_cooldown(
+                (reset_after_seconds as i64).saturating_mul(1000),
+                now_ms,
+            );
+            return true;
+        }
+
+        self.quota_exhausted.store(0, Ordering::Relaxed);
+        self.quota_resets_at_ms.store(0, Ordering::Relaxed);
+        if self.status() == AccountStatus::Cooldown && self.cooldown_until_ms() <= now_ms {
+            self.set_status_active();
+        }
+        true
+    }
+
     pub fn apply_runtime_snapshot(&self, snapshot: &AccountRuntimeSnapshot, now_ms: i64) {
         self.total_requests
             .store(snapshot.total_requests.max(0), Ordering::Relaxed);
@@ -580,6 +620,39 @@ fn extract_used_percent_x100(raw_json: &[u8]) -> Option<i64> {
         .get("used_percent")?
         .as_f64()?;
     Some((used * 100.0) as i64)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexHeaderWindow {
+    used_percent_x100: Option<i64>,
+    reset_after_seconds: Option<u64>,
+    window_minutes: Option<u64>,
+}
+
+fn parse_codex_header_window(headers: &HeaderMap, prefix: &str) -> Option<CodexHeaderWindow> {
+    let used_percent_x100 = headers
+        .get(format!("x-codex-{prefix}-used-percent"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|value| (value.clamp(0.0, 100.0) * 100.0).round() as i64);
+    let reset_after_seconds = headers
+        .get(format!("x-codex-{prefix}-reset-after-seconds"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let window_minutes = headers
+        .get(format!("x-codex-{prefix}-window-minutes"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    if used_percent_x100.is_none() && reset_after_seconds.is_none() && window_minutes.is_none() {
+        return None;
+    }
+
+    Some(CodexHeaderWindow {
+        used_percent_x100,
+        reset_after_seconds,
+        window_minutes,
+    })
 }
 
 pub fn parse_id_token_claims(id_token: &str) -> (String, String, String) {
