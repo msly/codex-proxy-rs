@@ -104,6 +104,11 @@ pub async fn refresh_account_with_options(
 
     let refresh_token = { account.token().refresh_token.clone() };
     if refresh_token.trim().is_empty() {
+        tracing::warn!(
+            account = account.file_path(),
+            remove_reason,
+            "account refresh skipped: missing refresh_token"
+        );
         if remove_reason == "auth_401" {
             manager.remove_account(account.file_path(), "auth_401_missing_refresh_token");
         }
@@ -116,15 +121,38 @@ pub async fn refresh_account_with_options(
     {
         Ok(td) => {
             let now_ms = now_unix_ms();
+            let expired = td.expired.clone();
+            let account_path = account.file_path().to_string();
             account.update_token(td, now_ms);
             save_queue.enqueue(account);
+            tracing::info!(
+                account = account_path,
+                remove_reason,
+                expired,
+                "account token refreshed"
+            );
             Ok(())
         }
         Err(err) if err.is_rate_limited() => {
             account.set_cooldown(rate_limit_cooldown_ms.max(0), now_unix_ms());
+            tracing::warn!(
+                account = account.file_path(),
+                remove_reason,
+                cooldown_ms = rate_limit_cooldown_ms.max(0),
+                status = err.status_code,
+                error = %err,
+                "account refresh rate limited"
+            );
             Err(err)
         }
         Err(err) => {
+            tracing::warn!(
+                account = account.file_path(),
+                remove_reason,
+                status = err.status_code,
+                error = %err,
+                "account refresh failed"
+            );
             manager.remove_account(account.file_path(), remove_reason);
             Err(err)
         }

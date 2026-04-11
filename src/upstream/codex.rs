@@ -173,6 +173,17 @@ impl CodexClient {
                     Err(_) => {
                         let now_ms = crate::core::now_unix_ms();
                         account.record_failure(now_ms);
+                        let will_retry = attempt < max_attempts - 1;
+                        tracing::warn!(
+                            model = %model,
+                            stream,
+                            attempt = attempt + 1,
+                            total = max_attempts,
+                            account = account.file_path(),
+                            timeout = ?timeout,
+                            will_retry,
+                            "upstream request timed out before headers"
+                        );
                         last_err = Some(UpstreamError::Network(format!(
                             "等待上游响应超时: {}s",
                             timeout.as_secs()
@@ -192,6 +203,17 @@ impl CodexClient {
                 Err(err) => {
                     let now_ms = crate::core::now_unix_ms();
                     account.record_failure(now_ms);
+                    let will_retry = attempt < max_attempts - 1;
+                    tracing::warn!(
+                        model = %model,
+                        stream,
+                        attempt = attempt + 1,
+                        total = max_attempts,
+                        account = account.file_path(),
+                        error = %err,
+                        will_retry,
+                        "upstream request network error"
+                    );
                     let e = UpstreamError::Network(format!("请求发送失败: {err}"));
                     last_err = Some(e);
                     if attempt < max_attempts - 1 {
@@ -206,6 +228,17 @@ impl CodexClient {
             if (200..300).contains(&status) {
                 let now_ms = crate::core::now_unix_ms();
                 account.apply_codex_rate_limit_headers(resp.headers(), now_ms);
+                if attempt > 0 {
+                    tracing::info!(
+                        model = %model,
+                        stream,
+                        attempt = attempt + 1,
+                        total = max_attempts,
+                        account = account.file_path(),
+                        status,
+                        "upstream request succeeded after retry"
+                    );
+                }
                 return Ok((resp, account, attempt + 1));
             }
 
@@ -238,12 +271,27 @@ impl CodexClient {
             );
 
             let effective_status = if retry_as_capacity { 429 } else { status };
+            let will_retry =
+                (is_retryable_status(status) || retry_as_capacity) && attempt < max_attempts - 1;
+            tracing::warn!(
+                model = %model,
+                stream,
+                attempt = attempt + 1,
+                total = max_attempts,
+                account = account.file_path(),
+                status,
+                effective_status,
+                retry_as_capacity,
+                will_retry,
+                body = %preview_body_for_log(&err_body, 240),
+                "upstream request failed"
+            );
             let e = UpstreamError::Status {
                 code: effective_status,
                 body: err_body.clone(),
             };
             last_err = Some(e.clone());
-            if (is_retryable_status(status) || retry_as_capacity) && attempt < max_attempts - 1 {
+            if will_retry {
                 continue;
             }
 
@@ -316,6 +364,20 @@ impl std::fmt::Display for UpstreamError {
 }
 
 impl std::error::Error for UpstreamError {}
+
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn preview_body_for_log(body: &[u8], max_chars: usize) -> String {
+    truncate_for_log(&String::from_utf8_lossy(body), max_chars)
+}
 
 fn is_retryable_status(code: u16) -> bool {
     if (200..300).contains(&code) {
@@ -943,6 +1005,12 @@ mod tests {
             parse_retry_after_ms(body.to_string().as_bytes(), now_ms, 60_000),
             7_000
         );
+    }
+
+    #[test]
+    fn upstream_preview_body_for_log_truncates_long_payloads() {
+        let preview = preview_body_for_log("你好abcdef".as_bytes(), 4);
+        assert_eq!(preview, "你好ab...");
     }
 
     #[tokio::test]

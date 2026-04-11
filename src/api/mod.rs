@@ -263,6 +263,8 @@ fn record_usage_from_sse_line(
 }
 
 fn build_passthrough_sse_response(
+    endpoint: &'static str,
+    model: String,
     upstream: reqwest::Response,
     account: Arc<Account>,
     runtime_state: Arc<RuntimeStateStore>,
@@ -280,6 +282,7 @@ fn build_passthrough_sse_response(
             let chunk = match chunk {
                 Ok(b) => b,
                 Err(err) => {
+                    log_stream_read_failed(endpoint, &model, account.as_ref(), &err);
                     let _ = tx
                         .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
                         .await;
@@ -579,6 +582,132 @@ fn send_claude_upstream_error(err: UpstreamError) -> Response {
     }
 }
 
+fn truncate_for_log(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn preview_body_for_log(body: &[u8], max_chars: usize) -> String {
+    truncate_for_log(&String::from_utf8_lossy(body), max_chars)
+}
+
+fn log_upstream_request_error(
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    err: &UpstreamError,
+) {
+    match err {
+        UpstreamError::Status { code, body } => tracing::warn!(
+            endpoint,
+            model = %model,
+            stream,
+            status = *code,
+            body = %preview_body_for_log(body, 240),
+            "request failed upstream"
+        ),
+        UpstreamError::Pick(msg) => tracing::warn!(
+            endpoint,
+            model = %model,
+            stream,
+            error = %truncate_for_log(msg, 240),
+            "request failed before upstream send"
+        ),
+        UpstreamError::Network(msg) => tracing::warn!(
+            endpoint,
+            model = %model,
+            stream,
+            error = %truncate_for_log(msg, 240),
+            "request failed before upstream send"
+        ),
+    }
+}
+
+fn log_request_completed(
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    status: StatusCode,
+    attempts: usize,
+    account: &Account,
+) {
+    if stream {
+        tracing::info!(
+            endpoint,
+            model = %model,
+            stream,
+            status = status.as_u16(),
+            attempts,
+            account = account.file_path(),
+            "stream request accepted by upstream"
+        );
+    } else {
+        tracing::info!(
+            endpoint,
+            model = %model,
+            stream,
+            status = status.as_u16(),
+            attempts,
+            account = account.file_path(),
+            "request completed"
+        );
+    }
+}
+
+fn log_response_read_failed(
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    account: &Account,
+    err: &reqwest::Error,
+) {
+    tracing::warn!(
+        endpoint,
+        model = %model,
+        stream,
+        account = account.file_path(),
+        error = %err,
+        "read upstream response failed"
+    );
+}
+
+fn log_stream_read_failed(
+    endpoint: &'static str,
+    model: &str,
+    account: &Account,
+    err: &reqwest::Error,
+) {
+    tracing::warn!(
+        endpoint,
+        model = %model,
+        stream = true,
+        account = account.file_path(),
+        error = %err,
+        "stream read from upstream failed"
+    );
+}
+
+fn log_stream_incomplete(
+    endpoint: &'static str,
+    model: &str,
+    account: &Account,
+    reason: &'static str,
+) {
+    tracing::warn!(
+        endpoint,
+        model = %model,
+        stream = true,
+        account = account.file_path(),
+        reason,
+        "stream ended without a complete response"
+    );
+}
+
 fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
     let mut passthrough = HeaderMap::new();
     for name in [
@@ -648,7 +777,8 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         }
     };
 
-    let (upstream, account, _attempts) = match state
+    let endpoint = "/v1/responses";
+    let (upstream, account, attempts) = match state
         .codex_client
         .send_with_retry(
             &state.manager,
@@ -663,16 +793,28 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         .await
     {
         Ok(v) => v,
-        Err(err) => return send_upstream_error(err),
+        Err(err) => {
+            log_upstream_request_error(endpoint, &base_model, stream, &err);
+            return send_upstream_error(err);
+        }
     };
 
     if stream {
+        let status = upstream.status();
         let now_ms = crate::core::now_unix_ms();
         record_client_success(
             account.as_ref(),
             state.request_stats.as_ref(),
             state.runtime_state.as_ref(),
             now_ms,
+        );
+        log_request_completed(
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            account.as_ref(),
         );
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -688,6 +830,8 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             axum::http::HeaderValue::from_static("keep-alive"),
         );
         return build_passthrough_sse_response(
+            endpoint,
+            base_model,
             upstream,
             account,
             state.runtime_state.clone(),
@@ -699,6 +843,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(err) => {
+            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
             return send_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("读取上游响应失败: {err}"),
@@ -718,6 +863,14 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         state.request_stats.as_ref(),
         state.runtime_state.as_ref(),
         now_ms,
+    );
+    log_request_completed(
+        endpoint,
+        &base_model,
+        false,
+        status,
+        attempts,
+        account.as_ref(),
     );
 
     let mut resp = Response::new(Body::from(bytes));
@@ -1090,7 +1243,8 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         }
     };
 
-    let (upstream, account, _attempts) = match state
+    let endpoint = "/v1/messages";
+    let (upstream, account, attempts) = match state
         .codex_client
         .send_with_retry(
             &state.manager,
@@ -1105,13 +1259,27 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         .await
     {
         Ok(v) => v,
-        Err(err) => return send_claude_upstream_error(err),
+        Err(err) => {
+            log_upstream_request_error(endpoint, &base_model, stream, &err);
+            return send_claude_upstream_error(err);
+        }
     };
 
     if stream {
+        let status = upstream.status();
+        log_request_completed(
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            account.as_ref(),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
+        let account_for_log = account.clone();
+        let model_for_log = base_model.clone();
         tokio::spawn(async move {
             let mut buf = BytesMut::new();
             let mut state = ClaudeStreamState::new(&base_model);
@@ -1121,6 +1289,12 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                 let chunk = match chunk {
                     Ok(b) => b,
                     Err(err) => {
+                        log_stream_read_failed(
+                            endpoint,
+                            &model_for_log,
+                            account_for_log.as_ref(),
+                            &err,
+                        );
                         let _ = tx
                             .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
                             .await;
@@ -1161,6 +1335,13 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                     runtime_state.as_ref(),
                     now_ms,
                 );
+            } else {
+                log_stream_incomplete(
+                    endpoint,
+                    &model_for_log,
+                    account_for_log.as_ref(),
+                    "missing response.completed",
+                );
             }
         });
 
@@ -1189,6 +1370,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(err) => {
+            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
             return send_claude_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -1199,6 +1381,13 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
 
     let result = convert_codex_full_sse_to_claude_response_with_meta(&bytes, &base_model);
     if !result.found_completed || result.json.is_empty() {
+        tracing::warn!(
+            endpoint,
+            model = %base_model,
+            stream = false,
+            account = account.file_path(),
+            "messages non-stream response missing response.completed"
+        );
         return send_claude_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -1206,6 +1395,13 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         );
     }
     if !result.has_text && !result.has_tool_use {
+        tracing::warn!(
+            endpoint,
+            model = %base_model,
+            stream = false,
+            account = account.file_path(),
+            "messages non-stream response was empty"
+        );
         return send_claude_error(
             StatusCode::BAD_REQUEST,
             "invalid_response",
@@ -1219,6 +1415,14 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         state.request_stats.as_ref(),
         state.runtime_state.as_ref(),
         now_ms,
+    );
+    log_request_completed(
+        endpoint,
+        &base_model,
+        false,
+        StatusCode::OK,
+        attempts,
+        account.as_ref(),
     );
 
     let mut resp = Response::new(Body::from(result.json));
@@ -1278,7 +1482,8 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         }
     };
 
-    let (upstream, account, _attempts) = match state
+    let endpoint = "/v1/responses/compact";
+    let (upstream, account, attempts) = match state
         .codex_client
         .send_with_retry(
             &state.manager,
@@ -1293,11 +1498,15 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         .await
     {
         Ok(v) => v,
-        Err(err) => return send_upstream_error(err),
+        Err(err) => {
+            log_upstream_request_error(endpoint, &base_model, stream, &err);
+            return send_upstream_error(err);
+        }
     };
 
     if stream {
         let headers = upstream.headers().clone();
+        let status = upstream.status();
         let now_ms = crate::core::now_unix_ms();
         record_client_success(
             account.as_ref(),
@@ -1305,7 +1514,17 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             state.runtime_state.as_ref(),
             now_ms,
         );
+        log_request_completed(
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            account.as_ref(),
+        );
         return build_passthrough_sse_response(
+            endpoint,
+            base_model,
             upstream,
             account,
             state.runtime_state.clone(),
@@ -1316,6 +1535,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(err) => {
+            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
             return send_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("读取上游响应失败: {err}"),
@@ -1335,6 +1555,14 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         state.request_stats.as_ref(),
         state.runtime_state.as_ref(),
         now_ms,
+    );
+    log_request_completed(
+        endpoint,
+        &base_model,
+        false,
+        StatusCode::OK,
+        attempts,
+        account.as_ref(),
     );
 
     let mut resp = Response::new(Body::from(bytes));
@@ -1441,8 +1669,9 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         }
     };
 
+    let endpoint = "/v1/chat/completions";
     if stream {
-        let (upstream, account, _attempts) = match state
+        let (upstream, account, attempts) = match state
             .codex_client
             .send_with_retry(
                 &state.manager,
@@ -1457,13 +1686,26 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             .await
         {
             Ok(v) => v,
-            Err(err) => return send_upstream_error(err),
+            Err(err) => {
+                log_upstream_request_error(endpoint, &base_model, true, &err);
+                return send_upstream_error(err);
+            }
         };
 
+        let status = upstream.status();
+        log_request_completed(
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            account.as_ref(),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let account = account.clone();
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
+        let model_for_log = base_model.clone();
         tokio::spawn(async move {
             let mut buf = BytesMut::new();
             let mut state = StreamState::new(&base_model);
@@ -1473,6 +1715,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 let chunk = match chunk {
                     Ok(b) => b,
                     Err(err) => {
+                        log_stream_read_failed(endpoint, &model_for_log, account.as_ref(), &err);
                         let _ = tx
                             .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
                             .await;
@@ -1530,6 +1773,13 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     now_ms,
                 );
                 let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
+            } else {
+                log_stream_incomplete(
+                    endpoint,
+                    &model_for_log,
+                    account.as_ref(),
+                    "missing usable output",
+                );
             }
         });
 
@@ -1557,7 +1807,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
     let mut excluded_for_empty = HashSet::new();
     for empty_attempt in 0..=state.empty_retry_max {
-        let (upstream, account, _attempts) = match state
+        let (upstream, account, attempts) = match state
             .codex_client
             .send_with_retry_excluding(
                 &state.manager,
@@ -1573,12 +1823,16 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             .await
         {
             Ok(v) => v,
-            Err(err) => return send_upstream_error(err),
+            Err(err) => {
+                log_upstream_request_error(endpoint, &base_model, false, &err);
+                return send_upstream_error(err);
+            }
         };
 
         let bytes = match upstream.bytes().await {
             Ok(b) => b,
             Err(err) => {
+                log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
                 return send_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("读取上游响应失败: {err}"),
@@ -1601,6 +1855,14 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     state.request_stats.as_ref(),
                     state.runtime_state.as_ref(),
                     now_ms,
+                );
+                log_request_completed(
+                    endpoint,
+                    &base_model,
+                    false,
+                    StatusCode::OK,
+                    attempts,
+                    account.as_ref(),
                 );
                 let mut resp = Response::new(Body::from(out));
                 *resp.status_mut() = StatusCode::OK;
@@ -1628,6 +1890,13 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 );
             }
             ChatNonStreamOutcome::MissingCompleted => {
+                tracing::warn!(
+                    endpoint,
+                    model = %base_model,
+                    stream = false,
+                    account = account.file_path(),
+                    "chat non-stream response missing response.completed"
+                );
                 return send_error(
                     StatusCode::BAD_GATEWAY,
                     "上游响应缺少 response.completed",
@@ -2415,5 +2684,11 @@ mod tests {
         assert_eq!(append_value["input"], "next turn");
         assert_eq!(append_value["instructions"], "keep");
         assert_eq!(append_value["stream"], true);
+    }
+
+    #[test]
+    fn api_preview_body_for_log_truncates_long_payloads() {
+        let preview = preview_body_for_log("你好abcdef".as_bytes(), 4);
+        assert_eq!(preview, "你好ab...");
     }
 }
