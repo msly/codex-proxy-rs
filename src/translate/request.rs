@@ -29,6 +29,22 @@ pub fn build_reverse_tool_name_map_from_value(v: &Value) -> HashMap<String, Stri
         .collect()
 }
 
+pub(crate) fn normalize_codex_instructions(v: &mut Value) {
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+
+    let needs_default = match obj.get("instructions") {
+        None => true,
+        Some(Value::Null) => true,
+        _ => false,
+    };
+
+    if needs_default {
+        obj.insert("instructions".to_string(), Value::String(String::new()));
+    }
+}
+
 fn convert_existing_input(model_name: &str, mut v: Value, stream: bool) -> Value {
     // input 为字符串时，转换为标准消息数组
     if let Some(input) = v.get("input").and_then(Value::as_str) {
@@ -63,10 +79,7 @@ fn convert_existing_input(model_name: &str, mut v: Value, stream: bool) -> Value
         }
     }
 
-    // instructions 必须存在
-    if v.get("instructions").is_none() {
-        set(&mut v, &["instructions"], Value::String(String::new()));
-    }
+    normalize_codex_instructions(&mut v);
 
     // 删除上游不支持的参数（对齐 Go：这里只做最小子集）
     for key in [

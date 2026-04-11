@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
@@ -398,6 +398,72 @@ pub fn convert_stream_chunk(
             Vec::new()
         }
     }
+}
+
+pub fn extract_completed_response_payload(data: &[u8]) -> Option<Vec<u8>> {
+    let mut output_items_by_index = BTreeMap::<i64, Value>::new();
+    let mut output_items_fallback = Vec::<Value>::new();
+
+    for line in data.split(|&b| b == b'\n') {
+        let line = line.trim_ascii();
+        if !line.starts_with(DATA_PREFIX) {
+            continue;
+        }
+        let payload = line[DATA_PREFIX.len()..].trim_ascii();
+        if payload.is_empty() || payload == b"[DONE]" {
+            continue;
+        }
+
+        let root: Value = match serde_json::from_slice(payload) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        match root.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "response.output_item.done" => {
+                let item = root.get("item").cloned().unwrap_or(Value::Null);
+                if item.is_null() {
+                    continue;
+                }
+                if let Some(idx) = root.get("output_index").and_then(Value::as_i64) {
+                    output_items_by_index.insert(idx, item);
+                } else {
+                    output_items_fallback.push(item);
+                }
+            }
+            "response.completed" => {
+                let mut completed = root;
+                let should_patch_output = match completed
+                    .get("response")
+                    .and_then(|resp| resp.get("output"))
+                {
+                    None => true,
+                    Some(Value::Null) => true,
+                    Some(Value::Array(items)) if items.is_empty() => true,
+                    _ => false,
+                };
+
+                if should_patch_output
+                    && (!output_items_by_index.is_empty() || !output_items_fallback.is_empty())
+                {
+                    let mut patched_output = Vec::with_capacity(
+                        output_items_by_index.len() + output_items_fallback.len(),
+                    );
+                    patched_output.extend(output_items_by_index.into_values());
+                    patched_output.extend(output_items_fallback);
+                    if let Some(resp) = completed.get_mut("response").and_then(Value::as_object_mut)
+                    {
+                        resp.insert("output".to_string(), Value::Array(patched_output));
+                    }
+                }
+
+                return serde_json::to_vec(&completed).ok();
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 pub fn convert_non_stream_response(

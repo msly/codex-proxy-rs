@@ -7,7 +7,10 @@ pub use claude::{
     convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
 };
 pub use request::{build_reverse_tool_name_map, convert_openai_request_to_codex};
-pub use response::{StreamState, convert_non_stream_response, convert_stream_chunk};
+pub use response::{
+    StreamState, convert_non_stream_response, convert_stream_chunk,
+    extract_completed_response_payload,
+};
 
 #[cfg(test)]
 mod tests {
@@ -75,5 +78,18 @@ mod tests {
 
         assert_eq!(v["text"]["format"]["type"], "json_object");
         assert_eq!(v["instructions"], "Respond in JSON format.");
+    }
+
+    #[test]
+    fn translate_existing_input_null_instructions_normalizes_to_empty_string() {
+        let input = json!({
+            "input": "hi",
+            "instructions": null
+        });
+        let out =
+            convert_openai_request_to_codex("gpt-5.4", &serde_json::to_vec(&input).unwrap(), true);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(v["instructions"], "");
     }
 }

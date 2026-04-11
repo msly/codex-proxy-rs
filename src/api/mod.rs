@@ -28,13 +28,14 @@ use crate::quota::QuotaChecker;
 use crate::refresh::{Refresher, SaveQueue, refresh_account};
 use crate::state::RuntimeStateStore;
 use crate::thinking::apply::apply_thinking_to_value;
+use crate::translate::request::{
+    build_reverse_tool_name_map_from_value, convert_openai_value_to_codex_value,
+    normalize_codex_instructions,
+};
 use crate::translate::{
     ClaudeStreamState, StreamState, convert_claude_request_to_openai,
     convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
-    convert_non_stream_response, convert_stream_chunk,
-};
-use crate::translate::request::{
-    build_reverse_tool_name_map_from_value, convert_openai_value_to_codex_value,
+    convert_non_stream_response, convert_stream_chunk, extract_completed_response_payload,
 };
 use crate::upstream::codex::CodexClient;
 use crate::upstream::codex::UpstreamError;
@@ -1277,49 +1278,46 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
 }
 
 fn clean_compact_value_to_vec(mut v: serde_json::Value, base_model: &str) -> Vec<u8> {
-    let obj = match v.as_object_mut() {
-        Some(m) => m,
-        None => {
-            v = serde_json::Value::Object(Default::default());
-            v.as_object_mut().unwrap()
-        }
-    };
+    {
+        let obj = match v.as_object_mut() {
+            Some(m) => m,
+            None => {
+                v = serde_json::Value::Object(Default::default());
+                v.as_object_mut().unwrap()
+            }
+        };
 
-    obj.insert(
-        "model".to_string(),
-        serde_json::Value::String(base_model.to_string()),
-    );
-
-    for key in [
-        "stream",
-        "stream_options",
-        "parallel_tool_calls",
-        "reasoning",
-        "include",
-        "previous_response_id",
-        "prompt_cache_retention",
-        "safety_identifier",
-        "generate",
-        "store",
-        "reasoning_effort",
-        "max_output_tokens",
-        "max_completion_tokens",
-        "temperature",
-        "top_p",
-        "truncation",
-        "context_management",
-        "user",
-        "service_tier",
-    ] {
-        obj.remove(key);
-    }
-
-    if !obj.contains_key("instructions") {
         obj.insert(
-            "instructions".to_string(),
-            serde_json::Value::String(String::new()),
+            "model".to_string(),
+            serde_json::Value::String(base_model.to_string()),
         );
+
+        for key in [
+            "stream",
+            "stream_options",
+            "parallel_tool_calls",
+            "reasoning",
+            "include",
+            "previous_response_id",
+            "prompt_cache_retention",
+            "safety_identifier",
+            "generate",
+            "store",
+            "reasoning_effort",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "truncation",
+            "context_management",
+            "user",
+            "service_tier",
+        ] {
+            obj.remove(key);
+        }
     }
+
+    normalize_codex_instructions(&mut v);
 
     serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec())
 }
@@ -1574,6 +1572,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
     )
 }
 
+#[derive(Debug)]
 enum ChatNonStreamOutcome {
     Success(String),
     Empty,
@@ -1587,41 +1586,29 @@ fn parse_chat_non_stream_response(
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
 ) -> ChatNonStreamOutcome {
-    for line in bytes.split(|&b| b == b'\n') {
-        let line = trim_ascii(line);
-        if !line.starts_with(b"data:") {
-            continue;
-        }
-        let payload = trim_ascii(&line[5..]);
-        if payload.is_empty() || payload == b"[DONE]" {
-            continue;
-        }
+    let Some(completed_payload) = extract_completed_response_payload(bytes) else {
+        return ChatNonStreamOutcome::MissingCompleted;
+    };
 
-        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
-            if v.get("type").and_then(|v| v.as_str()) != Some("response.completed") {
-                continue;
-            }
-
-            if let Some(usage) = extract_usage_tokens(&v) {
-                account.record_usage_detail(
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cached_tokens,
-                    usage.reasoning_tokens,
-                    usage.total_tokens,
-                );
-                record_hourly_usage(runtime_state, now_ms, usage);
-            }
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&completed_payload) {
+        if let Some(usage) = extract_usage_tokens(&v) {
+            account.record_usage_detail(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cached_tokens,
+                usage.reasoning_tokens,
+                usage.total_tokens,
+            );
+            record_hourly_usage(runtime_state, now_ms, usage);
         }
-
-        let (out, has_output) = convert_non_stream_response(payload, reverse_tool_map);
-        if has_output && !out.is_empty() {
-            return ChatNonStreamOutcome::Success(out);
-        }
-        return ChatNonStreamOutcome::Empty;
     }
 
-    ChatNonStreamOutcome::MissingCompleted
+    let (out, has_output) = convert_non_stream_response(&completed_payload, reverse_tool_map);
+    if has_output && !out.is_empty() {
+        ChatNonStreamOutcome::Success(out)
+    } else {
+        ChatNonStreamOutcome::Empty
+    }
 }
 
 fn trim_ascii(input: &[u8]) -> &[u8] {
@@ -2148,9 +2135,11 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{Account, TokenData};
     use crate::state::RuntimeStateStore;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use serde_json::{Value, json};
     use tower::util::ServiceExt;
     use url::Url;
 
@@ -2265,5 +2254,58 @@ mod tests {
             body.contains("\"type\":\"done\""),
             "expected done payload, got body: {body}"
         );
+    }
+
+    #[test]
+    fn api_clean_compact_value_to_vec_normalizes_null_instructions() {
+        let body = json!({
+            "instructions": null,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+
+        let out = clean_compact_value_to_vec(body, "gpt-5.4");
+        let value: Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(value["model"], "gpt-5.4");
+        assert_eq!(value["instructions"], "");
+        assert!(value.get("stream").is_none());
+        assert!(value.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn api_parse_chat_non_stream_response_uses_output_item_done_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime_state = RuntimeStateStore::new(dir.path());
+        let account = Account::new(
+            "a.json".to_string(),
+            TokenData {
+                id_token: String::new(),
+                access_token: "at".to_string(),
+                refresh_token: "rt".to_string(),
+                account_id: String::new(),
+                email: "a@example.com".to_string(),
+                expired: String::new(),
+                plan_type: String::new(),
+            },
+        );
+        let raw = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5.4\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+        );
+
+        let reverse = std::collections::HashMap::new();
+        let out =
+            parse_chat_non_stream_response(raw.as_bytes(), &reverse, &account, &runtime_state, 1);
+
+        match out {
+            ChatNonStreamOutcome::Success(json) => {
+                let value: Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(value["choices"][0]["message"]["content"], "hi");
+                assert_eq!(value["usage"]["completion_tokens"], 2);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 }

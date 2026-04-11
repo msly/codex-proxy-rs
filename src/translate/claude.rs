@@ -1,4 +1,6 @@
 use serde_json::{Map, Value, json};
+
+use super::response::extract_completed_response_payload;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub fn convert_claude_request_to_openai(claude_body: &[u8]) -> (Vec<u8>, String, bool) {
@@ -462,64 +464,51 @@ pub fn convert_codex_full_sse_to_claude_response_with_meta(
     data: &[u8],
     model: &str,
 ) -> ClaudeNonStreamResult {
-    for line in data.split(|&b| b == b'\n') {
-        let line = trim_ascii(line);
-        if !line.starts_with(b"data:") {
-            continue;
-        }
-        let payload = trim_ascii(&line[5..]);
-        if payload.is_empty() {
-            continue;
-        }
+    let Some(completed_payload) = extract_completed_response_payload(data) else {
+        return ClaudeNonStreamResult::default();
+    };
 
-        let v: Value = match serde_json::from_slice(payload) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("type").and_then(Value::as_str) != Some("response.completed") {
-            continue;
-        }
+    let v: Value = match serde_json::from_slice(&completed_payload) {
+        Ok(v) => v,
+        Err(_) => return ClaudeNonStreamResult::default(),
+    };
 
-        let mut has_text = false;
-        let mut has_tool_use = false;
-        if let Some(output) = v
-            .get("response")
-            .and_then(|r| r.get("output"))
-            .and_then(Value::as_array)
-        {
-            for item in output {
-                match item.get("type").and_then(Value::as_str).unwrap_or_default() {
-                    "message" => {
-                        if let Some(content) = item.get("content").and_then(Value::as_array) {
-                            for ci in content {
-                                if ci.get("type").and_then(Value::as_str) == Some("output_text")
-                                    && ci.get("text").and_then(Value::as_str).unwrap_or_default()
-                                        != ""
-                                {
-                                    has_text = true;
-                                    break;
-                                }
+    let mut has_text = false;
+    let mut has_tool_use = false;
+    if let Some(output) = v
+        .get("response")
+        .and_then(|r| r.get("output"))
+        .and_then(Value::as_array)
+    {
+        for item in output {
+            match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "message" => {
+                    if let Some(content) = item.get("content").and_then(Value::as_array) {
+                        for ci in content {
+                            if ci.get("type").and_then(Value::as_str) == Some("output_text")
+                                && ci.get("text").and_then(Value::as_str).unwrap_or_default() != ""
+                            {
+                                has_text = true;
+                                break;
                             }
                         }
                     }
-                    "function_call" => has_tool_use = true,
-                    _ => {}
                 }
+                "function_call" => has_tool_use = true,
+                _ => {}
             }
         }
-
-        let out = convert_codex_completed_to_claude(&v, model);
-        let json = serde_json::to_string(&out).unwrap_or_else(|_| String::new());
-
-        return ClaudeNonStreamResult {
-            json,
-            found_completed: true,
-            has_text,
-            has_tool_use,
-        };
     }
 
-    ClaudeNonStreamResult::default()
+    let out = convert_codex_completed_to_claude(&v, model);
+    let json = serde_json::to_string(&out).unwrap_or_else(|_| String::new());
+
+    ClaudeNonStreamResult {
+        json,
+        found_completed: true,
+        has_text,
+        has_tool_use,
+    }
 }
 
 fn convert_codex_completed_to_claude(completed_event: &Value, model: &str) -> Value {
@@ -841,5 +830,22 @@ mod tests {
         assert_eq!(v["stop_reason"], "end_turn");
         assert_eq!(v["usage"]["input_tokens"], 1);
         assert_eq!(v["usage"]["output_tokens"], 2);
+    }
+
+    #[test]
+    fn translate_claude_non_stream_uses_output_item_done_fallback() {
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"model\":\"gpt-5.4\"}}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+        );
+
+        let got = convert_codex_full_sse_to_claude_response_with_meta(sse.as_bytes(), "gpt-5.4");
+        assert!(got.found_completed);
+        assert!(got.has_text);
+
+        let v: Value = serde_json::from_str(&got.json).unwrap();
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "hi");
     }
 }
