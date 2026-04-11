@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
@@ -16,6 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 
 type TestWs =
@@ -47,6 +49,12 @@ struct UpstreamState {
     body: &'static str,
 }
 
+#[derive(Clone)]
+struct CapturedWsUpstreamState {
+    calls: Arc<AtomicUsize>,
+    headers: Arc<Mutex<Vec<HeaderMap>>>,
+}
+
 async fn upstream_responses(
     State(state): State<UpstreamState>,
     headers: HeaderMap,
@@ -67,6 +75,41 @@ async fn start_upstream(calls: Arc<AtomicUsize>, body: &'static str) -> Url {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
         .with_state(UpstreamState { calls, body });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn upstream_responses_capture_ws(
+    State(state): State<CapturedWsUpstreamState>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, &'static str) {
+    state.calls.fetch_add(1, Ordering::Relaxed);
+    state.headers.lock().unwrap().push(headers.clone());
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    match auth {
+        "Bearer at2" => (axum::http::StatusCode::OK, SSE_BODY_COMPLETED_ONLY_OUTPUT),
+        _ => (axum::http::StatusCode::FORBIDDEN, "forbidden"),
+    }
+}
+
+async fn start_capture_upstream_ws(
+    calls: Arc<AtomicUsize>,
+    headers: Arc<Mutex<Vec<HeaderMap>>>,
+) -> Url {
+    let app = Router::new()
+        .route(
+            "/backend-api/codex/responses",
+            post(upstream_responses_capture_ws),
+        )
+        .with_state(CapturedWsUpstreamState { calls, headers });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -252,4 +295,157 @@ async fn api_v1_responses_websocket_fallback_accepts_completed_only_output() {
     assert_eq!(request_stats.rpm(), 1);
     assert_eq!(runtime_state.hourly_trend().len(), 1);
     assert_eq!(runtime_state.hourly_trend()[0].requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_responses_websocket_fallback_accepts_append_and_forwards_handshake_headers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured_headers = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+    let base_url = start_capture_upstream_ws(calls.clone(), captured_headers.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at2").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+    let request_stats = Arc::new(api::RequestStats::default());
+    let runtime_state = Arc::new(RuntimeStateStore::new(dir.path()));
+
+    let state = AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: request_stats.clone(),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
+        on_401: None,
+    };
+
+    let app = api::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let mut request = format!("ws://{addr}/v1/responses")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Version",
+        axum::http::HeaderValue::from_static("0.120.0-ws"),
+    );
+    request.headers_mut().insert(
+        "Session_id",
+        axum::http::HeaderValue::from_str(&session_id).unwrap(),
+    );
+    request.headers_mut().insert(
+        "Originator",
+        axum::http::HeaderValue::from_static("codex-ws-test"),
+    );
+    request.headers_mut().insert(
+        "X-Codex-Turn-Metadata",
+        axum::http::HeaderValue::from_static("{\"turn\":\"ws\"}"),
+    );
+    request.headers_mut().insert(
+        "X-Client-Request-Id",
+        axum::http::HeaderValue::from_static("req-ws-1"),
+    );
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    ws.send(Message::Text(
+        serde_json::json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hi"
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        vec![recv_text_json(&mut ws).await, recv_text_json(&mut ws).await],
+        vec![
+            serde_json::json!({"type":"response.created","response":{"id":"r2"}}),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"r2",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+                }
+            }),
+        ]
+    );
+
+    ws.send(Message::Text(
+        serde_json::json!({
+            "type": "response.append",
+            "response": {
+                "input": "next turn"
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        vec![recv_text_json(&mut ws).await, recv_text_json(&mut ws).await],
+        vec![
+            serde_json::json!({"type":"response.created","response":{"id":"r2"}}),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"r2",
+                    "output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]
+                }
+            }),
+        ]
+    );
+
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(request_stats.rpm(), 2);
+    assert_eq!(runtime_state.hourly_trend().len(), 1);
+    assert_eq!(runtime_state.hourly_trend()[0].requests, 2);
+
+    let captured_headers = captured_headers.lock().unwrap();
+    assert_eq!(captured_headers.len(), 2);
+    for headers in captured_headers.iter() {
+        assert_eq!(
+            headers.get("Version").and_then(|v| v.to_str().ok()),
+            Some("0.120.0-ws")
+        );
+        assert_eq!(
+            headers.get("Session_id").and_then(|v| v.to_str().ok()),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            headers.get("Originator").and_then(|v| v.to_str().ok()),
+            Some("codex-ws-test")
+        );
+        assert_eq!(
+            headers
+                .get("X-Codex-Turn-Metadata")
+                .and_then(|v| v.to_str().ok()),
+            Some("{\"turn\":\"ws\"}")
+        );
+        assert_eq!(
+            headers
+                .get("X-Client-Request-Id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-ws-1")
+        );
+    }
 }

@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::Url;
+use reqwest::header::HeaderMap;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::core::{Account, Manager};
 
-pub const CODEX_CLIENT_VERSION: &str = "0.101.0";
-pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
+pub const CODEX_CLIENT_VERSION: &str = "0.120.0";
+pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.120.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 pub type On401Hook = Arc<dyn Fn(Arc<Account>) + Send + Sync>;
 
@@ -98,6 +100,7 @@ impl CodexClient {
         body: Vec<u8>,
         stream: bool,
         max_retry: usize,
+        passthrough_headers: Option<&HeaderMap>,
         on_401: Option<On401Hook>,
     ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
         self.send_with_retry_excluding(
@@ -107,6 +110,7 @@ impl CodexClient {
             body,
             stream,
             max_retry,
+            passthrough_headers,
             on_401,
             &HashSet::new(),
         )
@@ -121,6 +125,7 @@ impl CodexClient {
         body: Vec<u8>,
         stream: bool,
         max_retry: usize,
+        passthrough_headers: Option<&HeaderMap>,
         on_401: Option<On401Hook>,
         initial_excluded: &HashSet<String>,
     ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
@@ -129,9 +134,12 @@ impl CodexClient {
         let mut last_err: Option<UpstreamError> = None;
 
         for attempt in 0..max_attempts {
-            let account = manager
-                .pick_excluding(model, &excluded)
-                .map_err(UpstreamError::Pick)?;
+            let account = match manager.pick_excluding(model, &excluded) {
+                Ok(account) => account,
+                Err(err) => {
+                    return Err(last_err.unwrap_or_else(|| UpstreamError::Pick(err)));
+                }
+            };
             excluded.insert(account.file_path().to_string());
 
             let token = account.token().access_token.clone();
@@ -142,13 +150,12 @@ impl CodexClient {
                 .post(url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-                .header("Version", CODEX_CLIENT_VERSION)
-                .header("Session_id", Uuid::new_v4().to_string())
                 .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
                 .header("Origin", "https://chatgpt.com")
                 .header(reqwest::header::REFERER, "https://chatgpt.com/")
-                .header("Originator", "codex_cli_rs")
                 .body(body.clone());
+
+            req = apply_identity_headers(req, passthrough_headers);
 
             if stream {
                 req = req.header(reqwest::header::ACCEPT, "text/event-stream");
@@ -220,18 +227,27 @@ impl CodexClient {
             let now_ms = crate::core::now_unix_ms();
             account.record_failure(now_ms);
 
-            self.apply_retry_side_effects(&account, status, &err_body, now_ms, on_401.as_ref());
+            let retry_as_capacity = should_treat_as_capacity_retry(status, &err_body);
+            self.apply_retry_side_effects(
+                &account,
+                status,
+                &err_body,
+                now_ms,
+                on_401.as_ref(),
+                retry_as_capacity,
+            );
 
-            if is_retryable_status(status) && attempt < max_attempts - 1 {
+            let effective_status = if retry_as_capacity { 429 } else { status };
+            let e = UpstreamError::Status {
+                code: effective_status,
+                body: err_body.clone(),
+            };
+            last_err = Some(e.clone());
+            if (is_retryable_status(status) || retry_as_capacity) && attempt < max_attempts - 1 {
                 continue;
             }
 
             account.record_client_failure();
-            let e = UpstreamError::Status {
-                code: status,
-                body: err_body,
-            };
-            last_err = Some(e);
             break;
         }
 
@@ -245,6 +261,7 @@ impl CodexClient {
         err_body: &[u8],
         now_ms: i64,
         on_401: Option<&On401Hook>,
+        retry_as_capacity: bool,
     ) {
         match status {
             401 => {
@@ -263,6 +280,14 @@ impl CodexClient {
             }
             403 => {
                 account.set_cooldown(5 * 60_000, now_ms);
+            }
+            _ if retry_as_capacity => {
+                let cooldown_ms = parse_retry_after_ms(
+                    err_body,
+                    now_ms,
+                    self.retry_policy.default_cooldown_429_ms.max(0),
+                );
+                account.set_quota_cooldown(cooldown_ms, now_ms);
             }
             _ => {}
         }
@@ -300,6 +325,60 @@ fn is_retryable_status(code: u16) -> bool {
         400 | 403 => false,
         _ => true,
     }
+}
+
+fn apply_identity_headers(
+    mut req: reqwest::RequestBuilder,
+    passthrough_headers: Option<&HeaderMap>,
+) -> reqwest::RequestBuilder {
+    req = match header_clone(passthrough_headers, "Version") {
+        Some(value) => req.header("Version", value),
+        None => req.header("Version", CODEX_CLIENT_VERSION),
+    };
+    req = match header_clone(passthrough_headers, "Session_id") {
+        Some(value) => req.header("Session_id", value),
+        None => req.header("Session_id", Uuid::new_v4().to_string()),
+    };
+    req = match header_clone(passthrough_headers, "Originator") {
+        Some(value) => req.header("Originator", value),
+        None => req.header("Originator", CODEX_ORIGINATOR),
+    };
+    for header_name in ["X-Codex-Turn-Metadata", "X-Client-Request-Id"] {
+        if let Some(value) = header_clone(passthrough_headers, header_name) {
+            req = req.header(header_name, value);
+        }
+    }
+    req
+}
+
+fn header_clone(
+    headers: Option<&HeaderMap>,
+    name: &'static str,
+) -> Option<reqwest::header::HeaderValue> {
+    headers.and_then(|headers| headers.get(name)).cloned()
+}
+
+fn should_treat_as_capacity_retry(status: u16, body: &[u8]) -> bool {
+    !matches!(status, 400 | 403 | 429) && is_capacity_error(body)
+}
+
+fn is_capacity_error(body: &[u8]) -> bool {
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| extract_capacity_message(&value).map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+    message
+        .to_ascii_lowercase()
+        .contains("selected model is at capacity")
+}
+
+fn extract_capacity_message<'a>(value: &'a Value) -> Option<&'a str> {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("error").and_then(Value::as_str))
 }
 
 fn parse_retry_after_ms(body: &[u8], now_ms: i64, default_ms: i64) -> i64 {
@@ -431,6 +510,10 @@ mod tests {
                 axum::http::StatusCode::TOO_MANY_REQUESTS,
                 r#"{"error":{"resets_in_seconds":7}}"#,
             ),
+            "Bearer atcap" => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":{"message":"selected model is at capacity","resets_in_seconds":9}}"#,
+            ),
             "Bearer at2" => (axum::http::StatusCode::OK, "data: ok\n\n"),
             _ => (axum::http::StatusCode::FORBIDDEN, "forbidden"),
         }
@@ -440,6 +523,31 @@ mod tests {
         let app = Router::new()
             .route("/backend-api/codex/responses", post(upstream_responses))
             .with_state(UpstreamState { calls });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct CapturedHeadersState {
+        headers: Arc<Mutex<Vec<HeaderMap>>>,
+    }
+
+    async fn capture_headers(
+        State(state): State<CapturedHeadersState>,
+        headers: HeaderMap,
+    ) -> (axum::http::StatusCode, &'static str) {
+        state.headers.lock().unwrap().push(headers);
+        (axum::http::StatusCode::OK, "ok")
+    }
+
+    async fn start_capture_headers_upstream(headers: Arc<Mutex<Vec<HeaderMap>>>) -> Url {
+        let app = Router::new()
+            .route("/backend-api/codex/responses", post(capture_headers))
+            .with_state(CapturedHeadersState { headers });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -481,7 +589,16 @@ mod tests {
         let url = client.responses_url().unwrap();
 
         let (resp, _acc, attempts) = client
-            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1, None)
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                None,
+                None,
+            )
             .await
             .expect("should succeed on second attempt");
 
@@ -528,6 +645,7 @@ mod tests {
                 b"{}".to_vec(),
                 true,
                 1,
+                None,
                 Some(on_401),
             )
             .await
@@ -571,7 +689,16 @@ mod tests {
         let url = client.responses_url().unwrap();
 
         let (resp, _acc, attempts) = client
-            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1, None)
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                None,
+                None,
+            )
             .await
             .expect("should retry on 429 and succeed");
 
@@ -632,7 +759,16 @@ mod tests {
         let url = client.responses_url().unwrap();
 
         let (resp, _acc, attempts) = client
-            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), false, 0, None)
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                false,
+                0,
+                None,
+                None,
+            )
             .await
             .expect("should succeed");
 
@@ -702,7 +838,16 @@ mod tests {
         let url = client.responses_url().unwrap();
 
         let (resp, _acc, attempts) = client
-            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), false, 0, None)
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                false,
+                0,
+                None,
+                None,
+            )
             .await
             .expect("should succeed");
 
@@ -736,7 +881,16 @@ mod tests {
         let url = client.responses_url().unwrap();
 
         let err = client
-            .send_with_retry(&manager, "gpt-4.1", url, b"{}".to_vec(), true, 1, None)
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                None,
+                None,
+            )
             .await
             .expect_err("403 should be non-retryable");
         match err {
@@ -791,6 +945,230 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upstream_send_with_retry_uses_default_identity_headers_when_passthrough_missing() {
+        let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let base_url = start_capture_headers_upstream(captured.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                false,
+                0,
+                None,
+                None,
+            )
+            .await
+            .expect("should succeed");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let headers = captured.lock().unwrap();
+        let headers = headers.first().expect("captured headers");
+        assert_eq!(
+            headers.get("Version").and_then(|v| v.to_str().ok()),
+            Some(CODEX_CLIENT_VERSION)
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some(CODEX_USER_AGENT)
+        );
+        assert_eq!(
+            headers.get("Originator").and_then(|v| v.to_str().ok()),
+            Some(CODEX_ORIGINATOR)
+        );
+        let session_id = headers
+            .get("Session_id")
+            .and_then(|v| v.to_str().ok())
+            .expect("Session_id header");
+        assert!(Uuid::parse_str(session_id).is_ok());
+        assert!(headers.get("X-Codex-Turn-Metadata").is_none());
+        assert!(headers.get("X-Client-Request-Id").is_none());
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_preserves_whitelisted_passthrough_headers() {
+        let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+        let base_url = start_capture_headers_upstream(captured.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let session_id = Uuid::new_v4().to_string();
+        let mut passthrough = HeaderMap::new();
+        passthrough.insert(
+            "Version",
+            axum::http::HeaderValue::from_static("0.120.0-test"),
+        );
+        passthrough.insert(
+            "Session_id",
+            axum::http::HeaderValue::from_str(&session_id).unwrap(),
+        );
+        passthrough.insert(
+            "Originator",
+            axum::http::HeaderValue::from_static("codex-proxy-test"),
+        );
+        passthrough.insert(
+            "X-Codex-Turn-Metadata",
+            axum::http::HeaderValue::from_static("{\"turn\":\"t1\"}"),
+        );
+        passthrough.insert(
+            "X-Client-Request-Id",
+            axum::http::HeaderValue::from_static("req-123"),
+        );
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                false,
+                0,
+                Some(&passthrough),
+                None,
+            )
+            .await
+            .expect("should succeed");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let headers = captured.lock().unwrap();
+        let headers = headers.first().expect("captured headers");
+        assert_eq!(
+            headers.get("Version").and_then(|v| v.to_str().ok()),
+            Some("0.120.0-test")
+        );
+        assert_eq!(
+            headers.get("Session_id").and_then(|v| v.to_str().ok()),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            headers.get("Originator").and_then(|v| v.to_str().ok()),
+            Some("codex-proxy-test")
+        );
+        assert_eq!(
+            headers
+                .get("X-Codex-Turn-Metadata")
+                .and_then(|v| v.to_str().ok()),
+            Some("{\"turn\":\"t1\"}")
+        );
+        assert_eq!(
+            headers
+                .get("X-Client-Request-Id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-123")
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+            Some(CODEX_USER_AGENT)
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_treats_capacity_error_as_retryable() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base_url = start_upstream(calls.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "atcap").await;
+        write_auth_file(dir.path(), "b.json", "at2").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let (resp, _acc, attempts) = client
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                None,
+                None,
+            )
+            .await
+            .expect("should retry capacity error and succeed");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let snap = manager.accounts_snapshot();
+        let a = snap
+            .iter()
+            .find(|a| a.file_path().ends_with("a.json"))
+            .unwrap();
+        assert_eq!(a.status(), crate::core::AccountStatus::Cooldown);
+        assert_eq!(a.used_percent_x100(), 10000);
+    }
+
+    #[tokio::test]
+    async fn upstream_send_with_retry_returns_capacity_error_when_no_other_account_available() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let base_url = start_upstream(calls.clone()).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "atcap").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new(base_url, "").unwrap();
+        let url = client.responses_url().unwrap();
+
+        let err = client
+            .send_with_retry(
+                &manager,
+                "gpt-4.1",
+                url,
+                b"{}".to_vec(),
+                true,
+                1,
+                None,
+                None,
+            )
+            .await
+            .expect_err("capacity error should be returned cleanly");
+
+        match err {
+            UpstreamError::Status { code, body } => {
+                assert_eq!(code, 429);
+                assert!(String::from_utf8_lossy(&body).contains("selected model is at capacity"));
+            }
+            other => panic!("expected upstream status error, got: {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
     #[derive(Clone)]
     struct ProxyState {
         manager: Arc<Manager>,
@@ -808,6 +1186,7 @@ mod tests {
                 b"{}".to_vec(),
                 true,
                 1,
+                None,
                 None,
             )
             .await

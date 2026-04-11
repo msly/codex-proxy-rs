@@ -579,7 +579,28 @@ fn send_claude_upstream_error(err: UpstreamError) -> Response {
     }
 }
 
+fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
+    let mut passthrough = HeaderMap::new();
+    for name in [
+        "Version",
+        "Session_id",
+        "Originator",
+        "X-Codex-Turn-Metadata",
+        "X-Client-Request-Id",
+    ] {
+        if let Some(value) = headers.get(name) {
+            passthrough.insert(name, value.clone());
+        }
+    }
+    if passthrough.is_empty() {
+        None
+    } else {
+        Some(passthrough)
+    }
+}
+
 async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -636,6 +657,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             codex_body,
             stream,
             state.max_retry,
+            passthrough_headers.as_ref(),
             state.on_401.clone(),
         )
         .await
@@ -707,12 +729,28 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
     resp
 }
 
-async fn v1_responses_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle_responses_ws(socket, state))
+async fn v1_responses_ws(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(&headers);
+    ws.on_upgrade(move |socket| handle_responses_ws(socket, state, passthrough_headers))
         .into_response()
 }
 
-async fn handle_responses_ws(mut socket: WebSocket, state: AppState) {
+#[derive(Default)]
+struct ResponsesWsSession {
+    last_request: Option<serde_json::Value>,
+    last_model: Option<String>,
+}
+
+async fn handle_responses_ws(
+    mut socket: WebSocket,
+    state: AppState,
+    passthrough_headers: Option<HeaderMap>,
+) {
+    let mut session = ResponsesWsSession::default();
     loop {
         let msg = match socket.recv().await {
             Some(Ok(m)) => m,
@@ -735,65 +773,26 @@ async fn handle_responses_ws(mut socket: WebSocket, state: AppState) {
                     .unwrap_or_default();
 
                 match event_type {
-                    "response.create" => {
-                        let response_value = match value.get("response") {
-                            Some(v) => v.clone(),
-                            None => {
-                                write_ws_error(
-                                    &mut socket,
-                                    "invalid_request_error",
-                                    "缺少 response 字段",
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-
-                        let mut request_value = response_value;
-                        match request_value.as_object_mut() {
-                            Some(obj) => {
-                                obj.insert("stream".to_string(), serde_json::Value::Bool(true));
-                            }
-                            None => {
-                                write_ws_error(
-                                    &mut socket,
-                                    "invalid_request_error",
-                                    "response 必须是对象",
-                                )
-                                .await;
-                                continue;
-                            }
-                        }
-
-                        let model = request_value
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        if model.trim().is_empty() {
-                            write_ws_error(&mut socket, "invalid_request_error", "缺少 model 字段")
-                                .await;
-                            continue;
-                        }
-
-                        let request_body = match serde_json::to_vec(&request_value) {
-                            Ok(b) => b,
-                            Err(_) => {
-                                write_ws_error(
-                                    &mut socket,
-                                    "invalid_request_error",
-                                    "序列化请求失败",
-                                )
-                                .await;
-                                continue;
-                            }
-                        };
-
-                        let stream_result =
-                            forward_responses_sse_as_ws(&mut socket, &state, request_body, &model)
-                                .await;
+                    "response.create" | "response.append" => {
+                        let (request_body, model) =
+                            match build_responses_ws_request(&value, &mut session) {
+                                Ok(v) => v,
+                                Err(message) => {
+                                    write_ws_error(&mut socket, "invalid_request_error", &message)
+                                        .await;
+                                    continue;
+                                }
+                            };
+                        let stream_result = forward_responses_sse_as_ws(
+                            &mut socket,
+                            &state,
+                            request_body,
+                            &model,
+                            passthrough_headers.as_ref(),
+                        )
+                        .await;
                         match stream_result {
-                            Ok(()) => return,
+                            Ok(()) => continue,
                             Err(ResponsesWsError::EmptyResponse) => {
                                 write_ws_error(&mut socket, "invalid_response", "empty response")
                                     .await;
@@ -839,11 +838,76 @@ enum ResponsesWsError {
     Local(String),
 }
 
+fn build_responses_ws_request(
+    value: &serde_json::Value,
+    session: &mut ResponsesWsSession,
+) -> Result<(Vec<u8>, String), String> {
+    let event_type = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let response_value = value
+        .get("response")
+        .ok_or_else(|| "缺少 response 字段".to_string())?;
+    let response_object = response_value
+        .as_object()
+        .ok_or_else(|| "response 必须是对象".to_string())?;
+
+    let mut request_value = match event_type {
+        "response.create" => serde_json::Value::Object(response_object.clone()),
+        "response.append" => {
+            let Some(previous) = session.last_request.clone() else {
+                return Err("response.append 之前必须先发送 response.create".to_string());
+            };
+            let mut merged = previous;
+            let merged_object = merged
+                .as_object_mut()
+                .ok_or_else(|| "response 必须是对象".to_string())?;
+            for (key, value) in response_object {
+                merged_object.insert(key.clone(), value.clone());
+            }
+            merged
+        }
+        _ => return Err("不支持的事件类型".to_string()),
+    };
+
+    let existing_model = request_value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string);
+    let model = response_object
+        .get("model")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string)
+        .or(existing_model)
+        .or_else(|| session.last_model.clone())
+        .ok_or_else(|| "缺少 model 字段".to_string())?;
+
+    let request_object = request_value
+        .as_object_mut()
+        .ok_or_else(|| "response 必须是对象".to_string())?;
+    request_object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    request_object.insert(
+        "model".to_string(),
+        serde_json::Value::String(model.clone()),
+    );
+
+    session.last_request = Some(request_value.clone());
+    session.last_model = Some(model.clone());
+
+    let request_body =
+        serde_json::to_vec(&request_value).map_err(|_| "序列化请求失败".to_string())?;
+    Ok((request_body, model))
+}
+
 async fn forward_responses_sse_as_ws(
     socket: &mut WebSocket,
     state: &AppState,
     request_body: Vec<u8>,
     model: &str,
+    passthrough_headers: Option<&HeaderMap>,
 ) -> Result<(), ResponsesWsError> {
     tracing::info!(model = %model, "responses ws: fallback to HTTP/SSE forwarding");
 
@@ -867,6 +931,7 @@ async fn forward_responses_sse_as_ws(
             codex_body,
             true,
             state.max_retry,
+            passthrough_headers,
             state.on_401.clone(),
         )
         .await
@@ -985,6 +1050,7 @@ async fn close_ws(socket: &mut WebSocket, code: CloseCode, reason: &str) {
 }
 
 async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1033,6 +1099,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             codex_body,
             true,
             state.max_retry,
+            passthrough_headers.as_ref(),
             state.on_401.clone(),
         )
         .await
@@ -1164,6 +1231,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
 }
 
 async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1219,6 +1287,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             codex_body,
             stream,
             state.max_retry,
+            passthrough_headers.as_ref(),
             state.on_401.clone(),
         )
         .await
@@ -1323,6 +1392,7 @@ fn clean_compact_value_to_vec(mut v: serde_json::Value, base_model: &str) -> Vec
 }
 
 async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1381,6 +1451,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 codex_body,
                 true,
                 state.max_retry,
+                passthrough_headers.as_ref(),
                 state.on_401.clone(),
             )
             .await
@@ -1495,6 +1566,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 codex_body.clone(),
                 true,
                 state.max_retry,
+                passthrough_headers.as_ref(),
                 state.on_401.clone(),
                 &excluded_for_empty,
             )
@@ -2307,5 +2379,41 @@ mod tests {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[test]
+    fn api_build_responses_ws_request_append_reuses_previous_model_and_replaces_input() {
+        let mut session = ResponsesWsSession::default();
+
+        let create = json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hi",
+                "instructions": "keep"
+            }
+        });
+        let (create_body, create_model) =
+            build_responses_ws_request(&create, &mut session).expect("create request");
+        let create_value: Value = serde_json::from_slice(&create_body).unwrap();
+        assert_eq!(create_model, "gpt-5.4");
+        assert_eq!(create_value["model"], "gpt-5.4");
+        assert_eq!(create_value["input"], "hi");
+        assert_eq!(create_value["stream"], true);
+
+        let append = json!({
+            "type": "response.append",
+            "response": {
+                "input": "next turn"
+            }
+        });
+        let (append_body, append_model) =
+            build_responses_ws_request(&append, &mut session).expect("append request");
+        let append_value: Value = serde_json::from_slice(&append_body).unwrap();
+        assert_eq!(append_model, "gpt-5.4");
+        assert_eq!(append_value["model"], "gpt-5.4");
+        assert_eq!(append_value["input"], "next turn");
+        assert_eq!(append_value["instructions"], "keep");
+        assert_eq!(append_value["stream"], true);
     }
 }

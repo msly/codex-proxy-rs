@@ -19,6 +19,11 @@ struct UpstreamState {
     calls: Arc<AtomicUsize>,
 }
 
+#[derive(Clone)]
+struct CapturedHeadersState {
+    headers: Arc<Mutex<Vec<HeaderMap>>>,
+}
+
 async fn upstream_responses(
     State(state): State<UpstreamState>,
     headers: HeaderMap,
@@ -69,6 +74,33 @@ async fn start_upstream(calls: Arc<AtomicUsize>) -> Url {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
         .with_state(UpstreamState { calls });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn upstream_capture_headers(
+    State(state): State<CapturedHeadersState>,
+    headers: HeaderMap,
+) -> (axum::http::StatusCode, &'static str) {
+    state.headers.lock().unwrap().push(headers);
+    (
+        axum::http::StatusCode::OK,
+        r#"{"id":"r-capture","object":"response"}"#,
+    )
+}
+
+async fn start_upstream_capture_headers(headers: Arc<Mutex<Vec<HeaderMap>>>) -> Url {
+    let app = Router::new()
+        .route(
+            "/backend-api/codex/responses",
+            post(upstream_capture_headers),
+        )
+        .with_state(CapturedHeadersState { headers });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -286,6 +318,87 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
     assert_eq!(trend[0].input_tokens, 11);
     assert_eq!(trend[0].output_tokens, 7);
     assert_eq!(trend[0].total_tokens, 18);
+}
+
+#[tokio::test]
+async fn api_v1_responses_forwards_whitelisted_codex_identity_headers() {
+    let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+    let base_url = start_upstream_capture_headers(captured.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at2").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let state = AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+    };
+
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let app = api::router(state);
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header("Version", "0.120.0-client")
+                .header("Session_id", &session_id)
+                .header("Originator", "codex-proxy-test")
+                .header("X-Codex-Turn-Metadata", "{\"turn\":\"outer\"}")
+                .header("X-Client-Request-Id", "req-http-1")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let captured = captured.lock().unwrap();
+    let headers = captured.first().expect("captured upstream headers");
+    assert_eq!(
+        headers.get("Version").and_then(|v| v.to_str().ok()),
+        Some("0.120.0-client")
+    );
+    assert_eq!(
+        headers.get("Session_id").and_then(|v| v.to_str().ok()),
+        Some(session_id.as_str())
+    );
+    assert_eq!(
+        headers.get("Originator").and_then(|v| v.to_str().ok()),
+        Some("codex-proxy-test")
+    );
+    assert_eq!(
+        headers
+            .get("X-Codex-Turn-Metadata")
+            .and_then(|v| v.to_str().ok()),
+        Some("{\"turn\":\"outer\"}")
+    );
+    assert_eq!(
+        headers
+            .get("X-Client-Request-Id")
+            .and_then(|v| v.to_str().ok()),
+        Some("req-http-1")
+    );
 }
 
 #[tokio::test]
