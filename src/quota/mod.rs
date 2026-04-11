@@ -424,7 +424,10 @@ fn parse_retry_after_ms(body: &[u8], default_ms: i64) -> i64 {
                 }
             }
         }
-        if found && let Some(seconds) = current.as_i64() && seconds > 0 {
+        if found
+            && let Some(seconds) = current.as_i64()
+            && seconds > 0
+        {
             return seconds.saturating_mul(1000);
         }
     }
@@ -445,7 +448,10 @@ fn parse_retry_after_ms(body: &[u8], default_ms: i64) -> i64 {
                 }
             }
         }
-        if found && let Some(resets_at) = current.as_i64() && resets_at > now_s {
+        if found
+            && let Some(resets_at) = current.as_i64()
+            && resets_at > now_s
+        {
             return (resets_at - now_s).saturating_mul(1000);
         }
     }
@@ -621,7 +627,9 @@ mod tests {
         let qc = QuotaChecker::new(&base_url.to_string(), "", "", 1)
             .unwrap()
             .with_runtime_state(runtime_state.clone());
-        let outcome = qc.check_account(manager.accounts_snapshot()[0].clone()).await;
+        let outcome = qc
+            .check_account(manager.accounts_snapshot()[0].clone())
+            .await;
         assert!(matches!(outcome, CheckOutcome::Failed { .. }));
 
         let acc = manager.accounts_snapshot()[0].clone();

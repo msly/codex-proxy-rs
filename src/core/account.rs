@@ -353,14 +353,15 @@ impl Account {
             .into_iter()
             .flatten()
             .filter(|window| window.used_percent_x100.unwrap_or(-100) >= 10_000)
-            .filter_map(|window| window.reset_after_seconds.map(|seconds| (seconds, window.window_minutes)))
+            .filter_map(|window| {
+                window
+                    .reset_after_seconds
+                    .map(|seconds| (seconds, window.window_minutes))
+            })
             .max_by_key(|(seconds, minutes)| (*seconds, *minutes));
 
         if let Some((reset_after_seconds, _)) = exhausted_window {
-            self.set_quota_cooldown(
-                (reset_after_seconds as i64).saturating_mul(1000),
-                now_ms,
-            );
+            self.set_quota_cooldown((reset_after_seconds as i64).saturating_mul(1000), now_ms);
             return true;
         }
 

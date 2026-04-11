@@ -591,9 +591,7 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_send_with_retry_updates_used_percent_from_success_headers() {
-        async fn upstream_with_headers(
-            headers: HeaderMap,
-        ) -> Response {
+        async fn upstream_with_headers(headers: HeaderMap) -> Response {
             let mut resp = Response::new(Body::from("ok"));
             *resp.status_mut() = axum::http::StatusCode::OK;
             resp.headers_mut().insert(
@@ -646,15 +644,17 @@ mod tests {
             .iter()
             .find(|a| a.file_path().ends_with("a.json"))
             .unwrap();
-        assert!((a.used_percent() - 34.0).abs() < 0.01, "used={}", a.used_percent());
+        assert!(
+            (a.used_percent() - 34.0).abs() < 0.01,
+            "used={}",
+            a.used_percent()
+        );
         assert!(!a.quota_exhausted());
     }
 
     #[tokio::test]
     async fn upstream_send_with_retry_sets_quota_state_from_success_headers() {
-        async fn upstream_with_exhausted_headers(
-            headers: HeaderMap,
-        ) -> Response {
+        async fn upstream_with_exhausted_headers(headers: HeaderMap) -> Response {
             let mut resp = Response::new(Body::from("ok"));
             *resp.status_mut() = axum::http::StatusCode::OK;
             resp.headers_mut().insert(

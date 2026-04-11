@@ -413,7 +413,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let manager = Manager::new(dir.path());
 
-        assert_eq!(manager.scan_new_files().expect("initial scan"), ScanOutcome::default());
+        assert_eq!(
+            manager.scan_new_files().expect("initial scan"),
+            ScanOutcome::default()
+        );
 
         fs::write(
             dir.path().join("a.json"),
@@ -468,7 +471,10 @@ mod tests {
             }
         );
         assert_eq!(manager.account_count(), 1);
-        assert_eq!(manager.accounts_snapshot()[0].file_path(), a_path.to_string_lossy());
+        assert_eq!(
+            manager.accounts_snapshot()[0].file_path(),
+            a_path.to_string_lossy()
+        );
     }
 
     #[test]
@@ -515,7 +521,10 @@ mod tests {
         )
         .expect("write invalid.json");
 
-        assert_eq!(manager.scan_new_files().expect("scan"), ScanOutcome::default());
+        assert_eq!(
+            manager.scan_new_files().expect("scan"),
+            ScanOutcome::default()
+        );
         assert!(
             !invalid_path.exists(),
             "missing-access-token auth file should be deleted"

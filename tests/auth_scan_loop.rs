@@ -60,10 +60,9 @@ async fn auth_scan_loop_prunes_deleted_auth_file_without_refresh_loop() {
     assert_eq!(manager.account_count(), 1);
     assert!(runtime_state.save_now_if_dirty(manager.as_ref()).unwrap());
 
-    let state: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.path().join(".codex-proxy-state.json")).unwrap(),
-    )
-    .unwrap();
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join(".codex-proxy-state.json")).unwrap())
+            .unwrap();
     let accounts = state["accounts"].as_object().unwrap();
     assert_eq!(accounts.len(), 1);
     assert!(accounts.contains_key(&a_path.to_string_lossy().to_string()));

@@ -54,7 +54,7 @@ impl RefreshLoop {
     pub async fn start_loop(self, mut shutdown: watch::Receiver<bool>) {
         let mut refresh_ticker = tokio::time::interval(self.cfg.refresh_interval);
         refresh_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        
+
         // Go parity: startup does an immediate refresh.
         self.refresh_once().await;
 
