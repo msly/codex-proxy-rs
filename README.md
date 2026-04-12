@@ -20,6 +20,7 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - `GET /health`（不鉴权）
 - 多账号池 + 内部重试：
   - 从 `auth-dir` 读取 `*.json`（`access_token` 必填；`refresh_token` 可选）
+  - 兼容 `sub2api` 的单账号导出 JSON（顶层 `accounts[0].credentials`）
   - 账号切换重试（400/403 不重试，其它可重试）
   - **SSE gate**：仅在拿到上游 **2xx** 后才向下游返回流式响应（客户端“无感重试”）
 - 后台任务（可取消）：

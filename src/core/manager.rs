@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use serde::Deserialize;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use super::account::{Account, TokenData, TokenFile, parse_id_token_claims};
 use super::selector::{RoundRobinSelector, Selector};
@@ -276,8 +279,7 @@ fn delete_invalid_auth_file(path: &Path, reason: &str) {
 
 fn load_account_from_file(path: &Path) -> Result<Arc<Account>, LoadAccountError> {
     let data = fs::read_to_string(path).map_err(|e| LoadAccountError::Read(e.to_string()))?;
-    let tf: TokenFile =
-        serde_json::from_str(&data).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
+    let tf = parse_token_file(&data)?;
 
     if tf.access_token.trim().is_empty() {
         return Err(LoadAccountError::MissingAccessToken);
@@ -309,6 +311,99 @@ fn load_account_from_file(path: &Path) -> Result<Arc<Account>, LoadAccountError>
             plan_type,
         },
     )))
+}
+
+fn parse_token_file(data: &str) -> Result<TokenFile, LoadAccountError> {
+    let tf: TokenFile =
+        serde_json::from_str(data).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
+    if !tf.access_token.trim().is_empty() {
+        return Ok(tf);
+    }
+
+    match parse_sub2api_token_file(data)? {
+        Some(sub2api_tf) => Ok(sub2api_tf),
+        None => Ok(tf),
+    }
+}
+
+fn parse_sub2api_token_file(data: &str) -> Result<Option<TokenFile>, LoadAccountError> {
+    #[derive(Debug, Deserialize)]
+    struct Sub2ApiExport {
+        #[serde(default)]
+        accounts: Vec<Sub2ApiAccount>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Sub2ApiAccount {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        credentials: Sub2ApiCredentials,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct Sub2ApiCredentials {
+        #[serde(default)]
+        access_token: String,
+        #[serde(default)]
+        refresh_token: String,
+        #[serde(default)]
+        chatgpt_account_id: String,
+        #[serde(default)]
+        organization_id: String,
+        #[serde(default)]
+        expires_at: i64,
+    }
+
+    let export: Sub2ApiExport =
+        serde_json::from_str(data).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
+    if export.accounts.is_empty() {
+        return Ok(None);
+    }
+    if export.accounts.len() != 1 {
+        return Err(LoadAccountError::Parse(format!(
+            "sub2api 导出包含 {} 个 accounts，当前仅支持单账号文件",
+            export.accounts.len()
+        )));
+    }
+
+    let account = export
+        .accounts
+        .into_iter()
+        .next()
+        .expect("checked len == 1");
+    let credentials = account.credentials;
+    if credentials.access_token.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let account_id = if credentials.chatgpt_account_id.trim().is_empty() {
+        credentials.organization_id
+    } else {
+        credentials.chatgpt_account_id
+    };
+
+    Ok(Some(TokenFile {
+        id_token: String::new(),
+        access_token: credentials.access_token,
+        refresh_token: credentials.refresh_token,
+        account_id,
+        last_refresh: String::new(),
+        email: account.name,
+        token_type: "codex".to_string(),
+        expired: format_expires_at(credentials.expires_at),
+    }))
+}
+
+fn format_expires_at(expires_at_unix_seconds: i64) -> String {
+    if expires_at_unix_seconds <= 0 {
+        return String::new();
+    }
+
+    OffsetDateTime::from_unix_timestamp(expires_at_unix_seconds)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| expires_at_unix_seconds.to_string())
 }
 
 #[cfg(test)]
@@ -603,5 +698,87 @@ mod tests {
         let manager = Manager::new(dir.path());
         let err = manager.load_accounts().expect_err("should error");
         assert!(err.contains("未找到有效"), "got err: {err}");
+    }
+
+    #[test]
+    fn core_manager_loads_sub2api_single_account_export() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("sub.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "accounts": [
+    {
+      "name": "sub@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-sub",
+        "refresh_token": "rt-sub",
+        "chatgpt_account_id": "acc-sub",
+        "organization_id": "org-sub",
+        "expires_at": 4070908800
+      }
+    }
+  ],
+  "proxies": [],
+  "exported_at": "2026-04-11T11:35:09Z"
+}"#,
+        )
+        .expect("write sub.json");
+
+        let manager = Manager::new(dir.path());
+        let count = manager.load_accounts().expect("load accounts");
+        assert_eq!(count, 1);
+
+        let token = manager.accounts_snapshot()[0].token_clone();
+        assert_eq!(token.access_token, "at-sub");
+        assert_eq!(token.refresh_token, "rt-sub");
+        assert_eq!(token.account_id, "acc-sub");
+        assert_eq!(token.email, "sub@example.com");
+        assert_eq!(token.expired, "2099-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn core_manager_skips_sub2api_multi_account_export() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("sub.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "accounts": [
+    {
+      "name": "a@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-a",
+        "refresh_token": "rt-a",
+        "chatgpt_account_id": "acc-a",
+        "expires_at": 4070908800
+      }
+    },
+    {
+      "name": "b@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-b",
+        "refresh_token": "rt-b",
+        "chatgpt_account_id": "acc-b",
+        "expires_at": 4070908800
+      }
+    }
+  ],
+  "proxies": [],
+  "exported_at": "2026-04-11T11:35:09Z"
+}"#,
+        )
+        .expect("write sub.json");
+
+        let manager = Manager::new(dir.path());
+        let err = manager.load_accounts().expect_err("should error");
+        assert!(err.contains("未找到有效"), "got err: {err}");
+        assert!(
+            auth_path.exists(),
+            "multi-account export should not be deleted"
+        );
     }
 }
