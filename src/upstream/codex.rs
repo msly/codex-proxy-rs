@@ -38,6 +38,8 @@ pub struct CodexClient {
     http: reqwest::Client,
     base_url: Url,
     retry_policy: RetryPolicy,
+    client_version: String,
+    user_agent: String,
 }
 
 impl CodexClient {
@@ -71,7 +73,19 @@ impl CodexClient {
             http,
             base_url,
             retry_policy,
+            client_version: CODEX_CLIENT_VERSION.to_string(),
+            user_agent: CODEX_USER_AGENT.to_string(),
         }
+    }
+
+    pub fn with_client_identity(mut self, client_version: String, user_agent: String) -> Self {
+        if !client_version.is_empty() {
+            self.client_version = client_version;
+        }
+        if !user_agent.is_empty() {
+            self.user_agent = user_agent;
+        }
+        self
     }
 
     pub fn responses_url(&self) -> Result<Url, String> {
@@ -150,12 +164,17 @@ impl CodexClient {
                 .post(url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
-                .header(reqwest::header::USER_AGENT, CODEX_USER_AGENT)
                 .header("Origin", "https://chatgpt.com")
                 .header(reqwest::header::REFERER, "https://chatgpt.com/")
                 .body(body.clone());
+            req = match header_clone(passthrough_headers, "User-Agent")
+                .or_else(|| header_clone(passthrough_headers, "user-agent"))
+            {
+                Some(ua) => req.header(reqwest::header::USER_AGENT, ua),
+                None => req.header(reqwest::header::USER_AGENT, &self.user_agent),
+            };
 
-            req = apply_identity_headers(req, passthrough_headers);
+            req = self.apply_identity_headers(req, passthrough_headers);
 
             if stream {
                 req = req.header(reqwest::header::ACCEPT, "text/event-stream");
@@ -389,28 +408,31 @@ fn is_retryable_status(code: u16) -> bool {
     }
 }
 
-fn apply_identity_headers(
-    mut req: reqwest::RequestBuilder,
-    passthrough_headers: Option<&HeaderMap>,
-) -> reqwest::RequestBuilder {
-    req = match header_clone(passthrough_headers, "Version") {
-        Some(value) => req.header("Version", value),
-        None => req.header("Version", CODEX_CLIENT_VERSION),
-    };
-    req = match header_clone(passthrough_headers, "Session_id") {
-        Some(value) => req.header("Session_id", value),
-        None => req.header("Session_id", Uuid::new_v4().to_string()),
-    };
-    req = match header_clone(passthrough_headers, "Originator") {
-        Some(value) => req.header("Originator", value),
-        None => req.header("Originator", CODEX_ORIGINATOR),
-    };
-    for header_name in ["X-Codex-Turn-Metadata", "X-Client-Request-Id"] {
-        if let Some(value) = header_clone(passthrough_headers, header_name) {
-            req = req.header(header_name, value);
+impl CodexClient {
+    fn apply_identity_headers(
+        &self,
+        mut req: reqwest::RequestBuilder,
+        passthrough_headers: Option<&HeaderMap>,
+    ) -> reqwest::RequestBuilder {
+        req = match header_clone(passthrough_headers, "Version") {
+            Some(value) => req.header("Version", value),
+            None => req.header("Version", &self.client_version),
+        };
+        req = match header_clone(passthrough_headers, "Session_id") {
+            Some(value) => req.header("Session_id", value),
+            None => req.header("Session_id", Uuid::new_v4().to_string()),
+        };
+        req = match header_clone(passthrough_headers, "Originator") {
+            Some(value) => req.header("Originator", value),
+            None => req.header("Originator", CODEX_ORIGINATOR),
+        };
+        for header_name in ["X-Codex-Turn-Metadata", "X-Client-Request-Id"] {
+            if let Some(value) = header_clone(passthrough_headers, header_name) {
+                req = req.header(header_name, value);
+            }
         }
+        req
     }
-    req
 }
 
 fn header_clone(

@@ -104,6 +104,12 @@ pub struct Config {
     #[serde(rename = "api-keys")]
     #[serde(default)]
     pub api_keys: Vec<String>,
+
+    #[serde(rename = "client-version")]
+    pub client_version: String,
+
+    #[serde(rename = "user-agent")]
+    pub user_agent: String,
 }
 
 impl Default for Config {
@@ -142,6 +148,8 @@ impl Default for Config {
             selector: "round-robin".to_string(),
             refresh_batch_size: 0,
             api_keys: Vec::new(),
+            client_version: String::new(),
+            user_agent: String::new(),
         }
     }
 }
@@ -265,6 +273,9 @@ impl Config {
             "debug" | "info" | "warn" | "error" => {}
             _ => self.log_level = "info".to_string(),
         }
+
+        self.client_version = self.client_version.trim().to_string();
+        self.user_agent = self.user_agent.trim().to_string();
     }
 
     // Go 允许 ":8080" 形式，Rust bind 需要明确 host。

@@ -2018,6 +2018,10 @@ const MODEL_LIST: &[ModelListEntry] = &[
         base: "gpt-5.4-mini",
         suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
     },
+    ModelListEntry {
+        base: "gpt-5.5",
+        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
+    },
 ];
 
 #[derive(Debug, Serialize)]

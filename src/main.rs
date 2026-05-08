@@ -89,19 +89,22 @@ async fn main() -> Result<(), String> {
 
     let base_url = Url::parse(&cfg.base_url).map_err(|e| format!("base-url 无效: {e}"))?;
     let codex_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(5 * 60))?;
-    let codex_client = Arc::new(CodexClient::new_with_http_and_policy(
-        base_url.clone(),
-        codex_http,
-        RetryPolicy {
-            cooldown_401_ms: (cfg.cooldown_401_sec as i64).saturating_mul(1000),
-            default_cooldown_429_ms: (cfg.cooldown_429_sec as i64).saturating_mul(1000),
-            header_timeout: if cfg.upstream_timeout_sec > 0 {
-                Some(Duration::from_secs(cfg.upstream_timeout_sec))
-            } else {
-                None
+    let codex_client = Arc::new(
+        CodexClient::new_with_http_and_policy(
+            base_url.clone(),
+            codex_http,
+            RetryPolicy {
+                cooldown_401_ms: (cfg.cooldown_401_sec as i64).saturating_mul(1000),
+                default_cooldown_429_ms: (cfg.cooldown_429_sec as i64).saturating_mul(1000),
+                header_timeout: if cfg.upstream_timeout_sec > 0 {
+                    Some(Duration::from_secs(cfg.upstream_timeout_sec))
+                } else {
+                    None
+                },
             },
-        },
-    ));
+        )
+        .with_client_identity(cfg.client_version.clone(), cfg.user_agent.clone()),
+    );
 
     let quota_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(20))?;
     let quota_checker = Arc::new(
