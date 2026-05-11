@@ -14,7 +14,7 @@ use tower::util::ServiceExt;
 use url::Url;
 
 const UPSTREAM_SSE: &str = concat!(
-    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"created_at\":111,\"model\":\"gpt-5.4\",\"usage\":{\"input_tokens\":1}}}\n\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"created_at\":111,\"model\":\"gpt-5.4\"}}\n\n",
     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"created_at\":111,\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}}\n\n",
 );
@@ -79,7 +79,7 @@ fn build_state(base_url: Url, manager: Arc<Manager>) -> AppState {
 }
 
 #[tokio::test]
-async fn api_v1_messages_stream_converts_to_claude_events() {
+async fn api_v1_completions_non_stream_returns_text_completion() {
     let base_url = start_upstream().await;
 
     let dir = tempfile::tempdir().unwrap();
@@ -92,14 +92,52 @@ async fn api_v1_messages_stream_converts_to_claude_events() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/messages")
+                .uri("/v1/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "prompt": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(v["object"], "text_completion");
+    assert_eq!(v["choices"][0]["text"], "hi");
+}
+
+#[tokio::test]
+async fn api_v1_completions_stream_returns_text_completion_chunks() {
+    let base_url = start_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
                     serde_json::json!({
                         "model": "gpt-5.4",
                         "stream": true,
-                        "messages": [{"role":"user","content":"hi"}],
-                        "max_tokens": 16
+                        "prompt": "hi"
                     })
                     .to_string(),
                 ))
@@ -122,134 +160,9 @@ async fn api_v1_messages_stream_converts_to_claude_events() {
         .unwrap();
     let body = String::from_utf8_lossy(&bytes);
     assert!(
-        body.contains("event: message_start"),
-        "expected message_start, got body: {body}"
+        body.contains("\"object\":\"text_completion\""),
+        "body: {body}"
     );
-    assert!(
-        body.contains("event: content_block_delta"),
-        "expected content_block_delta, got body: {body}"
-    );
-    assert!(
-        body.contains("event: message_stop"),
-        "expected message_stop, got body: {body}"
-    );
-}
-
-#[tokio::test]
-async fn api_v1_messages_non_stream_returns_claude_json() {
-    let base_url = start_upstream().await;
-
-    let dir = tempfile::tempdir().unwrap();
-    write_auth_file(dir.path(), "a.json", "at").await;
-    let manager = Arc::new(Manager::new(dir.path()));
-    manager.load_accounts().unwrap();
-
-    let app = api::router(build_state(base_url, manager));
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "model": "gpt-5.4",
-                        "stream": false,
-                        "messages": [{"role":"user","content":"hi"}],
-                        "max_tokens": 16
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(
-        res.headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-        "application/json"
-    );
-
-    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["type"], "message");
-    assert_eq!(v["role"], "assistant");
-    assert_eq!(v["content"][0]["type"], "text");
-    assert_eq!(v["content"][0]["text"], "hi");
-    assert_eq!(v["stop_reason"], "end_turn");
-}
-
-#[tokio::test]
-async fn api_v1_messages_missing_model_returns_claude_error() {
-    let base_url = start_upstream().await;
-
-    let dir = tempfile::tempdir().unwrap();
-    write_auth_file(dir.path(), "a.json", "at").await;
-    let manager = Arc::new(Manager::new(dir.path()));
-    manager.load_accounts().unwrap();
-
-    let app = api::router(build_state(base_url, manager));
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(r#"{"stream":false,"messages":[]}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["type"], "error");
-    assert_eq!(v["error"]["type"], "invalid_request_error");
-}
-
-#[tokio::test]
-async fn api_v1_messages_count_tokens_returns_estimate() {
-    let base_url = start_upstream().await;
-
-    let dir = tempfile::tempdir().unwrap();
-    write_auth_file(dir.path(), "a.json", "at").await;
-    let manager = Arc::new(Manager::new(dir.path()));
-    manager.load_accounts().unwrap();
-
-    let app = api::router(build_state(base_url, manager));
-    let res = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/messages/count_tokens")
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    serde_json::json!({
-                        "model": "gpt-5.4",
-                        "system": "sys",
-                        "messages": [{"role":"user","content":[{"type":"text","text":"hello world"}]}],
-                        "tools": [{"name":"lookup","input_schema":{"type":"object"}}]
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert!(v["input_tokens"].as_i64().unwrap_or_default() > 0);
+    assert!(body.contains("\"text\":\"hi\""), "body: {body}");
+    assert!(body.contains("data: [DONE]"), "body: {body}");
 }

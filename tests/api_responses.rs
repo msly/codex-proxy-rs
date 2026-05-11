@@ -618,3 +618,117 @@ async fn api_v1_responses_persist_cached_and_reasoning_tokens_to_state_file() {
     assert_eq!(json["hourly"][0]["cached_tokens"], 4);
     assert_eq!(json["hourly"][0]["reasoning_tokens"], 2);
 }
+
+#[tokio::test]
+async fn api_v1_responses_rejects_function_call_output_without_context() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+    });
+
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": [
+                            {"type":"function_call_output","call_id":"call_1","output":"tool output"}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("function_call_output")
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn api_v1_responses_allows_function_call_output_with_previous_response_id() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+    });
+
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "previous_response_id": "resp_prev",
+                        "input": [
+                            {"type":"function_call_output","call_id":"call_1","output":"tool output"}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    assert!(calls.load(Ordering::Relaxed) >= 1);
+}

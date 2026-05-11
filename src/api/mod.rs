@@ -33,9 +33,11 @@ use crate::translate::request::{
     normalize_codex_instructions,
 };
 use crate::translate::{
-    ClaudeStreamState, StreamState, convert_claude_request_to_openai,
+    ClaudeStreamState, StreamState, convert_chat_completion_chunk_to_completion_chunk,
+    convert_chat_completion_to_completion, convert_claude_request_to_openai,
     convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
-    convert_non_stream_response, convert_stream_chunk, extract_completed_response_payload,
+    convert_completions_request_to_chat_value, convert_non_stream_response, convert_stream_chunk,
+    extract_completed_response_payload,
 };
 use crate::upstream::codex::CodexClient;
 use crate::upstream::codex::UpstreamError;
@@ -360,7 +362,9 @@ pub fn router(state: AppState) -> Router {
         .route("/responses/compact", post(v1_responses_compact))
         .route("/models", get(v1_models))
         .route("/chat/completions", post(v1_chat_completions))
+        .route("/completions", post(v1_completions))
         .route("/messages", post(v1_messages))
+        .route("/messages/count_tokens", post(v1_messages_count_tokens))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
     let non_v1 = Router::new()
@@ -761,6 +765,10 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         .unwrap_or(false);
 
     tracing::info!(model = %model, stream, "received /v1/responses request");
+
+    if let Err(message) = validate_function_call_output_context(&body_value) {
+        return send_error(StatusCode::BAD_REQUEST, &message, "invalid_request_error");
+    }
 
     let base_model = apply_thinking_to_value(&mut body_value, &model);
     let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, stream);
@@ -1434,6 +1442,181 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
     resp
 }
 
+async fn v1_messages_count_tokens(req: Request<Body>) -> Response {
+    let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return send_claude_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "读取请求体失败",
+            );
+        }
+    };
+
+    let value: serde_json::Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            return send_claude_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "非法 JSON",
+            );
+        }
+    };
+    if value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return send_claude_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "缺少 model 字段",
+        );
+    }
+
+    let tokens = estimate_claude_input_tokens(&value).max(1);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "input_tokens": tokens,
+        })),
+    )
+        .into_response()
+}
+
+fn estimate_claude_input_tokens(value: &serde_json::Value) -> i64 {
+    let mut chars = 0usize;
+    if let Some(system) = value.get("system") {
+        chars += count_text_chars(system);
+    }
+    if let Some(messages) = value.get("messages").and_then(|v| v.as_array()) {
+        for message in messages {
+            chars += count_text_chars(message.get("content").unwrap_or(&serde_json::Value::Null));
+        }
+    }
+    if let Some(tools) = value.get("tools") {
+        chars += tools.to_string().chars().count();
+    }
+    ((chars as i64) + 3) / 4
+}
+
+fn count_text_chars(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => s.chars().count(),
+        serde_json::Value::Array(items) => items.iter().map(count_text_chars).sum(),
+        serde_json::Value::Object(obj) => {
+            let mut n = 0usize;
+            for key in ["text", "content", "name", "input"] {
+                if let Some(v) = obj.get(key) {
+                    n += count_text_chars(v);
+                }
+            }
+            n
+        }
+        _ => 0,
+    }
+}
+
+fn validate_function_call_output_context(v: &serde_json::Value) -> Result<(), String> {
+    let Some(input) = v.get("input").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+
+    let mut has_function_call_output = false;
+    let mut has_tool_call_context = false;
+    for item in input {
+        match item
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+        {
+            "function_call_output" => has_function_call_output = true,
+            "function_call" | "tool_call" => {
+                if !item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                {
+                    has_tool_call_context = true;
+                }
+            }
+            _ => {}
+        }
+        if has_function_call_output && has_tool_call_context {
+            return Ok(());
+        }
+    }
+
+    if !has_function_call_output || has_tool_call_context {
+        return Ok(());
+    }
+    if !v
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        return Ok(());
+    }
+
+    let mut call_ids = HashSet::<String>::new();
+    let mut reference_ids = HashSet::<String>::new();
+    let mut missing_call_id = false;
+    for item in input {
+        match item
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+        {
+            "function_call_output" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim();
+                if call_id.is_empty() {
+                    missing_call_id = true;
+                } else {
+                    call_ids.insert(call_id.to_string());
+                }
+            }
+            "item_reference" => {
+                let id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .trim();
+                if !id.is_empty() {
+                    reference_ids.insert(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if missing_call_id {
+        return Err("function_call_output requires call_id on HTTP requests; continuation via previous_response_id requires a response id".to_string());
+    }
+
+    if !call_ids.is_empty()
+        && !reference_ids.is_empty()
+        && call_ids
+            .iter()
+            .all(|call_id| reference_ids.contains(call_id))
+    {
+        return Ok(());
+    }
+
+    Err("function_call_output requires matching function_call context, item_reference ids, or previous_response_id on HTTP requests".to_string())
+}
+
 async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>) -> Response {
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -1911,6 +2094,251 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         "empty response",
         "invalid_response",
     )
+}
+
+async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
+    let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return send_error(
+                StatusCode::BAD_REQUEST,
+                "读取请求体失败",
+                "invalid_request_error",
+            );
+        }
+    };
+
+    let raw_value: serde_json::Value = serde_json::from_slice(&raw)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let mut body_value = convert_completions_request_to_chat_value(raw_value);
+    let model = body_value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if model.trim().is_empty() {
+        return send_error(
+            StatusCode::BAD_REQUEST,
+            "缺少 model 字段",
+            "invalid_request_error",
+        );
+    }
+    let stream = body_value
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    tracing::info!(model = %model, stream, "received /v1/completions request");
+
+    let reverse_tool_map = build_reverse_tool_name_map_from_value(&body_value);
+    let base_model = apply_thinking_to_value(&mut body_value, &model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
+    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
+
+    let url = match state.codex_client.responses_url() {
+        Ok(u) => u,
+        Err(err) => {
+            return send_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("构建上游 URL 失败: {err}"),
+                "server_error",
+            );
+        }
+    };
+
+    let endpoint = "/v1/completions";
+    let (upstream, account, attempts) = match state
+        .codex_client
+        .send_with_retry(
+            &state.manager,
+            &base_model,
+            url,
+            codex_body,
+            true,
+            state.max_retry,
+            passthrough_headers.as_ref(),
+            state.on_401.clone(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            log_upstream_request_error(endpoint, &base_model, stream, &err);
+            return send_upstream_error(err);
+        }
+    };
+
+    if stream {
+        let status = upstream.status();
+        log_request_completed(
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            account.as_ref(),
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
+        let account = account.clone();
+        let request_stats = state.request_stats.clone();
+        let runtime_state = state.runtime_state.clone();
+        let model_for_log = base_model.clone();
+        tokio::spawn(async move {
+            let mut buf = BytesMut::new();
+            let mut state = StreamState::new(&base_model);
+            let mut upstream_stream = upstream.bytes_stream();
+
+            while let Some(chunk) = upstream_stream.next().await {
+                let chunk = match chunk {
+                    Ok(b) => b,
+                    Err(err) => {
+                        log_stream_read_failed(endpoint, &model_for_log, account.as_ref(), &err);
+                        let _ = tx
+                            .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
+                            .await;
+                        return;
+                    }
+                };
+
+                buf.extend_from_slice(&chunk);
+                while let Some(pos) = memchr(b'\n', buf.as_ref()) {
+                    let mut line = buf.split_to(pos + 1);
+                    line.truncate(pos);
+                    let line = trim_ascii(line.as_ref());
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let chunks = convert_stream_chunk(line, &mut state, &reverse_tool_map);
+                    for chunk in chunks {
+                        let completion_chunk =
+                            convert_chat_completion_chunk_to_completion_chunk(&chunk);
+                        let msg = format!("data: {completion_chunk}\n\n").into_bytes();
+                        if tx.send(Ok(msg)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if state.completed {
+                        break;
+                    }
+                }
+                if state.completed {
+                    break;
+                }
+            }
+
+            if state.completed && (state.has_text || state.has_tool_call || state.has_reasoning) {
+                let now_ms = crate::core::now_unix_ms();
+                let usage = UsageTokens {
+                    input_tokens: state.usage_input,
+                    output_tokens: state.usage_output,
+                    cached_tokens: state.usage_cached,
+                    reasoning_tokens: state.usage_reasoning,
+                    total_tokens: state.usage_total,
+                };
+                if usage.has_activity() {
+                    account.record_usage_detail(
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_tokens,
+                        usage.reasoning_tokens,
+                        usage.total_tokens,
+                    );
+                    record_hourly_usage(runtime_state.as_ref(), now_ms, usage);
+                }
+                record_client_success(
+                    account.as_ref(),
+                    request_stats.as_ref(),
+                    runtime_state.as_ref(),
+                    now_ms,
+                );
+                let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
+            } else {
+                log_stream_incomplete(
+                    endpoint,
+                    &model_for_log,
+                    account.as_ref(),
+                    "missing usable output",
+                );
+            }
+        });
+
+        let stream = unfold(rx, |mut rx| async move {
+            let item = rx.recv().await?;
+            Some((item, rx))
+        });
+
+        let mut resp = Response::new(Body::from_stream(stream));
+        *resp.status_mut() = StatusCode::OK;
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        resp.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+        resp.headers_mut().insert(
+            header::CONNECTION,
+            axum::http::HeaderValue::from_static("keep-alive"),
+        );
+        return resp;
+    }
+
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            return send_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("读取上游响应失败: {err}"),
+                "api_error",
+            );
+        }
+    };
+
+    let now_ms = crate::core::now_unix_ms();
+    match parse_chat_non_stream_response(
+        &bytes,
+        &reverse_tool_map,
+        account.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+    ) {
+        ChatNonStreamOutcome::Success(out) => {
+            record_client_success(
+                account.as_ref(),
+                state.request_stats.as_ref(),
+                state.runtime_state.as_ref(),
+                now_ms,
+            );
+            log_request_completed(
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::OK,
+                attempts,
+                account.as_ref(),
+            );
+            let mut resp = Response::new(Body::from(convert_chat_completion_to_completion(&out)));
+            *resp.status_mut() = StatusCode::OK;
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            resp
+        }
+        ChatNonStreamOutcome::Empty => send_error(
+            StatusCode::BAD_REQUEST,
+            "empty response",
+            "invalid_response",
+        ),
+        ChatNonStreamOutcome::MissingCompleted => send_error(
+            StatusCode::BAD_GATEWAY,
+            "上游响应缺少 response.completed",
+            "api_error",
+        ),
+    }
 }
 
 #[derive(Debug)]
