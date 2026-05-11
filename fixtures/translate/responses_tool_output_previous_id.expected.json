@@ -1,0 +1,18 @@
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "call_id": "call_1",
+      "output": "tool output",
+      "type": "function_call_output"
+    }
+  ],
+  "instructions": "",
+  "model": "gpt-5.4",
+  "parallel_tool_calls": true,
+  "previous_response_id": "resp_prev",
+  "store": false,
+  "stream": true
+}

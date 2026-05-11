@@ -1,0 +1,12 @@
+{
+  "model": "gpt-5.4",
+  "stream": true,
+  "previous_response_id": "resp_prev",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "tool output"
+    }
+  ]
+}

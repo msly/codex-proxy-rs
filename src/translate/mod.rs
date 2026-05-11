@@ -92,4 +92,42 @@ mod tests {
 
         assert_eq!(v["instructions"], "");
     }
+
+    #[test]
+    fn translate_existing_input_keeps_previous_response_id_for_tool_outputs() {
+        let input = json!({
+            "previous_response_id": "resp_prev",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "tool output"
+                }
+            ]
+        });
+        let out =
+            convert_openai_request_to_codex("gpt-5.4", &serde_json::to_vec(&input).unwrap(), true);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(v["previous_response_id"], "resp_prev");
+    }
+
+    #[test]
+    fn translate_existing_input_drops_previous_response_id_without_tool_outputs() {
+        let input = json!({
+            "previous_response_id": "resp_prev",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}]
+                }
+            ]
+        });
+        let out =
+            convert_openai_request_to_codex("gpt-5.4", &serde_json::to_vec(&input).unwrap(), true);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert!(v.get("previous_response_id").is_none());
+    }
 }

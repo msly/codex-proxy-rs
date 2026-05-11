@@ -81,9 +81,10 @@ fn convert_existing_input(model_name: &str, mut v: Value, stream: bool) -> Value
 
     normalize_codex_instructions(&mut v);
 
+    let keep_previous_response_id = input_has_function_call_output(&v);
+
     // 删除上游不支持的参数（对齐 Go：这里只做最小子集）
     for key in [
-        "previous_response_id",
         "stream_options",
         "prompt_cache_retention",
         "safety_identifier",
@@ -98,6 +99,9 @@ fn convert_existing_input(model_name: &str, mut v: Value, stream: bool) -> Value
         "variant",
     ] {
         delete(&mut v, &[key]);
+    }
+    if !keep_previous_response_id {
+        delete(&mut v, &["previous_response_id"]);
     }
 
     fix_tools_array_schema(&mut v);
@@ -507,6 +511,16 @@ fn ensure_input_contains_json(v: &mut Value) {
         format!("Respond in JSON format.\n\n{existing}")
     };
     set(v, &["instructions"], Value::String(next));
+}
+
+fn input_has_function_call_output(v: &Value) -> bool {
+    v.get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            })
+        })
 }
 
 fn build_tool_name_map(raw: &Value) -> HashMap<String, String> {
