@@ -2631,7 +2631,7 @@ async fn parse_multipart_image_request_value(
             continue;
         };
 
-        if name == "image" || name == "mask" {
+        if name == "image" || name == "image[]" || name == "mask" {
             let content_type = field.content_type().map(str::to_string);
             let bytes = field.bytes().await.map_err(|_| {
                 send_error(
@@ -2646,7 +2646,12 @@ async fn parse_multipart_image_request_value(
                 mime,
                 base64::engine::general_purpose::STANDARD.encode(bytes)
             );
-            insert_multipart_value(&mut object, &name, serde_json::Value::String(data_url));
+            let target_name = if name == "image[]" { "image" } else { &name };
+            insert_multipart_value(
+                &mut object,
+                target_name,
+                serde_json::Value::String(data_url),
+            );
         } else {
             let text = field.text().await.map_err(|_| {
                 send_error(

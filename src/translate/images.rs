@@ -21,11 +21,8 @@ pub fn convert_image_request_to_responses_value(v: Value, edit: bool) -> Value {
 
     let mut content = vec![json!({"type":"input_text","text": prompt})];
     if edit {
-        for image in collect_input_images(v.get("image")) {
+        for image in collect_input_images(v.get("image").or_else(|| v.get("images"))) {
             content.push(image);
-        }
-        if let Some(mask) = collect_single_input_image(v.get("mask")) {
-            content.push(mask);
         }
     }
 
@@ -44,19 +41,30 @@ pub fn convert_image_request_to_responses_value(v: Value, edit: bool) -> Value {
         "tool_choice": {"type":"image_generation"},
     });
 
-    if let Some(size) = v
-        .get("size")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-    {
-        set_image_tool_field(&mut out, "size", Value::String(size.to_string()));
+    for field in [
+        "size",
+        "quality",
+        "background",
+        "input_fidelity",
+        "moderation",
+    ] {
+        if let Some(value) = non_empty_string_field(&v, field) {
+            set_image_tool_field(&mut out, field, Value::String(value.to_string()));
+        }
     }
-    if let Some(quality) = v
-        .get("quality")
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-    {
-        set_image_tool_field(&mut out, "quality", Value::String(quality.to_string()));
+    for field in ["output_compression", "partial_images"] {
+        if let Some(value) = numeric_tool_field(&v, field) {
+            set_image_tool_field(&mut out, field, value);
+        }
+    }
+    if let Some(mask) = collect_single_input_image(v.get("mask")) {
+        if let Some(mask_url) = mask.get("image_url").and_then(Value::as_str) {
+            set_image_tool_path_field(
+                &mut out,
+                &["input_image_mask", "image_url"],
+                Value::String(mask_url.to_string()),
+            );
+        }
     }
 
     out
@@ -198,6 +206,7 @@ fn collect_single_input_image(value: Option<&Value>) -> Option<Value> {
         Value::Object(obj) => obj
             .get("url")
             .or_else(|| obj.get("image_url"))
+            .or_else(|| obj.get("image").and_then(|image| image.get("image_url")))
             .or_else(|| obj.get("b64_json"))
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
@@ -252,14 +261,53 @@ fn trim_ascii(input: &[u8]) -> &[u8] {
 }
 
 fn set_image_tool_field(v: &mut Value, key: &str, value: Value) {
+    set_image_tool_path_field(v, &[key], value);
+}
+
+fn set_image_tool_path_field(v: &mut Value, path: &[&str], value: Value) {
     if let Some(tool) = v
         .get_mut("tools")
         .and_then(Value::as_array_mut)
         .and_then(|tools| tools.first_mut())
         .and_then(Value::as_object_mut)
     {
-        tool.insert(key.to_string(), value);
+        set_object_path(tool, path, value);
     }
+}
+
+fn set_object_path(obj: &mut serde_json::Map<String, Value>, path: &[&str], value: Value) {
+    let Some((head, tail)) = path.split_first() else {
+        return;
+    };
+    if tail.is_empty() {
+        obj.insert((*head).to_string(), value);
+        return;
+    }
+    let entry = obj
+        .entry((*head).to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    if !entry.is_object() {
+        *entry = Value::Object(Default::default());
+    }
+    if let Some(next) = entry.as_object_mut() {
+        set_object_path(next, tail, value);
+    }
+}
+
+fn non_empty_string_field<'a>(v: &'a Value, field: &str) -> Option<&'a str> {
+    v.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn numeric_tool_field(v: &Value, field: &str) -> Option<Value> {
+    let value = v.get(field)?;
+    if value.is_number() {
+        return Some(value.clone());
+    }
+    let parsed = value.as_str()?.trim().parse::<i64>().ok()?;
+    Some(Value::Number(parsed.into()))
 }
 
 #[cfg(test)]
@@ -284,6 +332,42 @@ mod tests {
         assert_eq!(out["tools"][0]["type"], "image_generation");
         assert_eq!(out["tools"][0]["output_format"], "webp");
         assert_eq!(out["tools"][0]["size"], "1024x1024");
+    }
+
+    #[test]
+    fn image_request_to_responses_maps_edit_aliases_and_tool_options() {
+        let out = convert_image_request_to_responses_value(
+            json!({
+                "model":"gpt-5.4",
+                "prompt":"edit",
+                "images":[{"image_url":"data:image/png;base64,aW1hZ2Ux"},{"url":"data:image/png;base64,aW1hZ2Uy"}],
+                "mask":{"image_url":"data:image/png;base64,bWFzaw=="},
+                "background":"transparent",
+                "output_compression":80,
+                "partial_images":"2",
+                "input_fidelity":"high",
+                "moderation":"low"
+            }),
+            true,
+        );
+
+        assert_eq!(
+            out["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,aW1hZ2Ux"
+        );
+        assert_eq!(
+            out["input"][0]["content"][2]["image_url"],
+            "data:image/png;base64,aW1hZ2Uy"
+        );
+        assert_eq!(
+            out["tools"][0]["input_image_mask"]["image_url"],
+            "data:image/png;base64,bWFzaw=="
+        );
+        assert_eq!(out["tools"][0]["background"], "transparent");
+        assert_eq!(out["tools"][0]["output_compression"], 80);
+        assert_eq!(out["tools"][0]["partial_images"], 2);
+        assert_eq!(out["tools"][0]["input_fidelity"], "high");
+        assert_eq!(out["tools"][0]["moderation"], "low");
     }
 
     #[test]

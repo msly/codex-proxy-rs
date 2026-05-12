@@ -169,6 +169,67 @@ async fn api_v1_images_edits_includes_input_image() {
 }
 
 #[tokio::test]
+async fn api_v1_images_edits_accepts_json_images_and_mask_options() {
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let base_url = start_upstream(bodies.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager, dir.path()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "prompt": "make it blue",
+                        "images": [
+                            {"image_url": "data:image/png;base64,aW1hZ2Ux"},
+                            {"url": "data:image/png;base64,aW1hZ2Uy"}
+                        ],
+                        "mask": {"image_url": "data:image/png;base64,bWFzaw=="},
+                        "background": "transparent",
+                        "output_compression": 80,
+                        "partial_images": 2,
+                        "input_fidelity": "high",
+                        "moderation": "low"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(
+        bodies[0]["input"][0]["content"][1]["image_url"],
+        "data:image/png;base64,aW1hZ2Ux"
+    );
+    assert_eq!(
+        bodies[0]["input"][0]["content"][2]["image_url"],
+        "data:image/png;base64,aW1hZ2Uy"
+    );
+    assert_eq!(
+        bodies[0]["tools"][0]["input_image_mask"]["image_url"],
+        "data:image/png;base64,bWFzaw=="
+    );
+    assert_eq!(bodies[0]["tools"][0]["background"], "transparent");
+    assert_eq!(bodies[0]["tools"][0]["output_compression"], 80);
+    assert_eq!(bodies[0]["tools"][0]["partial_images"], 2);
+    assert_eq!(bodies[0]["tools"][0]["input_fidelity"], "high");
+    assert_eq!(bodies[0]["tools"][0]["moderation"], "low");
+}
+
+#[tokio::test]
 async fn api_v1_images_edits_accepts_multipart_image() {
     let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let base_url = start_upstream(bodies.clone()).await;
@@ -190,9 +251,17 @@ async fn api_v1_images_edits_accepts_multipart_image() {
         "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n",
         "b64_json\r\n",
         "--codexproxyboundary\r\n",
+        "Content-Disposition: form-data; name=\"image[]\"; filename=\"input-a.png\"\r\n",
+        "Content-Type: image/png\r\n\r\n",
+        "first\r\n",
+        "--codexproxyboundary\r\n",
         "Content-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\n",
         "Content-Type: image/png\r\n\r\n",
         "hello\r\n",
+        "--codexproxyboundary\r\n",
+        "Content-Disposition: form-data; name=\"mask\"; filename=\"mask.png\"\r\n",
+        "Content-Type: image/png\r\n\r\n",
+        "mask\r\n",
         "--codexproxyboundary--\r\n",
     );
 
@@ -224,7 +293,16 @@ async fn api_v1_images_edits_accepts_multipart_image() {
     assert_eq!(bodies[0]["input"][0]["content"][1]["type"], "input_image");
     assert_eq!(
         bodies[0]["input"][0]["content"][1]["image_url"],
+        "data:image/png;base64,Zmlyc3Q="
+    );
+    assert_eq!(bodies[0]["input"][0]["content"][2]["type"], "input_image");
+    assert_eq!(
+        bodies[0]["input"][0]["content"][2]["image_url"],
         "data:image/png;base64,aGVsbG8="
+    );
+    assert_eq!(
+        bodies[0]["tools"][0]["input_image_mask"]["image_url"],
+        "data:image/png;base64,bWFzaw=="
     );
 }
 
