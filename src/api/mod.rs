@@ -904,6 +904,8 @@ async fn v1_responses_ws(
 struct ResponsesWsSession {
     last_request: Option<serde_json::Value>,
     last_model: Option<String>,
+    last_response_id: Option<String>,
+    tool_call_ids: HashSet<String>,
 }
 
 async fn handle_responses_ws(
@@ -950,6 +952,7 @@ async fn handle_responses_ws(
                             request_body,
                             &model,
                             passthrough_headers.as_ref(),
+                            &mut session,
                         )
                         .await;
                         match stream_result {
@@ -1049,11 +1052,22 @@ fn build_responses_ws_request(
     let request_object = request_value
         .as_object_mut()
         .ok_or_else(|| "response 必须是对象".to_string())?;
+    if event_type == "response.append"
+        && request_object.get("previous_response_id").is_none()
+        && let Some(previous_response_id) = session.last_response_id.clone()
+    {
+        request_object.insert(
+            "previous_response_id".to_string(),
+            serde_json::Value::String(previous_response_id),
+        );
+    }
     request_object.insert("stream".to_string(), serde_json::Value::Bool(true));
     request_object.insert(
         "model".to_string(),
         serde_json::Value::String(model.clone()),
     );
+
+    validate_function_call_output_context_with_known_ids(&request_value, &session.tool_call_ids)?;
 
     session.last_request = Some(request_value.clone());
     session.last_model = Some(model.clone());
@@ -1069,6 +1083,7 @@ async fn forward_responses_sse_as_ws(
     request_body: Vec<u8>,
     model: &str,
     passthrough_headers: Option<&HeaderMap>,
+    session: &mut ResponsesWsSession,
 ) -> Result<(), ResponsesWsError> {
     tracing::info!(model = %model, "responses ws: fallback to HTTP/SSE forwarding");
 
@@ -1125,6 +1140,7 @@ async fn forward_responses_sse_as_ws(
 
             let mut outbound_text = None;
             if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                update_responses_ws_session_from_event(session, &v);
                 let had_stream_output = has_text || has_tool;
                 if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
                     match typ {
@@ -1522,6 +1538,13 @@ fn count_text_chars(value: &serde_json::Value) -> usize {
 }
 
 fn validate_function_call_output_context(v: &serde_json::Value) -> Result<(), String> {
+    validate_function_call_output_context_with_known_ids(v, &HashSet::new())
+}
+
+fn validate_function_call_output_context_with_known_ids(
+    v: &serde_json::Value,
+    known_call_ids: &HashSet<String>,
+) -> Result<(), String> {
     let Some(input) = v.get("input").and_then(|v| v.as_array()) else {
         return Ok(());
     };
@@ -1606,15 +1629,75 @@ fn validate_function_call_output_context(v: &serde_json::Value) -> Result<(), St
     }
 
     if !call_ids.is_empty()
-        && !reference_ids.is_empty()
         && call_ids
             .iter()
-            .all(|call_id| reference_ids.contains(call_id))
+            .all(|call_id| reference_ids.contains(call_id) || known_call_ids.contains(call_id))
     {
         return Ok(());
     }
 
     Err("function_call_output requires matching function_call context, item_reference ids, or previous_response_id on HTTP requests".to_string())
+}
+
+fn update_responses_ws_session_from_event(
+    session: &mut ResponsesWsSession,
+    event: &serde_json::Value,
+) {
+    let event_type = event
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    match event_type {
+        "response.created" | "response.completed" => {
+            if let Some(response_id) = event
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+            {
+                session.last_response_id = Some(response_id.to_string());
+            }
+            if let Some(output) = event
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .and_then(|value| value.as_array())
+            {
+                collect_tool_call_ids(output.iter(), &mut session.tool_call_ids);
+            }
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            if let Some(item) = event.get("item") {
+                collect_tool_call_id(item, &mut session.tool_call_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_tool_call_ids<'a>(
+    items: impl IntoIterator<Item = &'a serde_json::Value>,
+    ids: &mut HashSet<String>,
+) {
+    for item in items {
+        collect_tool_call_id(item, ids);
+    }
+}
+
+fn collect_tool_call_id(item: &serde_json::Value, ids: &mut HashSet<String>) {
+    let item_type = item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if item_type != "function_call" && item_type != "tool_call" {
+        return;
+    }
+    if let Some(call_id) = item
+        .get("call_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+    {
+        ids.insert(call_id.to_string());
+    }
 }
 
 async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -3116,6 +3199,109 @@ mod tests {
         assert_eq!(append_value["input"], "next turn");
         assert_eq!(append_value["instructions"], "keep");
         assert_eq!(append_value["stream"], true);
+    }
+
+    #[test]
+    fn api_build_responses_ws_request_append_adds_previous_response_id() {
+        let mut session = ResponsesWsSession::default();
+
+        let create = json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hi"
+            }
+        });
+        build_responses_ws_request(&create, &mut session).expect("create request");
+        update_responses_ws_session_from_event(
+            &mut session,
+            &json!({"type":"response.created","response":{"id":"resp_1"}}),
+        );
+
+        let append = json!({
+            "type": "response.append",
+            "response": {
+                "input": "next turn"
+            }
+        });
+        let (append_body, _) =
+            build_responses_ws_request(&append, &mut session).expect("append request");
+        let append_value: Value = serde_json::from_slice(&append_body).unwrap();
+
+        assert_eq!(append_value["previous_response_id"], "resp_1");
+    }
+
+    #[test]
+    fn api_build_responses_ws_request_append_allows_known_function_call_output() {
+        let mut session = ResponsesWsSession::default();
+        session.tool_call_ids.insert("call_1".to_string());
+
+        let create = json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hi"
+            }
+        });
+        build_responses_ws_request(&create, &mut session).expect("create request");
+
+        let append = json!({
+            "type": "response.append",
+            "response": {
+                "input": [
+                    {"type":"function_call_output","call_id":"call_1","output":"ok"}
+                ]
+            }
+        });
+
+        let (append_body, _) =
+            build_responses_ws_request(&append, &mut session).expect("append request");
+        let append_value: Value = serde_json::from_slice(&append_body).unwrap();
+        assert_eq!(append_value["input"][0]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn api_build_responses_ws_request_append_rejects_unknown_function_call_output() {
+        let mut session = ResponsesWsSession::default();
+
+        let create = json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hi"
+            }
+        });
+        build_responses_ws_request(&create, &mut session).expect("create request");
+
+        let append = json!({
+            "type": "response.append",
+            "response": {
+                "input": [
+                    {"type":"function_call_output","call_id":"call_1","output":"ok"}
+                ]
+            }
+        });
+
+        let err = build_responses_ws_request(&append, &mut session).unwrap_err();
+        assert!(err.contains("function_call_output"));
+    }
+
+    #[test]
+    fn api_update_responses_ws_session_tracks_response_and_tool_call_ids() {
+        let mut session = ResponsesWsSession::default();
+        update_responses_ws_session_from_event(
+            &mut session,
+            &json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp_1",
+                    "output":[{"type":"function_call","call_id":"call_1"}]
+                }
+            }),
+        );
+
+        assert_eq!(session.last_response_id.as_deref(), Some("resp_1"));
+        assert!(session.tool_call_ids.contains("call_1"));
     }
 
     #[test]
