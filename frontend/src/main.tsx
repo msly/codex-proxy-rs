@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, Database, RefreshCw, Server, Shield } from "lucide-react";
+import { Activity, Database, KeyRound, LogOut, RefreshCw, Server, Shield } from "lucide-react";
 import "./styles.css";
 
 type StatsResponse = {
@@ -73,8 +73,21 @@ type RateLimits = {
   image_concurrency: number;
 };
 
-async function fetchJson<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+type PersistenceStatus = {
+  enabled: boolean;
+  writer_running: boolean;
+  dropped_events: number;
+  write_errors: number;
+};
+
+const API_KEY_STORAGE = "codex_proxy_rs_admin_key";
+
+async function fetchJson<T>(path: string, apiKey: string): Promise<T> {
+  const headers = new Headers();
+  if (apiKey.trim()) {
+    headers.set("Authorization", `Bearer ${apiKey.trim()}`);
+  }
+  const res = await fetch(path, { headers });
   if (!res.ok) {
     throw new Error(`${res.status} ${res.statusText}`);
   }
@@ -86,6 +99,9 @@ function App() {
   const [requests, setRequests] = useState<RequestLog[]>([]);
   const [usage, setUsage] = useState<UsageLog[]>([]);
   const [limits, setLimits] = useState<RateLimits | null>(null);
+  const [persistence, setPersistence] = useState<PersistenceStatus | null>(null);
+  const [apiKey, setApiKey] = useState(() => window.sessionStorage.getItem(API_KEY_STORAGE) ?? "");
+  const [apiKeyDraft, setApiKeyDraft] = useState(apiKey);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -93,18 +109,21 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const [statsData, requestData, usageData, limitData] = await Promise.all([
-        fetchJson<StatsResponse>("/stats"),
-        fetchJson<{ data: RequestLog[] }>("/admin/request-logs?limit=80").catch(() => ({ data: [] })),
-        fetchJson<{ data: UsageLog[] }>("/admin/usage-logs?limit=80").catch(() => ({ data: [] })),
-        fetchJson<{ data: RateLimits | null }>("/admin/rate-limits").catch(() => ({ data: null }))
+      const [statsData, requestData, usageData, limitData, persistenceData] = await Promise.all([
+        fetchJson<StatsResponse>("/stats", apiKey),
+        fetchJson<{ data: RequestLog[] }>("/admin/request-logs?limit=80", apiKey).catch(() => ({ data: [] })),
+        fetchJson<{ data: UsageLog[] }>("/admin/usage-logs?limit=80", apiKey).catch(() => ({ data: [] })),
+        fetchJson<{ data: RateLimits | null }>("/admin/rate-limits", apiKey).catch(() => ({ data: null })),
+        fetchJson<{ data: PersistenceStatus | null }>("/admin/persistence", apiKey).catch(() => ({ data: null }))
       ]);
       setStats(statsData);
       setRequests(requestData.data);
       setUsage(usageData.data);
       setLimits(limitData.data);
+      setPersistence(persistenceData.data);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message.includes("401") ? "API key required or invalid" : message);
     } finally {
       setLoading(false);
     }
@@ -114,7 +133,24 @@ function App() {
     load();
     const timer = window.setInterval(load, 15000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [apiKey]);
+
+  function saveApiKey(event: React.FormEvent) {
+    event.preventDefault();
+    const next = apiKeyDraft.trim();
+    if (next) {
+      window.sessionStorage.setItem(API_KEY_STORAGE, next);
+    } else {
+      window.sessionStorage.removeItem(API_KEY_STORAGE);
+    }
+    setApiKey(next);
+  }
+
+  function clearApiKey() {
+    window.sessionStorage.removeItem(API_KEY_STORAGE);
+    setApiKey("");
+    setApiKeyDraft("");
+  }
 
   const totals = useMemo(() => {
     if (!stats) return [];
@@ -135,10 +171,28 @@ function App() {
           <h1>codex-proxy-rs</h1>
           <p>Accounts, traffic, usage, and runtime limits</p>
         </div>
-        <button onClick={load} disabled={loading}>
-          <RefreshCw size={16} />
-          Refresh
-        </button>
+        <div className="actions">
+          <form className="key-form" onSubmit={saveApiKey}>
+            <KeyRound size={16} />
+            <input
+              aria-label="API key"
+              placeholder="API key"
+              type="password"
+              value={apiKeyDraft}
+              onChange={(event) => setApiKeyDraft(event.target.value)}
+            />
+            <button type="submit">Use</button>
+            {apiKey && (
+              <button type="button" aria-label="Clear API key" onClick={clearApiKey}>
+                <LogOut size={16} />
+              </button>
+            )}
+          </form>
+          <button onClick={load} disabled={loading}>
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+        </div>
       </header>
 
       {error && <div className="alert">{error}</div>}
@@ -185,6 +239,9 @@ function App() {
             <Limit label="Account RPM" value={limits?.account_rpm} />
             <Limit label="Account Concurrency" value={limits?.account_concurrency} />
             <Limit label="Image Concurrency" value={limits?.image_concurrency} />
+            <Limit label="SQLite Writer" value={persistence?.enabled ? (persistence.writer_running ? 1 : 0) : undefined} onText="running" />
+            <Limit label="Dropped Logs" value={persistence?.dropped_events} zeroText="0" />
+            <Limit label="Write Errors" value={persistence?.write_errors} zeroText="0" />
           </div>
         </Panel>
 
@@ -232,11 +289,11 @@ function Status({ value }: { value: string }) {
   return <span className={`status ${value}`}>{value}</span>;
 }
 
-function Limit({ label, value }: { label: string; value?: number }) {
+function Limit({ label, value, onText = "on", zeroText = "off" }: { label: string; value?: number; onText?: string; zeroText?: string }) {
   return (
     <div className="limit">
       <span>{label}</span>
-      <strong>{value && value > 0 ? value : "off"}</strong>
+      <strong>{value && value > 0 ? (value === 1 && onText !== "on" ? onText : value) : zeroText}</strong>
     </div>
   );
 }

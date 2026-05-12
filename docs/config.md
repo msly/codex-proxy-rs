@@ -17,6 +17,8 @@
   | persistence.sqlite-path | ./codex-proxy.sqlite3 | SQLite 数据库路径 |
   | persistence.request-log-retention-days | 30 | request_logs / usage_logs 保留天数 |
 
+  管理端点 `/admin/persistence` 会返回 SQLite writer 是否运行、队列满时丢弃的事件数和写入错误数。
+
   限流
   | 配置项 | 默认值 | 含义 |
   |---|---:|---|

@@ -1,13 +1,16 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
 use codex_proxy_rs::api::{self, AppState};
+use codex_proxy_rs::config::RateLimitConfig;
 use codex_proxy_rs::core::Manager;
+use codex_proxy_rs::limit::RateLimiter;
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::{CodexClient, On401Hook};
@@ -83,6 +86,28 @@ async fn start_upstream(calls: Arc<AtomicUsize>) -> Url {
     Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
 }
 
+async fn slow_upstream_responses() -> (axum::http::StatusCode, &'static str) {
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    (
+        axum::http::StatusCode::OK,
+        r#"{"id":"r1","object":"response","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}"#,
+    )
+}
+
+async fn start_slow_upstream() -> Url {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        post(slow_upstream_responses),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
 async fn upstream_capture_headers(
     State(state): State<CapturedHeadersState>,
     headers: HeaderMap,
@@ -125,6 +150,78 @@ async fn write_auth_file(dir: &std::path::Path, name: &str, access_token: &str) 
         .to_string(),
     )
     .unwrap();
+}
+
+#[tokio::test]
+async fn api_v1_responses_key_concurrency_is_held_until_upstream_finishes() {
+    let base_url = start_slow_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let mut keys = HashSet::new();
+    keys.insert("k1".to_string());
+
+    let state = AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(keys),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+        rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+            key_concurrency: 1,
+            ..RateLimitConfig::default()
+        })),
+        persist_store: None,
+    };
+
+    let app = api::router(state);
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("Authorization", "Bearer k1")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"model":"gpt-5.4"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("Authorization", "Bearer k1")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"model":"gpt-5.4"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.await.unwrap().status(), axum::http::StatusCode::OK);
 }
 
 #[tokio::test]

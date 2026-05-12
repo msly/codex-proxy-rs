@@ -20,6 +20,7 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - `GET /stats`（账号 summary + RPM + token totals + quota raw JSON cache）
   - `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status`（SQLite 持久化查询，需开启 `persistence.enabled`）
   - `GET /admin/rate-limits`（当前 key/account/image 限流配置）
+  - `GET /admin/persistence`（SQLite writer 状态与 dropped/write error 计数）
   - `POST /check-quota`（SSE，批量查询 `/backend-api/wham/usage`）
   - `POST /refresh`（SSE，强制刷新所有账号 Token）
   - `GET /health`（不鉴权）
@@ -57,6 +58,7 @@ cargo run -- --config config.yaml
 ```
 
 后端会托管 `frontend/dist`，浏览器打开监听地址即可访问管理 UI。
+如果配置了 `api-keys`，管理 UI 顶部输入同一个 API key 后会用 Bearer header 访问管理端点。
 
 ## Docker
 
@@ -125,7 +127,7 @@ docker compose up --build
 
 当 `api-keys` 配置非空时：
 
-- 受保护：`/v1/*`、`/stats`、`/check-quota`
+- 受保护：`/v1/*`、`/stats`、`/admin/*`、`/check-quota`、`/refresh`
 - 不鉴权：`/health`
 
 支持以下 header 任一方式：

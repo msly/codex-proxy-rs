@@ -163,6 +163,10 @@ fn api_key_from_req(req: &Request<Body>) -> Option<String> {
         .and_then(|v| v.0.clone())
 }
 
+fn request_limit_guard_from_req(req: &Request<Body>) -> Option<Arc<RequestLimitGuard>> {
+    req.extensions().get::<Arc<RequestLimitGuard>>().cloned()
+}
+
 fn record_persist_request(
     persist_store: Option<&Arc<PersistStore>>,
     endpoint: &'static str,
@@ -220,6 +224,38 @@ fn record_persist_error(
         duration_ms,
         ..RequestLogInput::default()
     });
+}
+
+fn record_persist_account_error(
+    persist_store: Option<&Arc<PersistStore>>,
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    status: StatusCode,
+    attempts: usize,
+    api_key: Option<String>,
+    account: &Account,
+    message: String,
+    duration_ms: i64,
+) {
+    let Some(store) = persist_store else {
+        return;
+    };
+    store.record_request(RequestLogInput {
+        ts_ms: crate::core::now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        stream,
+        status: status.as_u16(),
+        attempts,
+        api_key,
+        account_file_path: Some(account.file_path().to_string()),
+        error_type: Some("api_error".to_string()),
+        error_message: Some(message),
+        duration_ms,
+    });
+    let snap = account.stats_snapshot();
+    store.record_account_status((&snap).into());
 }
 
 fn record_persist_usage(
@@ -390,6 +426,7 @@ fn build_passthrough_sse_response(
     runtime_state: Arc<RuntimeStateStore>,
     headers: HeaderMap,
     account_limit_guard: AccountLimitGuard,
+    request_limit_guard: Option<Arc<RequestLimitGuard>>,
     persist_store: Option<Arc<PersistStore>>,
     api_key: Option<String>,
 ) -> Response {
@@ -398,6 +435,7 @@ fn build_passthrough_sse_response(
 
     tokio::spawn(async move {
         let _account_limit_guard = account_limit_guard;
+        let _request_limit_guard = request_limit_guard;
         let mut upstream_stream = upstream.bytes_stream();
         let mut buf = BytesMut::new();
         let mut recorded_usage = false;
@@ -407,6 +445,18 @@ fn build_passthrough_sse_response(
                 Ok(b) => b,
                 Err(err) => {
                     log_stream_read_failed(endpoint, &model, account.as_ref(), &err);
+                    record_persist_account_error(
+                        persist_store.as_ref(),
+                        endpoint,
+                        &model,
+                        true,
+                        StatusCode::BAD_GATEWAY,
+                        0,
+                        api_key.clone(),
+                        account.as_ref(),
+                        format!("stream read from upstream failed: {err}"),
+                        0,
+                    );
                     let _ = tx
                         .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
                         .await;
@@ -493,6 +543,7 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/usage-logs", get(admin_usage_logs))
         .route("/admin/account-status", get(admin_account_status))
         .route("/admin/rate-limits", get(admin_rate_limits))
+        .route("/admin/persistence", get(admin_persistence))
         .route("/refresh", post(refresh))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
@@ -648,7 +699,8 @@ fn check_request_limits(
     req: &Request<Body>,
     api_key: Option<&str>,
 ) -> Result<RequestLimitGuard, Response> {
-    let is_image = req.uri().path().starts_with("/v1/images/");
+    let path = req.uri().path();
+    let is_image = path.starts_with("/v1/images/") || path.starts_with("/images/");
     state
         .rate_limiter
         .check_request(api_key, is_image)
@@ -944,6 +996,7 @@ fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
 
 async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Response {
     let api_key = api_key_from_req(&req);
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -1079,6 +1132,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             state.runtime_state.clone(),
             headers,
             account_limit_guard,
+            request_limit_guard,
             state.persist_store.clone(),
             api_key,
         );
@@ -1089,6 +1143,18 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         Ok(b) => b,
         Err(err) => {
             log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                attempts,
+                api_key,
+                account.as_ref(),
+                format!("读取上游响应失败: {err}"),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("读取上游响应失败: {err}"),
@@ -1139,6 +1205,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
     );
 
     let mut resp = Response::new(Body::from(bytes));
+    let _request_limit_guard = request_limit_guard;
     *resp.status_mut() = status;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -1485,6 +1552,7 @@ async fn close_ws(socket: &mut WebSocket, code: CloseCode, reason: &str) {
 
 async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Response {
     let api_key = api_key_from_req(&req);
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -1589,6 +1657,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         let api_key_for_persist = api_key.clone();
         tokio::spawn(async move {
             let _account_limit_guard = account_limit_guard;
+            let _request_limit_guard = request_limit_guard;
             let mut buf = BytesMut::new();
             let mut state = ClaudeStreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
@@ -1603,6 +1672,18 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                             &model_for_log,
                             account_for_log.as_ref(),
                             &err,
+                        );
+                        record_persist_account_error(
+                            persist_store.as_ref(),
+                            endpoint,
+                            &model_for_log,
+                            true,
+                            StatusCode::BAD_GATEWAY,
+                            attempts,
+                            api_key_for_persist.clone(),
+                            account_for_log.as_ref(),
+                            format!("stream read from upstream failed: {err}"),
+                            0,
                         );
                         let _ = tx
                             .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
@@ -1699,6 +1780,18 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         Ok(b) => b,
         Err(err) => {
             log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                attempts,
+                api_key,
+                account.as_ref(),
+                format!("读取上游响应失败: {err}"),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_claude_error(
                 StatusCode::BAD_GATEWAY,
                 "api_error",
@@ -1716,6 +1809,18 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             account = account.file_path(),
             "messages non-stream response missing response.completed"
         );
+        record_persist_account_error(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            false,
+            StatusCode::BAD_GATEWAY,
+            attempts,
+            api_key,
+            account.as_ref(),
+            "未收到 response.completed 事件".to_string(),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
         return send_claude_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -1729,6 +1834,18 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             stream = false,
             account = account.file_path(),
             "messages non-stream response was empty"
+        );
+        record_persist_account_error(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            false,
+            StatusCode::BAD_REQUEST,
+            attempts,
+            api_key,
+            account.as_ref(),
+            "empty response".to_string(),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
         );
         return send_claude_error(
             StatusCode::BAD_REQUEST,
@@ -1780,6 +1897,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
     );
 
     let mut resp = Response::new(Body::from(result.json));
+    let _request_limit_guard = request_limit_guard;
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -1789,6 +1907,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
 }
 
 async fn v1_messages_count_tokens(req: Request<Body>) -> Response {
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
@@ -1825,6 +1944,7 @@ async fn v1_messages_count_tokens(req: Request<Body>) -> Response {
     }
 
     let tokens = estimate_claude_input_tokens(&value).max(1);
+    let _request_limit_guard = request_limit_guard;
     (
         StatusCode::OK,
         Json(json!({
@@ -2032,6 +2152,7 @@ fn collect_tool_call_id(item: &serde_json::Value, ids: &mut HashSet<String>) {
 
 async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>) -> Response {
     let api_key = api_key_from_req(&req);
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -2150,6 +2271,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             state.runtime_state.clone(),
             headers,
             account_limit_guard,
+            request_limit_guard,
             state.persist_store.clone(),
             api_key,
         );
@@ -2159,6 +2281,18 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         Ok(b) => b,
         Err(err) => {
             log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                attempts,
+                api_key,
+                account.as_ref(),
+                format!("读取上游响应失败: {err}"),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("读取上游响应失败: {err}"),
@@ -2209,6 +2343,7 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
     );
 
     let mut resp = Response::new(Body::from(bytes));
+    let _request_limit_guard = request_limit_guard;
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -2264,6 +2399,7 @@ fn clean_compact_value_to_vec(mut v: serde_json::Value, base_model: &str) -> Vec
 
 async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
     let api_key = api_key_from_req(&req);
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -2377,6 +2513,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         let api_key_for_persist = api_key.clone();
         tokio::spawn(async move {
             let _account_limit_guard = account_limit_guard;
+            let _request_limit_guard = request_limit_guard;
             let mut buf = BytesMut::new();
             let mut state = StreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
@@ -2386,6 +2523,18 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     Ok(b) => b,
                     Err(err) => {
                         log_stream_read_failed(endpoint, &model_for_log, account.as_ref(), &err);
+                        record_persist_account_error(
+                            persist_store.as_ref(),
+                            endpoint,
+                            &model_for_log,
+                            true,
+                            StatusCode::BAD_GATEWAY,
+                            attempts,
+                            api_key_for_persist.clone(),
+                            account.as_ref(),
+                            format!("stream read from upstream failed: {err}"),
+                            0,
+                        );
                         let _ = tx
                             .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
                             .await;
@@ -2521,6 +2670,18 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             Ok(b) => b,
             Err(err) => {
                 log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+                record_persist_account_error(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    false,
+                    StatusCode::BAD_GATEWAY,
+                    attempts,
+                    api_key.clone(),
+                    account.as_ref(),
+                    format!("读取上游响应失败: {err}"),
+                    crate::core::now_unix_ms().saturating_sub(started_ms),
+                );
                 return send_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("读取上游响应失败: {err}"),
@@ -2574,6 +2735,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     now_ms.saturating_sub(started_ms),
                 );
                 let mut resp = Response::new(Body::from(body));
+                let _request_limit_guard = request_limit_guard;
                 *resp.status_mut() = StatusCode::OK;
                 resp.headers_mut().insert(
                     header::CONTENT_TYPE,
@@ -2592,6 +2754,18 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     );
                     continue;
                 }
+                record_persist_account_error(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    false,
+                    StatusCode::BAD_REQUEST,
+                    attempts,
+                    api_key,
+                    account.as_ref(),
+                    "empty response".to_string(),
+                    crate::core::now_unix_ms().saturating_sub(started_ms),
+                );
                 return send_error(
                     StatusCode::BAD_REQUEST,
                     "empty response",
@@ -2605,6 +2779,18 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     stream = false,
                     account = account.file_path(),
                     "chat non-stream response missing response.completed"
+                );
+                record_persist_account_error(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    false,
+                    StatusCode::BAD_GATEWAY,
+                    attempts,
+                    api_key,
+                    account.as_ref(),
+                    "上游响应缺少 response.completed".to_string(),
+                    crate::core::now_unix_ms().saturating_sub(started_ms),
                 );
                 return send_error(
                     StatusCode::BAD_GATEWAY,
@@ -2624,6 +2810,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
 async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
     let api_key = api_key_from_req(&req);
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
@@ -2738,6 +2925,7 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
         let api_key_for_persist = api_key.clone();
         tokio::spawn(async move {
             let _account_limit_guard = account_limit_guard;
+            let _request_limit_guard = request_limit_guard;
             let mut buf = BytesMut::new();
             let mut state = StreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
@@ -2747,6 +2935,18 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
                     Ok(b) => b,
                     Err(err) => {
                         log_stream_read_failed(endpoint, &model_for_log, account.as_ref(), &err);
+                        record_persist_account_error(
+                            persist_store.as_ref(),
+                            endpoint,
+                            &model_for_log,
+                            true,
+                            StatusCode::BAD_GATEWAY,
+                            attempts,
+                            api_key_for_persist.clone(),
+                            account.as_ref(),
+                            format!("stream read from upstream failed: {err}"),
+                            0,
+                        );
                         let _ = tx
                             .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
                             .await;
@@ -2850,6 +3050,18 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
         Ok(b) => b,
         Err(err) => {
             log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                attempts,
+                api_key.clone(),
+                account.as_ref(),
+                format!("读取上游响应失败: {err}"),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("读取上游响应失败: {err}"),
@@ -2903,6 +3115,7 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
                 now_ms.saturating_sub(started_ms),
             );
             let mut resp = Response::new(Body::from(convert_chat_completion_to_completion(&body)));
+            let _request_limit_guard = request_limit_guard;
             *resp.status_mut() = StatusCode::OK;
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -2910,16 +3123,44 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
             );
             resp
         }
-        ChatNonStreamOutcome::Empty => send_error(
-            StatusCode::BAD_REQUEST,
-            "empty response",
-            "invalid_response",
-        ),
-        ChatNonStreamOutcome::MissingCompleted => send_error(
-            StatusCode::BAD_GATEWAY,
-            "上游响应缺少 response.completed",
-            "api_error",
-        ),
+        ChatNonStreamOutcome::Empty => {
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_REQUEST,
+                attempts,
+                api_key,
+                account.as_ref(),
+                "empty response".to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
+            send_error(
+                StatusCode::BAD_REQUEST,
+                "empty response",
+                "invalid_response",
+            )
+        }
+        ChatNonStreamOutcome::MissingCompleted => {
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                attempts,
+                api_key,
+                account.as_ref(),
+                "上游响应缺少 response.completed".to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
+            send_error(
+                StatusCode::BAD_GATEWAY,
+                "上游响应缺少 response.completed",
+                "api_error",
+            )
+        }
     }
 }
 
@@ -2933,6 +3174,7 @@ async fn v1_images_edits(State(state): State<AppState>, req: Request<Body>) -> R
 
 async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response {
     let api_key = api_key_from_req(&req);
+    let request_limit_guard = request_limit_guard_from_req(&req);
     let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw_value = match parse_image_request_value(req).await {
@@ -3016,6 +3258,18 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
         Ok(b) => b,
         Err(err) => {
             log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            record_persist_account_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                attempts,
+                api_key.clone(),
+                account.as_ref(),
+                format!("读取上游响应失败: {err}"),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("读取上游响应失败: {err}"),
@@ -3041,6 +3295,18 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
         );
     }
     let Some(out) = convert_responses_sse_to_images_json(&bytes, &response_format) else {
+        record_persist_account_error(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            false,
+            StatusCode::BAD_GATEWAY,
+            attempts,
+            api_key,
+            account.as_ref(),
+            "上游响应缺少 image_generation_call 输出".to_string(),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
         return send_error(
             StatusCode::BAD_GATEWAY,
             "上游响应缺少 image_generation_call 输出",
@@ -3075,6 +3341,7 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
     );
 
     let mut resp = Response::new(Body::from(out));
+    let _request_limit_guard = request_limit_guard;
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -3693,6 +3960,30 @@ async fn admin_account_status(State(state): State<AppState>) -> Response {
 
 async fn admin_rate_limits(State(state): State<AppState>) -> Response {
     Json(json!({ "data": state.rate_limiter.snapshot() })).into_response()
+}
+
+async fn admin_persistence(State(state): State<AppState>) -> Response {
+    let Some(store) = state.persist_store.as_ref() else {
+        return Json(json!({
+            "data": {
+                "enabled": false,
+                "writer_running": false,
+                "dropped_events": 0,
+                "write_errors": 0,
+            }
+        }))
+        .into_response();
+    };
+    let status = store.status();
+    Json(json!({
+        "data": {
+            "enabled": true,
+            "writer_running": status.writer_running,
+            "dropped_events": status.dropped_events,
+            "write_errors": status.write_errors,
+        }
+    }))
+    .into_response()
 }
 
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {

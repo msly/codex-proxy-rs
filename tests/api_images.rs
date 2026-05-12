@@ -1,5 +1,7 @@
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -7,7 +9,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::routing::post;
 use codex_proxy_rs::api::{self, AppState};
+use codex_proxy_rs::config::RateLimitConfig;
 use codex_proxy_rs::core::Manager;
+use codex_proxy_rs::limit::RateLimiter;
+use codex_proxy_rs::persist::PersistStore;
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::CodexClient;
@@ -50,6 +55,64 @@ async fn start_upstream(bodies: Arc<Mutex<Vec<serde_json::Value>>>) -> Url {
     Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
 }
 
+async fn slow_image_upstream_responses() -> (axum::http::StatusCode, &'static str) {
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    (axum::http::StatusCode::OK, UPSTREAM_IMAGE_SSE)
+}
+
+#[derive(Clone)]
+struct SlowUpstreamState {
+    calls: Arc<AtomicUsize>,
+}
+
+async fn tracked_slow_image_upstream_responses(
+    State(state): State<SlowUpstreamState>,
+) -> (axum::http::StatusCode, &'static str) {
+    state.calls.fetch_add(1, Ordering::Relaxed);
+    slow_image_upstream_responses().await
+}
+
+async fn invalid_image_upstream_responses() -> (axum::http::StatusCode, &'static str) {
+    (
+        axum::http::StatusCode::OK,
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[]}}\n\n",
+    )
+}
+
+async fn start_slow_image_upstream() -> (Url, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/backend-api/codex/responses",
+            post(tracked_slow_image_upstream_responses),
+        )
+        .with_state(SlowUpstreamState {
+            calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap(),
+        calls,
+    )
+}
+
+async fn start_invalid_image_upstream() -> Url {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        post(invalid_image_upstream_responses),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
 async fn write_auth_file(dir: &std::path::Path, name: &str, access_token: &str) {
     let path = dir.join(name);
     std::fs::write(
@@ -84,6 +147,145 @@ fn build_state(base_url: Url, manager: Arc<Manager>, dir: &std::path::Path) -> A
         rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
         persist_store: None,
     }
+}
+
+#[tokio::test]
+async fn api_v1_images_concurrency_is_independent_from_regular_requests() {
+    let (base_url, calls) = start_slow_image_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let mut state = build_state(base_url, manager, dir.path());
+    state.rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig {
+        image_concurrency: 1,
+        ..RateLimitConfig::default()
+    }));
+
+    let app = api::router(state);
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/images/generations")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "gpt-5.4",
+                            "prompt": "draw a cat",
+                            "response_format": "b64_json"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    });
+
+    for _ in 0..20 {
+        if calls.load(Ordering::Relaxed) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let second_image = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "prompt": "draw a dog"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let regular_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"model":"gpt-5.4"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second_image.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(regular_response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn api_v1_images_conversion_failure_is_persisted_to_request_logs() {
+    let base_url = start_invalid_image_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let store = Arc::new(PersistStore::start(dir.path().join("persist.sqlite3")).unwrap());
+    let mut state = build_state(base_url, manager, dir.path());
+    state.persist_store = Some(store.clone());
+
+    let app = api::router(state);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "prompt": "draw a cat"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+
+    let mut rows = Vec::new();
+    for _ in 0..20 {
+        rows = store.list_request_logs(10).await.unwrap();
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let row = rows.first().expect("request log row");
+    assert_eq!(row.endpoint, "/v1/images/generations");
+    assert_eq!(row.status, StatusCode::BAD_GATEWAY.as_u16());
+    assert_eq!(row.error_type.as_deref(), Some("api_error"));
+    assert!(
+        row.error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("image_generation_call")
+    );
 }
 
 #[tokio::test]

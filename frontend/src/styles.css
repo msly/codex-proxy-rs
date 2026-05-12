@@ -54,9 +54,31 @@ button {
   cursor: pointer;
 }
 
+input {
+  height: 36px;
+  min-width: 180px;
+  padding: 0 10px;
+  border: 1px solid #cbd5dc;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #1f2933;
+  font: inherit;
+}
+
 button:disabled {
   opacity: 0.55;
   cursor: default;
+}
+
+.actions, .key-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.key-form {
+  padding-left: 8px;
+  color: #66717c;
 }
 
 .alert {
@@ -190,6 +212,17 @@ th {
   .topbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .actions, .key-form {
+    align-items: stretch;
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  input {
+    min-width: 0;
+    flex: 1 1 180px;
   }
 
   .metrics {

@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
 
 use rusqlite::{Connection, params};
@@ -7,10 +9,21 @@ use serde::Serialize;
 
 use crate::core::{AccountStatsSnapshot, now_unix_ms};
 
+const DEFAULT_QUEUE_CAPACITY: usize = 8192;
+const WRITE_BATCH_SIZE: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct PersistStore {
     db_path: PathBuf,
-    tx: mpsc::Sender<PersistEvent>,
+    tx: SyncSender<PersistEvent>,
+    runtime: Arc<PersistRuntime>,
+}
+
+#[derive(Debug, Default)]
+struct PersistRuntime {
+    dropped_events: AtomicU64,
+    write_errors: AtomicU64,
+    writer_running: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,8 +142,22 @@ pub struct AccountStatusRow {
     pub total_tokens: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PersistStatus {
+    pub writer_running: bool,
+    pub dropped_events: u64,
+    pub write_errors: u64,
+}
+
 impl PersistStore {
     pub fn start(db_path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::start_with_capacity(db_path, DEFAULT_QUEUE_CAPACITY)
+    }
+
+    pub fn start_with_capacity(
+        db_path: impl AsRef<Path>,
+        queue_capacity: usize,
+    ) -> Result<Self, String> {
         let db_path = db_path.as_ref().to_path_buf();
         if let Some(parent) = db_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建 SQLite 目录失败: {e}"))?;
@@ -140,48 +167,98 @@ impl PersistStore {
             init_schema(&conn).map_err(|e| format!("初始化 SQLite schema 失败: {e}"))?;
         }
 
-        let (tx, rx) = mpsc::channel::<PersistEvent>();
+        let (tx, rx) = mpsc::sync_channel::<PersistEvent>(queue_capacity.max(1));
         let worker_path = db_path.clone();
+        let runtime = Arc::new(PersistRuntime::default());
+        runtime.writer_running.store(true, Ordering::Relaxed);
+        let worker_runtime = runtime.clone();
         thread::Builder::new()
             .name("codex-proxy-sqlite-writer".to_string())
             .spawn(move || {
-                let conn = match Connection::open(worker_path) {
+                let mut conn = match Connection::open(worker_path) {
                     Ok(conn) => conn,
                     Err(err) => {
                         tracing::error!("sqlite writer open failed: {err}");
+                        worker_runtime
+                            .writer_running
+                            .store(false, Ordering::Relaxed);
                         return;
                     }
                 };
                 if let Err(err) = init_schema(&conn) {
                     tracing::error!("sqlite writer init failed: {err}");
+                    worker_runtime
+                        .writer_running
+                        .store(false, Ordering::Relaxed);
                     return;
                 }
-                while let Ok(event) = rx.recv() {
-                    if let Err(err) = write_event(&conn, event) {
+                while let Ok(first) = rx.recv() {
+                    let mut events = Vec::with_capacity(WRITE_BATCH_SIZE);
+                    events.push(first);
+                    while events.len() < WRITE_BATCH_SIZE {
+                        match rx.try_recv() {
+                            Ok(event) => events.push(event),
+                            Err(_) => break,
+                        }
+                    }
+                    if let Err(err) = write_events(&mut conn, events) {
+                        worker_runtime.write_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!("sqlite write failed: {err}");
                     }
                 }
+                worker_runtime
+                    .writer_running
+                    .store(false, Ordering::Relaxed);
             })
             .map_err(|e| format!("启动 SQLite writer 失败: {e}"))?;
 
-        Ok(Self { db_path, tx })
+        Ok(Self {
+            db_path,
+            tx,
+            runtime,
+        })
     }
 
     pub fn record_request(&self, input: RequestLogInput) {
-        let _ = self.tx.send(PersistEvent::Request(input));
+        self.enqueue(PersistEvent::Request(input));
     }
 
     pub fn record_usage(&self, input: UsageLogInput) {
-        let _ = self.tx.send(PersistEvent::Usage(input));
+        self.enqueue(PersistEvent::Usage(input));
     }
 
     pub fn record_account_status(&self, input: AccountStatusInput) {
-        let _ = self.tx.send(PersistEvent::AccountStatus(input));
+        self.enqueue(PersistEvent::AccountStatus(input));
     }
 
     pub fn cleanup_older_than_days(&self, days: u64) {
         let older_than_ms = now_unix_ms().saturating_sub((days as i64).saturating_mul(86_400_000));
-        let _ = self.tx.send(PersistEvent::Cleanup { older_than_ms });
+        self.enqueue(PersistEvent::Cleanup { older_than_ms });
+    }
+
+    pub fn status(&self) -> PersistStatus {
+        PersistStatus {
+            writer_running: self.runtime.writer_running.load(Ordering::Relaxed),
+            dropped_events: self.runtime.dropped_events.load(Ordering::Relaxed),
+            write_errors: self.runtime.write_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    fn enqueue(&self, event: PersistEvent) {
+        match self.tx.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                let dropped = self.runtime.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped == 1 || dropped.is_power_of_two() {
+                    tracing::warn!(dropped_events = dropped, "sqlite persist queue full");
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.runtime.writer_running.store(false, Ordering::Relaxed);
+                let dropped = self.runtime.dropped_events.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(dropped_events = dropped, "sqlite persist writer stopped");
+            }
+        }
     }
 
     pub async fn list_request_logs(&self, limit: usize) -> Result<Vec<RequestLogRow>, String> {
@@ -300,6 +377,14 @@ CREATE TABLE IF NOT EXISTS account_status (
 );
 "#,
     )
+}
+
+fn write_events(conn: &mut Connection, events: Vec<PersistEvent>) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    for event in events {
+        write_event(&tx, event)?;
+    }
+    tx.commit()
 }
 
 fn write_event(conn: &Connection, event: PersistEvent) -> rusqlite::Result<()> {
@@ -506,4 +591,32 @@ FROM account_status ORDER BY ts_ms DESC"#,
         .map_err(|e| e.to_string())?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_queue_full_drops_without_blocking_request_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistStore::start_with_capacity(dir.path().join("persist.sqlite3"), 1)
+            .expect("persist store");
+
+        for i in 0..50_000 {
+            store.record_request(RequestLogInput {
+                ts_ms: i,
+                endpoint: "/test".to_string(),
+                model: "gpt-test".to_string(),
+                status: 200,
+                ..RequestLogInput::default()
+            });
+        }
+
+        assert!(
+            store.status().dropped_events > 0,
+            "expected bounded queue to drop events under burst load"
+        );
+        assert!(store.status().writer_running);
+    }
 }

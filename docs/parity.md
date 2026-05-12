@@ -23,6 +23,7 @@
 | `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` / `response.append` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
 | `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status` | ✅ | SQLite 持久化查询 |
 | `GET /admin/rate-limits` | ✅ | 暴露 key/account/image 当前限流配置 |
+| `GET /admin/persistence` | ✅ | 暴露 SQLite writer 运行状态、丢弃事件数、写错误数 |
 
 ## 中间件与基础行为
 
