@@ -120,6 +120,8 @@ async fn api_stats_returns_cached_quota_raw_json() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);

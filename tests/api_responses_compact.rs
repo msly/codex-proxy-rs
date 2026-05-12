@@ -125,6 +125,8 @@ async fn api_v1_responses_compact_stream_passthrough_uses_internal_retry_gate() 
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -206,6 +208,8 @@ async fn api_v1_responses_compact_non_stream_passthrough_returns_json() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);

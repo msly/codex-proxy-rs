@@ -18,9 +18,16 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - `POST /v1/messages/count_tokens`（本地估算 token 数）
 - 管理端点：
   - `GET /stats`（账号 summary + RPM + token totals + quota raw JSON cache）
+  - `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status`（SQLite 持久化查询，需开启 `persistence.enabled`）
+  - `GET /admin/rate-limits`（当前 key/account/image 限流配置）
   - `POST /check-quota`（SSE，批量查询 `/backend-api/wham/usage`）
   - `POST /refresh`（SSE，强制刷新所有账号 Token）
   - `GET /health`（不鉴权）
+- 运行时保护：
+  - SQLite 持久化 request log / usage log / account status
+  - API key 级 RPM 与并发限制
+  - account 级 RPM 与并发限制
+  - 图片生成独立进程级并发限制
 - 多账号池 + 内部重试：
   - 从 `auth-dir` 读取 `*.json`（`access_token` 必填；`refresh_token` 可选）
   - 兼容 `sub2api` 的单账号导出 JSON（顶层 `accounts[0].credentials`）
@@ -38,6 +45,18 @@ cd codex-proxy-rs
 cp config.example.yaml config.yaml
 cargo run -- --config config.yaml
 ```
+
+首次使用独立管理前端：
+
+```bash
+cd frontend
+npm install
+npm run build
+cd ..
+cargo run -- --config config.yaml
+```
+
+后端会托管 `frontend/dist`，浏览器打开监听地址即可访问管理 UI。
 
 ## Docker
 

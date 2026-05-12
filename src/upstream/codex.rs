@@ -9,6 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::core::{Account, Manager};
+use crate::limit::{AccountLimitGuard, RateLimiter};
 
 pub const CODEX_CLIENT_VERSION: &str = "0.120.0";
 pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.120.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
@@ -40,6 +41,26 @@ pub struct CodexClient {
     retry_policy: RetryPolicy,
     client_version: String,
     user_agent: String,
+}
+
+pub struct UpstreamResponse {
+    pub response: reqwest::Response,
+    pub account: Arc<Account>,
+    pub attempts: usize,
+    pub account_limit_guard: AccountLimitGuard,
+}
+
+pub struct UpstreamRequest<'a> {
+    pub manager: &'a Manager,
+    pub model: &'a str,
+    pub url: Url,
+    pub body: Vec<u8>,
+    pub stream: bool,
+    pub max_retry: usize,
+    pub passthrough_headers: Option<&'a HeaderMap>,
+    pub on_401: Option<On401Hook>,
+    pub initial_excluded: &'a HashSet<String>,
+    pub rate_limiter: &'a RateLimiter,
 }
 
 impl CodexClient {
@@ -106,18 +127,11 @@ impl CodexClient {
         Ok(u)
     }
 
-    pub async fn send_with_retry(
+    pub async fn execute(
         &self,
-        manager: &Manager,
-        model: &str,
-        url: Url,
-        body: Vec<u8>,
-        stream: bool,
-        max_retry: usize,
-        passthrough_headers: Option<&HeaderMap>,
-        on_401: Option<On401Hook>,
-    ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
-        self.send_with_retry_excluding(
+        request: UpstreamRequest<'_>,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let UpstreamRequest {
             manager,
             model,
             url,
@@ -126,23 +140,9 @@ impl CodexClient {
             max_retry,
             passthrough_headers,
             on_401,
-            &HashSet::new(),
-        )
-        .await
-    }
-
-    pub async fn send_with_retry_excluding(
-        &self,
-        manager: &Manager,
-        model: &str,
-        url: Url,
-        body: Vec<u8>,
-        stream: bool,
-        max_retry: usize,
-        passthrough_headers: Option<&HeaderMap>,
-        on_401: Option<On401Hook>,
-        initial_excluded: &HashSet<String>,
-    ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
+            initial_excluded,
+            rate_limiter,
+        } = request;
         let mut excluded = initial_excluded.clone();
         let max_attempts = max_retry.saturating_add(1).max(1);
         let mut last_err: Option<UpstreamError> = None;
@@ -155,6 +155,31 @@ impl CodexClient {
                 }
             };
             excluded.insert(account.file_path().to_string());
+
+            let account_limit_guard = match rate_limiter.check_account(account.file_path()) {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let will_retry = attempt < max_attempts - 1;
+                    tracing::warn!(
+                        model = %model,
+                        stream,
+                        attempt = attempt + 1,
+                        total = max_attempts,
+                        account = account.file_path(),
+                        scope = err.scope,
+                        will_retry,
+                        "account rate limit exceeded"
+                    );
+                    last_err = Some(UpstreamError::Status {
+                        code: 429,
+                        body: err.message.into_bytes(),
+                    });
+                    if will_retry {
+                        continue;
+                    }
+                    break;
+                }
+            };
 
             let token = account.token().access_token.clone();
             let account_id = account.token().account_id.clone();
@@ -258,7 +283,12 @@ impl CodexClient {
                         "upstream request succeeded after retry"
                     );
                 }
-                return Ok((resp, account, attempt + 1));
+                return Ok(UpstreamResponse {
+                    response: resp,
+                    account,
+                    attempts: attempt + 1,
+                    account_limit_guard,
+                });
             }
 
             let err_body = resp
@@ -657,8 +687,36 @@ mod tests {
         .unwrap();
     }
 
+    async fn execute_tuple_for_test(
+        client: &CodexClient,
+        manager: &Manager,
+        url: Url,
+        stream: bool,
+        max_retry: usize,
+        passthrough_headers: Option<&HeaderMap>,
+        on_401: Option<On401Hook>,
+    ) -> Result<(reqwest::Response, Arc<Account>, usize), UpstreamError> {
+        let empty = HashSet::new();
+        let rate_limiter = RateLimiter::default();
+        let result = client
+            .execute(UpstreamRequest {
+                manager,
+                model: "gpt-4.1",
+                url,
+                body: b"{}".to_vec(),
+                stream,
+                max_retry,
+                passthrough_headers,
+                on_401,
+                initial_excluded: &empty,
+                rate_limiter: &rate_limiter,
+            })
+            .await?;
+        Ok((result.response, result.account, result.attempts))
+    }
+
     #[tokio::test]
-    async fn upstream_send_with_retry_switches_account() {
+    async fn upstream_execute_switches_account() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base_url = start_upstream(calls.clone()).await;
 
@@ -672,19 +730,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                None,
-            )
-            .await
-            .expect("should succeed on second attempt");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, true, 1, None, None)
+                .await
+                .expect("should succeed on second attempt");
 
         assert_eq!(attempts, 2);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -694,7 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_invokes_on_401_hook_and_sets_cooldown() {
+    async fn upstream_execute_invokes_on_401_hook_and_sets_cooldown() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base_url = start_upstream(calls.clone()).await;
 
@@ -721,19 +770,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                Some(on_401),
-            )
-            .await
-            .unwrap();
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, true, 1, None, Some(on_401))
+                .await
+                .unwrap();
 
         assert_eq!(attempts, 2);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -758,7 +798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_sets_quota_cooldown_on_429() {
+    async fn upstream_execute_sets_quota_cooldown_on_429() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base_url = start_upstream(calls.clone()).await;
 
@@ -772,19 +812,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                None,
-            )
-            .await
-            .expect("should retry on 429 and succeed");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, true, 1, None, None)
+                .await
+                .expect("should retry on 429 and succeed");
 
         assert_eq!(attempts, 2);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -801,7 +832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_updates_used_percent_from_success_headers() {
+    async fn upstream_execute_updates_used_percent_from_success_headers() {
         async fn upstream_with_headers(headers: HeaderMap) -> Response {
             let mut resp = Response::new(Body::from("ok"));
             *resp.status_mut() = axum::http::StatusCode::OK;
@@ -842,19 +873,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                false,
-                0,
-                None,
-                None,
-            )
-            .await
-            .expect("should succeed");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, false, 0, None, None)
+                .await
+                .expect("should succeed");
 
         assert_eq!(attempts, 1);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -873,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_sets_quota_state_from_success_headers() {
+    async fn upstream_execute_sets_quota_state_from_success_headers() {
         async fn upstream_with_exhausted_headers(headers: HeaderMap) -> Response {
             let mut resp = Response::new(Body::from("ok"));
             *resp.status_mut() = axum::http::StatusCode::OK;
@@ -921,19 +943,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                false,
-                0,
-                None,
-                None,
-            )
-            .await
-            .expect("should succeed");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, false, 0, None, None)
+                .await
+                .expect("should succeed");
 
         assert_eq!(attempts, 1);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -950,7 +963,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_does_not_retry_on_403() {
+    async fn upstream_execute_does_not_retry_on_403() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base_url = start_upstream(calls.clone()).await;
 
@@ -964,17 +977,7 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let err = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                None,
-            )
+        let err = execute_tuple_for_test(&client, &manager, url, true, 1, None, None)
             .await
             .expect_err("403 should be non-retryable");
         match err {
@@ -1036,7 +1039,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_uses_default_identity_headers_when_passthrough_missing() {
+    async fn upstream_execute_uses_default_identity_headers_when_passthrough_missing() {
         let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
         let base_url = start_capture_headers_upstream(captured.clone()).await;
 
@@ -1049,19 +1052,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                false,
-                0,
-                None,
-                None,
-            )
-            .await
-            .expect("should succeed");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, false, 0, None, None)
+                .await
+                .expect("should succeed");
 
         assert_eq!(attempts, 1);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -1092,7 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_preserves_whitelisted_passthrough_headers() {
+    async fn upstream_execute_preserves_whitelisted_passthrough_headers() {
         let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
         let base_url = start_capture_headers_upstream(captured.clone()).await;
 
@@ -1128,19 +1122,10 @@ mod tests {
             axum::http::HeaderValue::from_static("req-123"),
         );
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                false,
-                0,
-                Some(&passthrough),
-                None,
-            )
-            .await
-            .expect("should succeed");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, false, 0, Some(&passthrough), None)
+                .await
+                .expect("should succeed");
 
         assert_eq!(attempts, 1);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -1180,7 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_treats_capacity_error_as_retryable() {
+    async fn upstream_execute_treats_capacity_error_as_retryable() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base_url = start_upstream(calls.clone()).await;
 
@@ -1194,19 +1179,10 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let (resp, _acc, attempts) = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                None,
-            )
-            .await
-            .expect("should retry capacity error and succeed");
+        let (resp, _acc, attempts) =
+            execute_tuple_for_test(&client, &manager, url, true, 1, None, None)
+                .await
+                .expect("should retry capacity error and succeed");
 
         assert_eq!(attempts, 2);
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -1222,7 +1198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_send_with_retry_returns_capacity_error_when_no_other_account_available() {
+    async fn upstream_execute_returns_capacity_error_when_no_other_account_available() {
         let calls = Arc::new(AtomicUsize::new(0));
         let base_url = start_upstream(calls.clone()).await;
 
@@ -1235,17 +1211,7 @@ mod tests {
         let client = CodexClient::new(base_url, "").unwrap();
         let url = client.responses_url().unwrap();
 
-        let err = client
-            .send_with_retry(
-                &manager,
-                "gpt-4.1",
-                url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                None,
-            )
+        let err = execute_tuple_for_test(&client, &manager, url, true, 1, None, None)
             .await
             .expect_err("capacity error should be returned cleanly");
 
@@ -1267,20 +1233,25 @@ mod tests {
 
     async fn proxy_stream(State(state): State<ProxyState>) -> Response {
         let url = state.client.responses_url().unwrap();
-        let (upstream, _acc, _attempts) = state
+        let empty = HashSet::new();
+        let rate_limiter = RateLimiter::default();
+        let upstream_result = state
             .client
-            .send_with_retry(
-                &state.manager,
-                "gpt-4.1",
+            .execute(UpstreamRequest {
+                manager: state.manager.as_ref(),
+                model: "gpt-4.1",
                 url,
-                b"{}".to_vec(),
-                true,
-                1,
-                None,
-                None,
-            )
+                body: b"{}".to_vec(),
+                stream: true,
+                max_retry: 1,
+                passthrough_headers: None,
+                on_401: None,
+                initial_excluded: &empty,
+                rate_limiter: &rate_limiter,
+            })
             .await
             .unwrap();
+        let upstream = upstream_result.response;
 
         let status = upstream.status();
         let stream = upstream

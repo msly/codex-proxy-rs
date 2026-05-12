@@ -191,6 +191,8 @@ async fn open_responses_ws(
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -353,6 +355,8 @@ async fn api_v1_responses_websocket_fallback_accepts_append_and_forwards_handsha
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -514,6 +518,8 @@ async fn api_v1_responses_websocket_append_allows_known_tool_output_and_adds_pre
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);

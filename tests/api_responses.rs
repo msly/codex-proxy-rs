@@ -165,6 +165,8 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: Some(on_401),
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -260,6 +262,8 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -344,6 +348,8 @@ async fn api_v1_responses_forwards_whitelisted_codex_identity_headers() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -425,6 +431,8 @@ async fn api_v1_responses_non_retryable_failure_counts_as_failed_request() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -483,6 +491,8 @@ async fn api_v1_responses_stats_expose_cached_and_reasoning_tokens() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     });
 
     let res = post_app
@@ -518,6 +528,8 @@ async fn api_v1_responses_stats_expose_cached_and_reasoning_tokens() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     });
 
     let stats_res = stats_app
@@ -576,6 +588,8 @@ async fn api_v1_responses_persist_cached_and_reasoning_tokens_to_state_file() {
         refresh_concurrency: 1,
         runtime_state: runtime_state.clone(),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     });
 
     let res = app
@@ -643,6 +657,8 @@ async fn api_v1_responses_rejects_function_call_output_without_context() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     });
 
     let res = app
@@ -705,6 +721,8 @@ async fn api_v1_responses_allows_function_call_output_with_previous_response_id(
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     });
 
     let res = app

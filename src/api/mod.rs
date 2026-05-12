@@ -6,11 +6,10 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
-use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State};
 use axum::http::header;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::Html;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -23,8 +22,11 @@ use memchr::memchr;
 use serde::Serialize;
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::core::{Account, Manager};
+use crate::limit::{AccountLimitGuard, RateLimiter, RequestLimitGuard};
+use crate::persist::{PersistStore, RequestLogInput, UsageLogInput};
 use crate::quota::QuotaChecker;
 use crate::refresh::{Refresher, SaveQueue, refresh_account};
 use crate::state::RuntimeStateStore;
@@ -41,10 +43,9 @@ use crate::translate::{
     convert_non_stream_response, convert_responses_sse_to_images_json, convert_stream_chunk,
     extract_completed_response_payload,
 };
-use crate::upstream::codex::CodexClient;
-use crate::upstream::codex::UpstreamError;
+use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, UpstreamResponse};
 
-const INDEX_HTML: &str = include_str!("../../assets/index.html");
+const FRONTEND_DIST_DIR: &str = "frontend/dist";
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -66,7 +67,12 @@ pub struct AppState {
     pub refresh_concurrency: usize,
     pub runtime_state: Arc<RuntimeStateStore>,
     pub on_401: Option<crate::upstream::codex::On401Hook>,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub persist_store: Option<Arc<PersistStore>>,
 }
+
+#[derive(Debug, Clone)]
+struct RequestApiKey(Option<String>);
 
 #[derive(Debug, Default)]
 pub struct RequestStats {
@@ -151,6 +157,101 @@ fn record_client_success(
     record_hourly_request(runtime_state, now_ms);
 }
 
+fn api_key_from_req(req: &Request<Body>) -> Option<String> {
+    req.extensions()
+        .get::<RequestApiKey>()
+        .and_then(|v| v.0.clone())
+}
+
+fn record_persist_request(
+    persist_store: Option<&Arc<PersistStore>>,
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    status: StatusCode,
+    attempts: usize,
+    api_key: Option<String>,
+    account: Option<&Account>,
+    duration_ms: i64,
+) {
+    let Some(store) = persist_store else {
+        return;
+    };
+    store.record_request(RequestLogInput {
+        ts_ms: crate::core::now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        stream,
+        status: status.as_u16(),
+        attempts,
+        api_key,
+        account_file_path: account.map(|a| a.file_path().to_string()),
+        duration_ms,
+        ..RequestLogInput::default()
+    });
+    if let Some(account) = account {
+        let snap = account.stats_snapshot();
+        store.record_account_status((&snap).into());
+    }
+}
+
+fn record_persist_error(
+    persist_store: Option<&Arc<PersistStore>>,
+    endpoint: &'static str,
+    model: &str,
+    stream: bool,
+    status: StatusCode,
+    api_key: Option<String>,
+    message: String,
+    duration_ms: i64,
+) {
+    let Some(store) = persist_store else {
+        return;
+    };
+    store.record_request(RequestLogInput {
+        ts_ms: crate::core::now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        stream,
+        status: status.as_u16(),
+        api_key,
+        error_type: Some("api_error".to_string()),
+        error_message: Some(message),
+        duration_ms,
+        ..RequestLogInput::default()
+    });
+}
+
+fn record_persist_usage(
+    persist_store: Option<&Arc<PersistStore>>,
+    endpoint: &'static str,
+    model: &str,
+    api_key: Option<String>,
+    account: &Account,
+    usage: UsageTokens,
+) {
+    if !usage.has_activity() {
+        return;
+    }
+    let Some(store) = persist_store else {
+        return;
+    };
+    store.record_usage(UsageLogInput {
+        ts_ms: crate::core::now_unix_ms(),
+        endpoint: endpoint.to_string(),
+        model: model.to_string(),
+        api_key,
+        account_file_path: account.file_path().to_string(),
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cached_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        total_tokens: usage.total_tokens,
+    });
+    let snap = account.stats_snapshot();
+    store.record_account_status((&snap).into());
+}
+
 fn extract_usage_tokens(value: &serde_json::Value) -> Option<UsageTokens> {
     let usage = value.get("usage").or_else(|| {
         value
@@ -217,9 +318,9 @@ fn record_usage_from_value(
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
     value: &serde_json::Value,
-) {
+) -> Option<UsageTokens> {
     let Some(usage) = extract_usage_tokens(value) else {
-        return;
+        return None;
     };
     account.record_usage_detail(
         usage.input_tokens,
@@ -229,6 +330,7 @@ fn record_usage_from_value(
         usage.total_tokens,
     );
     record_hourly_usage(runtime_state, now_ms, usage);
+    Some(usage)
 }
 
 fn record_usage_from_json_bytes(
@@ -236,11 +338,11 @@ fn record_usage_from_json_bytes(
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
     bytes: &[u8],
-) {
+) -> Option<UsageTokens> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return;
+        return None;
     };
-    record_usage_from_value(account, runtime_state, now_ms, &value);
+    record_usage_from_value(account, runtime_state, now_ms, &value)
 }
 
 fn record_usage_from_sse_line(
@@ -248,22 +350,18 @@ fn record_usage_from_sse_line(
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
     line: &[u8],
-) -> bool {
+) -> Option<UsageTokens> {
     if !line.starts_with(b"data:") {
-        return false;
+        return None;
     }
     let payload = trim_ascii(&line[5..]);
     if payload.is_empty() || payload == b"[DONE]" {
-        return false;
+        return None;
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return false;
+        return None;
     };
-    let had_usage = extract_usage_tokens(&value).is_some();
-    if had_usage {
-        record_usage_from_value(account, runtime_state, now_ms, &value);
-    }
-    had_usage
+    record_usage_from_value(account, runtime_state, now_ms, &value)
 }
 
 fn record_usage_from_sse_bytes(
@@ -271,17 +369,17 @@ fn record_usage_from_sse_bytes(
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
     bytes: &[u8],
-) -> bool {
+) -> Option<UsageTokens> {
     for line in bytes.split(|b| *b == b'\n') {
         let line = trim_ascii(line);
         if line.is_empty() {
             continue;
         }
-        if record_usage_from_sse_line(account, runtime_state, now_ms, line) {
-            return true;
+        if let Some(usage) = record_usage_from_sse_line(account, runtime_state, now_ms, line) {
+            return Some(usage);
         }
     }
-    false
+    None
 }
 
 fn build_passthrough_sse_response(
@@ -291,11 +389,15 @@ fn build_passthrough_sse_response(
     account: Arc<Account>,
     runtime_state: Arc<RuntimeStateStore>,
     headers: HeaderMap,
+    account_limit_guard: AccountLimitGuard,
+    persist_store: Option<Arc<PersistStore>>,
+    api_key: Option<String>,
 ) -> Response {
     let status = upstream.status();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
 
     tokio::spawn(async move {
+        let _account_limit_guard = account_limit_guard;
         let mut upstream_stream = upstream.bytes_stream();
         let mut buf = BytesMut::new();
         let mut recorded_usage = false;
@@ -329,12 +431,20 @@ fn build_passthrough_sse_response(
                 if line.is_empty() {
                     continue;
                 }
-                if record_usage_from_sse_line(
+                if let Some(usage) = record_usage_from_sse_line(
                     account.as_ref(),
                     runtime_state.as_ref(),
                     crate::core::now_unix_ms(),
                     line,
                 ) {
+                    record_persist_usage(
+                        persist_store.as_ref(),
+                        endpoint,
+                        &model,
+                        api_key.clone(),
+                        account.as_ref(),
+                        usage,
+                    );
                     recorded_usage = true;
                     break;
                 }
@@ -344,12 +454,21 @@ fn build_passthrough_sse_response(
         if !recorded_usage {
             let line = trim_ascii(buf.as_ref());
             if !line.is_empty() {
-                let _ = record_usage_from_sse_line(
+                if let Some(usage) = record_usage_from_sse_line(
                     account.as_ref(),
                     runtime_state.as_ref(),
                     crate::core::now_unix_ms(),
                     line,
-                );
+                ) {
+                    record_persist_usage(
+                        persist_store.as_ref(),
+                        endpoint,
+                        &model,
+                        api_key,
+                        account.as_ref(),
+                        usage,
+                    );
+                }
             }
         }
     });
@@ -370,6 +489,10 @@ fn build_passthrough_sse_response(
 pub fn router(state: AppState) -> Router {
     let mgmt = Router::new()
         .route("/stats", get(stats))
+        .route("/admin/request-logs", get(admin_request_logs))
+        .route("/admin/usage-logs", get(admin_usage_logs))
+        .route("/admin/account-status", get(admin_account_status))
+        .route("/admin/rate-limits", get(admin_rate_limits))
         .route("/refresh", post(refresh))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
@@ -389,10 +512,13 @@ pub fn router(state: AppState) -> Router {
         .route("/messages/count_tokens", post(v1_messages_count_tokens))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
+    let frontend = ServeDir::new(FRONTEND_DIST_DIR)
+        .fallback(ServeFile::new(format!("{FRONTEND_DIST_DIR}/index.html")));
+
     let non_v1 = Router::new()
-        .route("/", get(index))
         .route("/health", get(health))
         .merge(mgmt)
+        .fallback_service(frontend)
         .layer(CompressionLayer::new());
 
     Router::new()
@@ -401,10 +527,6 @@ pub fn router(state: AppState) -> Router {
         .nest("/v1", v1)
         .layer(middleware::from_fn(cors_and_options))
         .with_state(state)
-}
-
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
 }
 
 async fn cors_and_options(req: Request<Body>, next: Next) -> Response {
@@ -471,13 +593,29 @@ fn apply_cors_headers(headers: &mut HeaderMap, origin: &str) {
 }
 
 async fn api_key_auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+    let mut req = req;
     if state.api_keys.is_empty() {
+        req.extensions_mut().insert(RequestApiKey(None));
+        match check_request_limits(&state, &req, None) {
+            Ok(guard) => {
+                req.extensions_mut().insert(Arc::new(guard));
+            }
+            Err(resp) => return resp,
+        }
         return next.run(req).await;
     }
 
     let (token, token_source) = extract_api_key(req.headers());
     if let Some(token) = token.as_deref() {
         if state.api_keys.contains(token) {
+            req.extensions_mut()
+                .insert(RequestApiKey(Some(token.to_string())));
+            match check_request_limits(&state, &req, Some(token)) {
+                Ok(guard) => {
+                    req.extensions_mut().insert(Arc::new(guard));
+                }
+                Err(resp) => return resp,
+            }
             return next.run(req).await;
         }
     }
@@ -503,6 +641,30 @@ async fn api_key_auth(State(state): State<AppState>, req: Request<Body>, next: N
         })),
     )
         .into_response()
+}
+
+fn check_request_limits(
+    state: &AppState,
+    req: &Request<Body>,
+    api_key: Option<&str>,
+) -> Result<RequestLimitGuard, Response> {
+    let is_image = req.uri().path().starts_with("/v1/images/");
+    state
+        .rate_limiter
+        .check_request(api_key, is_image)
+        .map_err(|err| {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": {
+                        "message": err.message,
+                        "type": "rate_limit_error",
+                        "code": err.scope,
+                    }
+                })),
+            )
+                .into_response()
+        })
 }
 
 fn extract_api_key(headers: &HeaderMap) -> (Option<String>, &'static str) {
@@ -606,6 +768,32 @@ fn send_claude_upstream_error(err: UpstreamError) -> Response {
             send_claude_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &msg)
         }
     }
+}
+
+async fn execute_codex_request(
+    state: &AppState,
+    model: &str,
+    url: url::Url,
+    body: Vec<u8>,
+    stream: bool,
+    passthrough_headers: Option<&HeaderMap>,
+    initial_excluded: &HashSet<String>,
+) -> Result<UpstreamResponse, UpstreamError> {
+    state
+        .codex_client
+        .execute(UpstreamRequest {
+            manager: state.manager.as_ref(),
+            model,
+            url,
+            body,
+            stream,
+            max_retry: state.max_retry,
+            passthrough_headers,
+            on_401: state.on_401.clone(),
+            initial_excluded,
+            rate_limiter: state.rate_limiter.as_ref(),
+        })
+        .await
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -755,6 +943,8 @@ fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
 }
 
 async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let api_key = api_key_from_req(&req);
+    let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
@@ -808,26 +998,37 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
     };
 
     let endpoint = "/v1/responses";
-    let (upstream, account, attempts) = match state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            stream,
-            state.max_retry,
-            passthrough_headers.as_ref(),
-            state.on_401.clone(),
-        )
-        .await
+    let upstream_result = match execute_codex_request(
+        &state,
+        &base_model,
+        url,
+        codex_body,
+        stream,
+        passthrough_headers.as_ref(),
+        &HashSet::new(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {
             log_upstream_request_error(endpoint, &base_model, stream, &err);
+            record_persist_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                stream,
+                StatusCode::BAD_GATEWAY,
+                api_key,
+                err.to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_upstream_error(err);
         }
     };
+    let upstream = upstream_result.response;
+    let account = upstream_result.account;
+    let attempts = upstream_result.attempts;
+    let account_limit_guard = upstream_result.account_limit_guard;
 
     if stream {
         let status = upstream.status();
@@ -845,6 +1046,17 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             status,
             attempts,
             account.as_ref(),
+        );
+        record_persist_request(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            api_key.clone(),
+            Some(account.as_ref()),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
         );
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -866,6 +1078,9 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             account,
             state.runtime_state.clone(),
             headers,
+            account_limit_guard,
+            state.persist_store.clone(),
+            api_key,
         );
     }
 
@@ -882,12 +1097,21 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         }
     };
     let now_ms = crate::core::now_unix_ms();
-    record_usage_from_json_bytes(
+    if let Some(usage) = record_usage_from_json_bytes(
         account.as_ref(),
         state.runtime_state.as_ref(),
         now_ms,
         bytes.as_ref(),
-    );
+    ) {
+        record_persist_usage(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            api_key.clone(),
+            account.as_ref(),
+            usage,
+        );
+    }
     record_client_success(
         account.as_ref(),
         state.request_stats.as_ref(),
@@ -901,6 +1125,17 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         status,
         attempts,
         account.as_ref(),
+    );
+    record_persist_request(
+        state.persist_store.as_ref(),
+        endpoint,
+        &base_model,
+        false,
+        status,
+        attempts,
+        api_key,
+        Some(account.as_ref()),
+        now_ms.saturating_sub(started_ms),
     );
 
     let mut resp = Response::new(Body::from(bytes));
@@ -1120,20 +1355,20 @@ async fn forward_responses_sse_as_ws(
         .responses_url()
         .map_err(ResponsesWsError::Local)?;
 
-    let (upstream, account, _attempts) = state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            true,
-            state.max_retry,
-            passthrough_headers,
-            state.on_401.clone(),
-        )
-        .await
-        .map_err(ResponsesWsError::Upstream)?;
+    let upstream_result = execute_codex_request(
+        state,
+        &base_model,
+        url,
+        codex_body,
+        true,
+        passthrough_headers,
+        &HashSet::new(),
+    )
+    .await
+    .map_err(ResponsesWsError::Upstream)?;
+    let upstream = upstream_result.response;
+    let account = upstream_result.account;
+    let _account_limit_guard = upstream_result.account_limit_guard;
 
     let mut has_text = false;
     let mut has_tool = false;
@@ -1249,6 +1484,8 @@ async fn close_ws(socket: &mut WebSocket, code: CloseCode, reason: &str) {
 }
 
 async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let api_key = api_key_from_req(&req);
+    let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
@@ -1290,26 +1527,37 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
     };
 
     let endpoint = "/v1/messages";
-    let (upstream, account, attempts) = match state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            true,
-            state.max_retry,
-            passthrough_headers.as_ref(),
-            state.on_401.clone(),
-        )
-        .await
+    let upstream_result = match execute_codex_request(
+        &state,
+        &base_model,
+        url,
+        codex_body,
+        true,
+        passthrough_headers.as_ref(),
+        &HashSet::new(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {
             log_upstream_request_error(endpoint, &base_model, stream, &err);
+            record_persist_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                stream,
+                StatusCode::BAD_GATEWAY,
+                api_key,
+                err.to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_claude_upstream_error(err);
         }
     };
+    let upstream = upstream_result.response;
+    let account = upstream_result.account;
+    let attempts = upstream_result.attempts;
+    let account_limit_guard = upstream_result.account_limit_guard;
 
     if stream {
         let status = upstream.status();
@@ -1321,15 +1569,30 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
             attempts,
             account.as_ref(),
         );
+        record_persist_request(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            api_key.clone(),
+            Some(account.as_ref()),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
         let account_for_log = account.clone();
         let model_for_log = base_model.clone();
+        let persist_store = state.persist_store.clone();
+        let api_key_for_persist = api_key.clone();
         tokio::spawn(async move {
+            let _account_limit_guard = account_limit_guard;
             let mut buf = BytesMut::new();
             let mut state = ClaudeStreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
+            let mut usage_for_persist = None;
 
             while let Some(chunk) = upstream_stream.next().await {
                 let chunk = match chunk {
@@ -1357,6 +1620,15 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                         continue;
                     }
 
+                    if usage_for_persist.is_none() {
+                        usage_for_persist = record_usage_from_sse_line(
+                            account.as_ref(),
+                            runtime_state.as_ref(),
+                            crate::core::now_unix_ms(),
+                            line,
+                        );
+                    }
+
                     let events = convert_codex_stream_to_claude_events(line, &mut state);
                     for evt in events {
                         if tx.send(Ok(evt.into_bytes())).await.is_err() {
@@ -1381,6 +1653,16 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                     runtime_state.as_ref(),
                     now_ms,
                 );
+                if let Some(usage) = usage_for_persist {
+                    record_persist_usage(
+                        persist_store.as_ref(),
+                        endpoint,
+                        &base_model,
+                        api_key_for_persist,
+                        account.as_ref(),
+                        usage,
+                    );
+                }
             } else {
                 log_stream_incomplete(
                     endpoint,
@@ -1456,6 +1738,21 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
     }
 
     let now_ms = crate::core::now_unix_ms();
+    if let Some(usage) = record_usage_from_sse_bytes(
+        account.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+        &bytes,
+    ) {
+        record_persist_usage(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            api_key.clone(),
+            account.as_ref(),
+            usage,
+        );
+    }
     record_client_success(
         account.as_ref(),
         state.request_stats.as_ref(),
@@ -1469,6 +1766,17 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         StatusCode::OK,
         attempts,
         account.as_ref(),
+    );
+    record_persist_request(
+        state.persist_store.as_ref(),
+        endpoint,
+        &base_model,
+        false,
+        StatusCode::OK,
+        attempts,
+        api_key,
+        Some(account.as_ref()),
+        now_ms.saturating_sub(started_ms),
     );
 
     let mut resp = Response::new(Body::from(result.json));
@@ -1723,6 +2031,8 @@ fn collect_tool_call_id(item: &serde_json::Value, ids: &mut HashSet<String>) {
 }
 
 async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let api_key = api_key_from_req(&req);
+    let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
@@ -1771,26 +2081,37 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
     };
 
     let endpoint = "/v1/responses/compact";
-    let (upstream, account, attempts) = match state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            stream,
-            state.max_retry,
-            passthrough_headers.as_ref(),
-            state.on_401.clone(),
-        )
-        .await
+    let upstream_result = match execute_codex_request(
+        &state,
+        &base_model,
+        url,
+        codex_body,
+        stream,
+        passthrough_headers.as_ref(),
+        &HashSet::new(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {
             log_upstream_request_error(endpoint, &base_model, stream, &err);
+            record_persist_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                stream,
+                StatusCode::BAD_GATEWAY,
+                api_key,
+                err.to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_upstream_error(err);
         }
     };
+    let upstream = upstream_result.response;
+    let account = upstream_result.account;
+    let attempts = upstream_result.attempts;
+    let account_limit_guard = upstream_result.account_limit_guard;
 
     if stream {
         let headers = upstream.headers().clone();
@@ -1810,6 +2131,17 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             attempts,
             account.as_ref(),
         );
+        record_persist_request(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            api_key.clone(),
+            Some(account.as_ref()),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
         return build_passthrough_sse_response(
             endpoint,
             base_model,
@@ -1817,6 +2149,9 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             account,
             state.runtime_state.clone(),
             headers,
+            account_limit_guard,
+            state.persist_store.clone(),
+            api_key,
         );
     }
 
@@ -1832,12 +2167,21 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         }
     };
     let now_ms = crate::core::now_unix_ms();
-    record_usage_from_json_bytes(
+    if let Some(usage) = record_usage_from_json_bytes(
         account.as_ref(),
         state.runtime_state.as_ref(),
         now_ms,
         bytes.as_ref(),
-    );
+    ) {
+        record_persist_usage(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            api_key.clone(),
+            account.as_ref(),
+            usage,
+        );
+    }
     record_client_success(
         account.as_ref(),
         state.request_stats.as_ref(),
@@ -1851,6 +2195,17 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
         StatusCode::OK,
         attempts,
         account.as_ref(),
+    );
+    record_persist_request(
+        state.persist_store.as_ref(),
+        endpoint,
+        &base_model,
+        false,
+        StatusCode::OK,
+        attempts,
+        api_key,
+        Some(account.as_ref()),
+        now_ms.saturating_sub(started_ms),
     );
 
     let mut resp = Response::new(Body::from(bytes));
@@ -1908,6 +2263,8 @@ fn clean_compact_value_to_vec(mut v: serde_json::Value, base_model: &str) -> Vec
 }
 
 async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let api_key = api_key_from_req(&req);
+    let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
@@ -1959,26 +2316,37 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
     let endpoint = "/v1/chat/completions";
     if stream {
-        let (upstream, account, attempts) = match state
-            .codex_client
-            .send_with_retry(
-                &state.manager,
-                &base_model,
-                url,
-                codex_body,
-                true,
-                state.max_retry,
-                passthrough_headers.as_ref(),
-                state.on_401.clone(),
-            )
-            .await
+        let upstream_result = match execute_codex_request(
+            &state,
+            &base_model,
+            url,
+            codex_body,
+            true,
+            passthrough_headers.as_ref(),
+            &HashSet::new(),
+        )
+        .await
         {
             Ok(v) => v,
             Err(err) => {
                 log_upstream_request_error(endpoint, &base_model, true, &err);
+                record_persist_error(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    true,
+                    StatusCode::BAD_GATEWAY,
+                    api_key,
+                    err.to_string(),
+                    crate::core::now_unix_ms().saturating_sub(started_ms),
+                );
                 return send_upstream_error(err);
             }
         };
+        let upstream = upstream_result.response;
+        let account = upstream_result.account;
+        let attempts = upstream_result.attempts;
+        let account_limit_guard = upstream_result.account_limit_guard;
 
         let status = upstream.status();
         log_request_completed(
@@ -1989,12 +2357,26 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             attempts,
             account.as_ref(),
         );
+        record_persist_request(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            api_key.clone(),
+            Some(account.as_ref()),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let account = account.clone();
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
         let model_for_log = base_model.clone();
+        let persist_store = state.persist_store.clone();
+        let api_key_for_persist = api_key.clone();
         tokio::spawn(async move {
+            let _account_limit_guard = account_limit_guard;
             let mut buf = BytesMut::new();
             let mut state = StreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
@@ -2053,6 +2435,14 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                         usage.total_tokens,
                     );
                     record_hourly_usage(runtime_state.as_ref(), now_ms, usage);
+                    record_persist_usage(
+                        persist_store.as_ref(),
+                        endpoint,
+                        &base_model,
+                        api_key_for_persist,
+                        account.as_ref(),
+                        usage,
+                    );
                 }
                 record_client_success(
                     account.as_ref(),
@@ -2095,27 +2485,37 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 
     let mut excluded_for_empty = HashSet::new();
     for empty_attempt in 0..=state.empty_retry_max {
-        let (upstream, account, attempts) = match state
-            .codex_client
-            .send_with_retry_excluding(
-                &state.manager,
-                &base_model,
-                url.clone(),
-                codex_body.clone(),
-                true,
-                state.max_retry,
-                passthrough_headers.as_ref(),
-                state.on_401.clone(),
-                &excluded_for_empty,
-            )
-            .await
+        let upstream_result = match execute_codex_request(
+            &state,
+            &base_model,
+            url.clone(),
+            codex_body.clone(),
+            true,
+            passthrough_headers.as_ref(),
+            &excluded_for_empty,
+        )
+        .await
         {
             Ok(v) => v,
             Err(err) => {
                 log_upstream_request_error(endpoint, &base_model, false, &err);
+                record_persist_error(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    false,
+                    StatusCode::BAD_GATEWAY,
+                    api_key.clone(),
+                    err.to_string(),
+                    crate::core::now_unix_ms().saturating_sub(started_ms),
+                );
                 return send_upstream_error(err);
             }
         };
+        let upstream = upstream_result.response;
+        let account = upstream_result.account;
+        let attempts = upstream_result.attempts;
+        let _account_limit_guard = upstream_result.account_limit_guard;
 
         let bytes = match upstream.bytes().await {
             Ok(b) => b,
@@ -2137,7 +2537,17 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             state.runtime_state.as_ref(),
             now_ms,
         ) {
-            ChatNonStreamOutcome::Success(out) => {
+            ChatNonStreamOutcome::Success { body, usage } => {
+                if let Some(usage) = usage {
+                    record_persist_usage(
+                        state.persist_store.as_ref(),
+                        endpoint,
+                        &base_model,
+                        api_key.clone(),
+                        account.as_ref(),
+                        usage,
+                    );
+                }
                 record_client_success(
                     account.as_ref(),
                     state.request_stats.as_ref(),
@@ -2152,7 +2562,18 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     attempts,
                     account.as_ref(),
                 );
-                let mut resp = Response::new(Body::from(out));
+                record_persist_request(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    false,
+                    StatusCode::OK,
+                    attempts,
+                    api_key,
+                    Some(account.as_ref()),
+                    now_ms.saturating_sub(started_ms),
+                );
+                let mut resp = Response::new(Body::from(body));
                 *resp.status_mut() = StatusCode::OK;
                 resp.headers_mut().insert(
                     header::CONTENT_TYPE,
@@ -2202,6 +2623,8 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
 }
 
 async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
+    let api_key = api_key_from_req(&req);
+    let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
         Ok(b) => b,
@@ -2253,26 +2676,37 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
     };
 
     let endpoint = "/v1/completions";
-    let (upstream, account, attempts) = match state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            true,
-            state.max_retry,
-            passthrough_headers.as_ref(),
-            state.on_401.clone(),
-        )
-        .await
+    let upstream_result = match execute_codex_request(
+        &state,
+        &base_model,
+        url,
+        codex_body,
+        true,
+        passthrough_headers.as_ref(),
+        &HashSet::new(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {
             log_upstream_request_error(endpoint, &base_model, stream, &err);
+            record_persist_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                stream,
+                StatusCode::BAD_GATEWAY,
+                api_key.clone(),
+                err.to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_upstream_error(err);
         }
     };
+    let upstream = upstream_result.response;
+    let account = upstream_result.account;
+    let attempts = upstream_result.attempts;
+    let account_limit_guard = upstream_result.account_limit_guard;
 
     if stream {
         let status = upstream.status();
@@ -2284,12 +2718,26 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
             attempts,
             account.as_ref(),
         );
+        record_persist_request(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            true,
+            status,
+            attempts,
+            api_key.clone(),
+            Some(account.as_ref()),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(256);
         let account = account.clone();
         let request_stats = state.request_stats.clone();
         let runtime_state = state.runtime_state.clone();
         let model_for_log = base_model.clone();
+        let persist_store = state.persist_store.clone();
+        let api_key_for_persist = api_key.clone();
         tokio::spawn(async move {
+            let _account_limit_guard = account_limit_guard;
             let mut buf = BytesMut::new();
             let mut state = StreamState::new(&base_model);
             let mut upstream_stream = upstream.bytes_stream();
@@ -2350,6 +2798,14 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
                         usage.total_tokens,
                     );
                     record_hourly_usage(runtime_state.as_ref(), now_ms, usage);
+                    record_persist_usage(
+                        persist_store.as_ref(),
+                        endpoint,
+                        &base_model,
+                        api_key_for_persist,
+                        account.as_ref(),
+                        usage,
+                    );
                 }
                 record_client_success(
                     account.as_ref(),
@@ -2410,7 +2866,17 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
         state.runtime_state.as_ref(),
         now_ms,
     ) {
-        ChatNonStreamOutcome::Success(out) => {
+        ChatNonStreamOutcome::Success { body, usage } => {
+            if let Some(usage) = usage {
+                record_persist_usage(
+                    state.persist_store.as_ref(),
+                    endpoint,
+                    &base_model,
+                    api_key.clone(),
+                    account.as_ref(),
+                    usage,
+                );
+            }
             record_client_success(
                 account.as_ref(),
                 state.request_stats.as_ref(),
@@ -2425,7 +2891,18 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
                 attempts,
                 account.as_ref(),
             );
-            let mut resp = Response::new(Body::from(convert_chat_completion_to_completion(&out)));
+            record_persist_request(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::OK,
+                attempts,
+                api_key,
+                Some(account.as_ref()),
+                now_ms.saturating_sub(started_ms),
+            );
+            let mut resp = Response::new(Body::from(convert_chat_completion_to_completion(&body)));
             *resp.status_mut() = StatusCode::OK;
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -2455,6 +2932,8 @@ async fn v1_images_edits(State(state): State<AppState>, req: Request<Body>) -> R
 }
 
 async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response {
+    let api_key = api_key_from_req(&req);
+    let started_ms = crate::core::now_unix_ms();
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
     let raw_value = match parse_image_request_value(req).await {
         Ok(value) => value,
@@ -2501,26 +2980,37 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
         }
     };
 
-    let (upstream, account, attempts) = match state
-        .codex_client
-        .send_with_retry(
-            &state.manager,
-            &base_model,
-            url,
-            codex_body,
-            true,
-            state.max_retry,
-            passthrough_headers.as_ref(),
-            state.on_401.clone(),
-        )
-        .await
+    let upstream_result = match execute_codex_request(
+        &state,
+        &base_model,
+        url,
+        codex_body,
+        true,
+        passthrough_headers.as_ref(),
+        &HashSet::new(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(err) => {
             log_upstream_request_error(endpoint, &base_model, true, &err);
+            record_persist_error(
+                state.persist_store.as_ref(),
+                endpoint,
+                &base_model,
+                false,
+                StatusCode::BAD_GATEWAY,
+                api_key.clone(),
+                err.to_string(),
+                crate::core::now_unix_ms().saturating_sub(started_ms),
+            );
             return send_upstream_error(err);
         }
     };
+    let upstream = upstream_result.response;
+    let account = upstream_result.account;
+    let attempts = upstream_result.attempts;
+    let _account_limit_guard = upstream_result.account_limit_guard;
 
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
@@ -2535,12 +3025,21 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
     };
 
     let now_ms = crate::core::now_unix_ms();
-    record_usage_from_sse_bytes(
+    if let Some(usage) = record_usage_from_sse_bytes(
         account.as_ref(),
         state.runtime_state.as_ref(),
         now_ms,
         &bytes,
-    );
+    ) {
+        record_persist_usage(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            api_key.clone(),
+            account.as_ref(),
+            usage,
+        );
+    }
     let Some(out) = convert_responses_sse_to_images_json(&bytes, &response_format) else {
         return send_error(
             StatusCode::BAD_GATEWAY,
@@ -2562,6 +3061,17 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
         StatusCode::OK,
         attempts,
         account.as_ref(),
+    );
+    record_persist_request(
+        state.persist_store.as_ref(),
+        endpoint,
+        &base_model,
+        false,
+        StatusCode::OK,
+        attempts,
+        api_key,
+        Some(account.as_ref()),
+        now_ms.saturating_sub(started_ms),
     );
 
     let mut resp = Response::new(Body::from(out));
@@ -2698,7 +3208,10 @@ fn insert_multipart_value(
 
 #[derive(Debug)]
 enum ChatNonStreamOutcome {
-    Success(String),
+    Success {
+        body: String,
+        usage: Option<UsageTokens>,
+    },
     Empty,
     MissingCompleted,
 }
@@ -2714,6 +3227,7 @@ fn parse_chat_non_stream_response(
         return ChatNonStreamOutcome::MissingCompleted;
     };
 
+    let mut recorded_usage = None;
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&completed_payload) {
         if let Some(usage) = extract_usage_tokens(&v) {
             account.record_usage_detail(
@@ -2724,12 +3238,16 @@ fn parse_chat_non_stream_response(
                 usage.total_tokens,
             );
             record_hourly_usage(runtime_state, now_ms, usage);
+            recorded_usage = Some(usage);
         }
     }
 
     let (out, has_output) = convert_non_stream_response(&completed_payload, reverse_tool_map);
     if has_output && !out.is_empty() {
-        ChatNonStreamOutcome::Success(out)
+        ChatNonStreamOutcome::Success {
+            body: out,
+            usage: recorded_usage,
+        }
     } else {
         ChatNonStreamOutcome::Empty
     }
@@ -3115,6 +3633,68 @@ struct StatsResponse {
     accounts: Vec<StatsAccount>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct LogQuery {
+    #[serde(default = "default_log_limit")]
+    limit: usize,
+}
+
+fn default_log_limit() -> usize {
+    100
+}
+
+async fn admin_request_logs(
+    State(state): State<AppState>,
+    Query(query): Query<LogQuery>,
+) -> Response {
+    let Some(store) = state.persist_store.as_ref() else {
+        return send_error(
+            StatusCode::NOT_FOUND,
+            "persistence is disabled",
+            "not_found",
+        );
+    };
+    match store.list_request_logs(query.limit).await {
+        Ok(data) => Json(json!({ "data": data })).into_response(),
+        Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
+    }
+}
+
+async fn admin_usage_logs(
+    State(state): State<AppState>,
+    Query(query): Query<LogQuery>,
+) -> Response {
+    let Some(store) = state.persist_store.as_ref() else {
+        return send_error(
+            StatusCode::NOT_FOUND,
+            "persistence is disabled",
+            "not_found",
+        );
+    };
+    match store.list_usage_logs(query.limit).await {
+        Ok(data) => Json(json!({ "data": data })).into_response(),
+        Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
+    }
+}
+
+async fn admin_account_status(State(state): State<AppState>) -> Response {
+    let Some(store) = state.persist_store.as_ref() else {
+        return send_error(
+            StatusCode::NOT_FOUND,
+            "persistence is disabled",
+            "not_found",
+        );
+    };
+    match store.list_account_status().await {
+        Ok(data) => Json(json!({ "data": data })).into_response(),
+        Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
+    }
+}
+
+async fn admin_rate_limits(State(state): State<AppState>) -> Response {
+    Json(json!({ "data": state.rate_limiter.snapshot() })).into_response()
+}
+
 async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     let accounts = state.manager.accounts_snapshot();
     let now_ms = crate::core::now_unix_ms();
@@ -3130,6 +3710,9 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
 
     for acc in accounts.iter() {
         let snap = acc.stats_snapshot();
+        if let Some(store) = state.persist_store.as_ref() {
+            store.record_account_status((&snap).into());
+        }
         match snap.status {
             crate::core::AccountStatus::Active => active += 1,
             crate::core::AccountStatus::Cooldown => cooldown += 1,
@@ -3301,6 +3884,8 @@ mod tests {
             refresh_concurrency: 1,
             runtime_state: Arc::new(RuntimeStateStore::new(dir.path())),
             on_401: None,
+            rate_limiter: Arc::new(RateLimiter::default()),
+            persist_store: None,
         };
 
         let app = router(state);
@@ -3348,6 +3933,8 @@ mod tests {
             refresh_concurrency: 1,
             runtime_state: Arc::new(RuntimeStateStore::new(dir.path())),
             on_401: None,
+            rate_limiter: Arc::new(RateLimiter::default()),
+            persist_store: None,
         };
 
         let app = router(state);
@@ -3428,10 +4015,11 @@ mod tests {
             parse_chat_non_stream_response(raw.as_bytes(), &reverse, &account, &runtime_state, 1);
 
         match out {
-            ChatNonStreamOutcome::Success(json) => {
-                let value: Value = serde_json::from_str(&json).unwrap();
+            ChatNonStreamOutcome::Success { body, usage } => {
+                let value: Value = serde_json::from_str(&body).unwrap();
                 assert_eq!(value["choices"][0]["message"]["content"], "hi");
                 assert_eq!(value["usage"]["completion_tokens"], 2);
+                assert_eq!(usage.unwrap().total_tokens, 3);
             }
             other => panic!("unexpected outcome: {other:?}"),
         }

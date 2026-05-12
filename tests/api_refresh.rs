@@ -86,6 +86,8 @@ async fn api_refresh_no_accounts_emits_done_event() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -162,6 +164,8 @@ async fn api_refresh_with_account_emits_item_and_done_events() {
         refresh_concurrency: 2,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -253,6 +257,8 @@ async fn api_refresh_preserves_existing_cooldown_when_refresh_cannot_run() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);

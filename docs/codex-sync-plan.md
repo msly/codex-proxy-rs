@@ -39,7 +39,7 @@ Upstream HTTP requests should no longer rely only on hard-coded header values. W
 
 #### Detailed Work
 
-- Extend `CodexClient::send_with_retry` and `send_with_retry_excluding` to accept optional passthrough header input.
+- Keep `CodexClient::execute` as the single upstream request path and pass optional passthrough headers through `UpstreamRequest`.
 - Restrict passthrough to a whitelist:
   - `Version`
   - `Session_id`

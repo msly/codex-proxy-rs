@@ -110,6 +110,48 @@ pub struct Config {
 
     #[serde(rename = "user-agent")]
     pub user_agent: String,
+
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
+
+    #[serde(rename = "rate-limits")]
+    #[serde(default)]
+    pub rate_limits: RateLimitConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PersistenceConfig {
+    pub enabled: bool,
+    #[serde(rename = "sqlite-path")]
+    pub sqlite_path: String,
+    #[serde(rename = "request-log-retention-days")]
+    pub request_log_retention_days: u64,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sqlite_path: "./codex-proxy.sqlite3".to_string(),
+            request_log_retention_days: 30,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RateLimitConfig {
+    #[serde(rename = "key-rpm")]
+    pub key_rpm: u64,
+    #[serde(rename = "key-concurrency")]
+    pub key_concurrency: usize,
+    #[serde(rename = "account-rpm")]
+    pub account_rpm: u64,
+    #[serde(rename = "account-concurrency")]
+    pub account_concurrency: usize,
+    #[serde(rename = "image-concurrency")]
+    pub image_concurrency: usize,
 }
 
 impl Default for Config {
@@ -150,6 +192,8 @@ impl Default for Config {
             api_keys: Vec::new(),
             client_version: String::new(),
             user_agent: String::new(),
+            persistence: PersistenceConfig::default(),
+            rate_limits: RateLimitConfig::default(),
         }
     }
 }
@@ -276,6 +320,13 @@ impl Config {
 
         self.client_version = self.client_version.trim().to_string();
         self.user_agent = self.user_agent.trim().to_string();
+        self.persistence.sqlite_path = self.persistence.sqlite_path.trim().to_string();
+        if self.persistence.sqlite_path.is_empty() {
+            self.persistence.sqlite_path = "./codex-proxy.sqlite3".to_string();
+        }
+        if self.persistence.request_log_retention_days == 0 {
+            self.persistence.request_log_retention_days = 30;
+        }
     }
 
     // Go 允许 ":8080" 形式，Rust bind 需要明确 host。

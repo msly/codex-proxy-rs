@@ -35,6 +35,8 @@ async fn api_index_is_public_and_returns_html() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -61,7 +63,7 @@ async fn api_index_is_public_and_returns_html() {
 }
 
 #[tokio::test]
-async fn api_index_exposes_quota_controls_and_sorting() {
+async fn api_index_serves_frontend_app_shell() {
     let dir = tempfile::tempdir().unwrap();
     let manager = Arc::new(Manager::new(dir.path()));
 
@@ -82,6 +84,8 @@ async fn api_index_exposes_quota_controls_and_sorting() {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     };
 
     let app = api::router(state);
@@ -101,16 +105,9 @@ async fn api_index_exposes_quota_controls_and_sorting() {
         .unwrap();
     let html = String::from_utf8_lossy(&body);
 
+    assert!(html.contains("id=\"root\""), "expected React app root");
     assert!(
-        html.contains("id=\"checkQuotaBtn\""),
-        "expected check quota button in index html"
-    );
-    assert!(
-        html.contains("data-sort-key=\"quota_remaining_sort\""),
-        "expected sortable quota column in index html"
-    );
-    assert!(
-        html.contains("return 0.001"),
-        "expected quota sorting to distinguish unknown from exhausted"
+        html.contains("script") && html.contains("module"),
+        "expected bundled frontend module script"
     );
 }

@@ -10,6 +10,22 @@
   | log-level | info | 日志级别：debug/info/warn/error，非法值会回退到 info |
   | api-keys | [] | API key 鉴权列表；空则关闭鉴权 |
 
+  持久化
+  | 配置项 | 默认值 | 含义 |
+  |---|---:|---|
+  | persistence.enabled | false | 是否启用 SQLite request log / usage log / account status 持久化 |
+  | persistence.sqlite-path | ./codex-proxy.sqlite3 | SQLite 数据库路径 |
+  | persistence.request-log-retention-days | 30 | request_logs / usage_logs 保留天数 |
+
+  限流
+  | 配置项 | 默认值 | 含义 |
+  |---|---:|---|
+  | rate-limits.key-rpm | 0 | 单个 API key 每分钟请求上限；0 关闭 |
+  | rate-limits.key-concurrency | 0 | 单个 API key 并发上限；0 关闭 |
+  | rate-limits.account-rpm | 0 | 单个账号每分钟上游请求上限；0 关闭 |
+  | rate-limits.account-concurrency | 0 | 单个账号上游并发上限；0 关闭 |
+  | rate-limits.image-concurrency | 0 | 图片端点进程级并发上限；0 关闭 |
+
   刷新与运行时
   | 配置项 | 默认值 | 含义 |
   |---|---:|---|

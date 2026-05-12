@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use codex_proxy_rs::health::{HealthChecker, HealthCheckerConfig, KeepAlive, KeepAliveConfig};
+use codex_proxy_rs::limit::RateLimiter;
+use codex_proxy_rs::persist::PersistStore;
 use codex_proxy_rs::refresh::{
     AuthScanLoop, AuthScanLoopConfig, RefreshLoop, RefreshLoopConfig, Refresher, SaveQueue,
     refresh_account_with_options,
@@ -161,6 +163,15 @@ async fn main() -> Result<(), String> {
         .filter(|k| !k.is_empty())
         .collect();
 
+    let rate_limiter = Arc::new(RateLimiter::new(cfg.rate_limits.clone()));
+    let persist_store = if cfg.persistence.enabled {
+        let store = Arc::new(PersistStore::start(&cfg.persistence.sqlite_path)?);
+        store.cleanup_older_than_days(cfg.persistence.request_log_retention_days);
+        Some(store)
+    } else {
+        None
+    };
+
     tracing::info!(
         listen = %cfg.listen,
         bind_addr = %cfg.bind_addr(),
@@ -184,6 +195,8 @@ async fn main() -> Result<(), String> {
         refresh_concurrency: cfg.refresh_concurrency as usize,
         runtime_state: runtime_state.clone(),
         on_401: Some(on_401),
+        rate_limiter,
+        persist_store: persist_store.clone(),
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr())
         .await

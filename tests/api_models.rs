@@ -40,6 +40,8 @@ fn build_state() -> AppState {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     }
 }
 

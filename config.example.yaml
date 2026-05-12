@@ -24,6 +24,20 @@ selector: "round-robin" # or "quota-first"
 api-keys:
   - "sk-123"
 
+# SQLite persistence for request logs, usage logs, and latest account status.
+persistence:
+  enabled: true
+  sqlite-path: "./data/codex-proxy.sqlite3"
+  request-log-retention-days: 30
+
+# Process-local limits. 0 disables that limit.
+rate-limits:
+  key-rpm: 0
+  key-concurrency: 0
+  account-rpm: 0
+  account-concurrency: 0
+  image-concurrency: 0
+
 # Health checker. Set interval to 0 to disable.
 health-check-interval: 0
 health-check-max-failures: 3
@@ -61,7 +75,6 @@ upstream-timeout-sec: 0
 # Override upstream client identity headers (leave empty to use defaults).
 client-version: "0.125.0"
 user-agent: "codex_cli_rs/0.125.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-
 
 
 

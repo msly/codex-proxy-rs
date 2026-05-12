@@ -148,6 +148,8 @@ fn build_state_with_empty_retry(
             std::env::temp_dir(),
         )),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     }
 }
 

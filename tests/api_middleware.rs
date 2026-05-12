@@ -36,6 +36,8 @@ fn make_state(dir: &tempfile::TempDir, api_key_enabled: bool) -> AppState {
         refresh_concurrency: 1,
         runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     }
 }
 
@@ -159,7 +161,8 @@ async fn api_gzip_applies_to_non_v1_routes() {
     let mut decoder = GzDecoder::new(&bytes[..]);
     let mut out = String::new();
     decoder.read_to_string(&mut out).unwrap();
-    assert!(out.contains("数据统计与展示"));
+    assert!(out.contains("id=\"root\""));
+    assert!(out.contains("module"));
 }
 
 #[tokio::test]

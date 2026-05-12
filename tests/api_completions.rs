@@ -75,6 +75,8 @@ fn build_state(base_url: Url, manager: Arc<Manager>) -> AppState {
             std::env::temp_dir(),
         )),
         on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
     }
 }
 

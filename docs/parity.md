@@ -6,7 +6,7 @@
 
 | 端点 | Rust | 说明 |
 |---|---:|---|
-| `GET /` | ✅ | embed `assets/index.html`（统计/展示首页） |
+| `GET /` | ✅ | 托管独立前端构建产物 `frontend/dist` |
 | `GET /health` | ✅ | 不鉴权；返回 `status` + `accounts` |
 | `POST /check-quota` | ✅ | SSE；查询 wham/usage 并缓存 quota raw JSON |
 | `GET /stats` | ✅ | summary + rpm + token totals + accounts + quota raw JSON cache |
@@ -21,6 +21,8 @@
 | `POST /v1/messages/count_tokens` | ✅ | Claude 兼容本地 token 估算 |
 | `POST /v1/responses/compact` | ✅ | stream/non-stream passthrough（上游 `/responses/compact`） |
 | `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` / `response.append` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
+| `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status` | ✅ | SQLite 持久化查询 |
+| `GET /admin/rate-limits` | ✅ | 暴露 key/account/image 当前限流配置 |
 
 ## 中间件与基础行为
 
@@ -29,6 +31,8 @@
 | OPTIONS 预检直通 | ✅ | 全局 OPTIONS 返回 204；绕过 api-key 鉴权 |
 | CORS headers | ✅ | `Access-Control-Allow-Origin` + `Vary: Origin` |
 | gzip | ✅ | 仅 non-`/v1/*`；SSE 不压缩 |
+| SQLite persistence | ✅ | request log / usage log / latest account status |
+| rate limiting | ✅ | API key RPM/并发、account RPM/并发、图片独立并发 |
 
 ## 鉴权
 
