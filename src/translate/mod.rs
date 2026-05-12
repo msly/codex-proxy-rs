@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod completions;
+pub mod images;
 pub mod request;
 pub mod response;
 
@@ -11,6 +12,7 @@ pub use completions::{
     convert_chat_completion_chunk_to_completion_chunk, convert_chat_completion_to_completion,
     convert_completions_request_to_chat_value,
 };
+pub use images::{convert_image_request_to_responses_value, convert_responses_sse_to_images_json};
 pub use request::{build_reverse_tool_name_map, convert_openai_request_to_codex};
 pub use response::{
     StreamState, convert_non_stream_response, convert_stream_chunk,

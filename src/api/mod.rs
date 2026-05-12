@@ -36,7 +36,8 @@ use crate::translate::{
     ClaudeStreamState, StreamState, convert_chat_completion_chunk_to_completion_chunk,
     convert_chat_completion_to_completion, convert_claude_request_to_openai,
     convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
-    convert_completions_request_to_chat_value, convert_non_stream_response, convert_stream_chunk,
+    convert_completions_request_to_chat_value, convert_image_request_to_responses_value,
+    convert_non_stream_response, convert_responses_sse_to_images_json, convert_stream_chunk,
     extract_completed_response_payload,
 };
 use crate::upstream::codex::CodexClient;
@@ -264,6 +265,24 @@ fn record_usage_from_sse_line(
     had_usage
 }
 
+fn record_usage_from_sse_bytes(
+    account: &Account,
+    runtime_state: &RuntimeStateStore,
+    now_ms: i64,
+    bytes: &[u8],
+) -> bool {
+    for line in bytes.split(|b| *b == b'\n') {
+        let line = trim_ascii(line);
+        if line.is_empty() {
+            continue;
+        }
+        if record_usage_from_sse_line(account, runtime_state, now_ms, line) {
+            return true;
+        }
+    }
+    false
+}
+
 fn build_passthrough_sse_response(
     endpoint: &'static str,
     model: String,
@@ -363,6 +382,8 @@ pub fn router(state: AppState) -> Router {
         .route("/models", get(v1_models))
         .route("/chat/completions", post(v1_chat_completions))
         .route("/completions", post(v1_completions))
+        .route("/images/generations", post(v1_images_generations))
+        .route("/images/edits", post(v1_images_edits))
         .route("/messages", post(v1_messages))
         .route("/messages/count_tokens", post(v1_messages_count_tokens))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
@@ -2422,6 +2443,142 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
             "api_error",
         ),
     }
+}
+
+async fn v1_images_generations(State(state): State<AppState>, req: Request<Body>) -> Response {
+    v1_images(state, req, false).await
+}
+
+async fn v1_images_edits(State(state): State<AppState>, req: Request<Body>) -> Response {
+    v1_images(state, req, true).await
+}
+
+async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response {
+    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
+    let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => {
+            return send_error(
+                StatusCode::BAD_REQUEST,
+                "读取请求体失败",
+                "invalid_request_error",
+            );
+        }
+    };
+
+    let raw_value: serde_json::Value = serde_json::from_slice(&raw)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let response_format = raw_value
+        .get("response_format")
+        .and_then(|value| value.as_str())
+        .unwrap_or("url")
+        .to_string();
+    let mut body_value = convert_image_request_to_responses_value(raw_value, edit);
+    let model = body_value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if model.trim().is_empty() {
+        return send_error(
+            StatusCode::BAD_REQUEST,
+            "缺少 model 字段",
+            "invalid_request_error",
+        );
+    }
+
+    let endpoint = if edit {
+        "/v1/images/edits"
+    } else {
+        "/v1/images/generations"
+    };
+    tracing::info!(model = %model, endpoint, "received images request");
+
+    let base_model = apply_thinking_to_value(&mut body_value, &model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
+    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
+
+    let url = match state.codex_client.responses_url() {
+        Ok(u) => u,
+        Err(err) => {
+            return send_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("构建上游 URL 失败: {err}"),
+                "server_error",
+            );
+        }
+    };
+
+    let (upstream, account, attempts) = match state
+        .codex_client
+        .send_with_retry(
+            &state.manager,
+            &base_model,
+            url,
+            codex_body,
+            true,
+            state.max_retry,
+            passthrough_headers.as_ref(),
+            state.on_401.clone(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            log_upstream_request_error(endpoint, &base_model, true, &err);
+            return send_upstream_error(err);
+        }
+    };
+
+    let bytes = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
+            return send_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("读取上游响应失败: {err}"),
+                "api_error",
+            );
+        }
+    };
+
+    let now_ms = crate::core::now_unix_ms();
+    record_usage_from_sse_bytes(
+        account.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+        &bytes,
+    );
+    let Some(out) = convert_responses_sse_to_images_json(&bytes, &response_format) else {
+        return send_error(
+            StatusCode::BAD_GATEWAY,
+            "上游响应缺少 image_generation_call 输出",
+            "api_error",
+        );
+    };
+
+    record_client_success(
+        account.as_ref(),
+        state.request_stats.as_ref(),
+        state.runtime_state.as_ref(),
+        now_ms,
+    );
+    log_request_completed(
+        endpoint,
+        &base_model,
+        false,
+        StatusCode::OK,
+        attempts,
+        account.as_ref(),
+    );
+
+    let mut resp = Response::new(Body::from(out));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 #[derive(Debug)]
