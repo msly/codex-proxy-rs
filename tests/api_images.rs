@@ -39,6 +39,7 @@ async fn upstream_responses(
 async fn start_upstream(bodies: Arc<Mutex<Vec<serde_json::Value>>>) -> Url {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
+        .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(UpstreamState { bodies });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -124,10 +125,7 @@ async fn api_v1_images_generations_returns_openai_images_json() {
     let bodies = bodies.lock().unwrap();
     assert_eq!(bodies.len(), 1);
     assert_eq!(bodies[0]["tools"][0]["type"], "image_generation");
-    assert_eq!(
-        bodies[0]["input"][0]["content"][0]["text"],
-        "draw a cat"
-    );
+    assert_eq!(bodies[0]["input"][0]["content"][0]["text"], "draw a cat");
 }
 
 #[tokio::test]
@@ -168,4 +166,119 @@ async fn api_v1_images_edits_includes_input_image() {
         bodies[0]["input"][0]["content"][1]["image_url"],
         "data:image/png;base64,aGVsbG8="
     );
+}
+
+#[tokio::test]
+async fn api_v1_images_edits_accepts_multipart_image() {
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let base_url = start_upstream(bodies.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let boundary = "codexproxyboundary";
+    let body = concat!(
+        "--codexproxyboundary\r\n",
+        "Content-Disposition: form-data; name=\"model\"\r\n\r\n",
+        "gpt-5.4\r\n",
+        "--codexproxyboundary\r\n",
+        "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n",
+        "make it blue\r\n",
+        "--codexproxyboundary\r\n",
+        "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n",
+        "b64_json\r\n",
+        "--codexproxyboundary\r\n",
+        "Content-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\n",
+        "Content-Type: image/png\r\n\r\n",
+        "hello\r\n",
+        "--codexproxyboundary--\r\n",
+    );
+
+    let app = api::router(build_state(base_url, manager, dir.path()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["data"][0]["b64_json"], "aGVsbG8=");
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies[0]["input"][0]["content"][0]["text"], "make it blue");
+    assert_eq!(bodies[0]["input"][0]["content"][1]["type"], "input_image");
+    assert_eq!(
+        bodies[0]["input"][0]["content"][1]["image_url"],
+        "data:image/png;base64,aGVsbG8="
+    );
+}
+
+#[tokio::test]
+async fn api_v1_images_edits_accepts_large_multipart_image() {
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let base_url = start_upstream(bodies.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let boundary = "codexproxylargeboundary";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        concat!(
+            "--codexproxylargeboundary\r\n",
+            "Content-Disposition: form-data; name=\"model\"\r\n\r\n",
+            "gpt-5.4\r\n",
+            "--codexproxylargeboundary\r\n",
+            "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n",
+            "make it blue\r\n",
+            "--codexproxylargeboundary\r\n",
+            "Content-Disposition: form-data; name=\"image\"; filename=\"input.png\"\r\n",
+            "Content-Type: image/png\r\n\r\n",
+        )
+        .as_bytes(),
+    );
+    body.extend(std::iter::repeat_n(b'a', 2 * 1024 * 1024 + 1));
+    body.extend_from_slice(b"\r\n--codexproxylargeboundary--\r\n");
+
+    let app = api::router(build_state(base_url, manager, dir.path()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/edits")
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bodies = bodies.lock().unwrap();
+    let image_url = bodies[0]["input"][0]["content"][1]["image_url"]
+        .as_str()
+        .unwrap();
+    assert!(image_url.starts_with("data:image/png;base64,"));
+    assert!(image_url.len() > 2 * 1024 * 1024);
 }

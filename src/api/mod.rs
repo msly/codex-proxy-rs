@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::State;
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
+use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, State};
 use axum::http::header;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
@@ -15,6 +15,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine;
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use futures_util::stream::unfold;
@@ -2455,19 +2456,10 @@ async fn v1_images_edits(State(state): State<AppState>, req: Request<Body>) -> R
 
 async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response {
     let passthrough_headers = extract_codex_passthrough_headers(req.headers());
-    let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return send_error(
-                StatusCode::BAD_REQUEST,
-                "读取请求体失败",
-                "invalid_request_error",
-            );
-        }
+    let raw_value = match parse_image_request_value(req).await {
+        Ok(value) => value,
+        Err(response) => return response,
     };
-
-    let raw_value: serde_json::Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let response_format = raw_value
         .get("response_format")
         .and_then(|value| value.as_str())
@@ -2579,6 +2571,124 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
         axum::http::HeaderValue::from_static("application/json"),
     );
     resp
+}
+
+async fn parse_image_request_value(req: Request<Body>) -> Result<serde_json::Value, Response> {
+    let is_multipart = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        });
+
+    if is_multipart {
+        return parse_multipart_image_request_value(req).await;
+    }
+
+    let raw = axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            send_error(
+                StatusCode::BAD_REQUEST,
+                "读取请求体失败",
+                "invalid_request_error",
+            )
+        })?;
+
+    Ok(serde_json::from_slice(&raw)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default())))
+}
+
+async fn parse_multipart_image_request_value(
+    mut req: Request<Body>,
+) -> Result<serde_json::Value, Response> {
+    DefaultBodyLimit::max(50 * 1024 * 1024).apply(&mut req);
+    let mut multipart = Multipart::from_request(req, &()).await.map_err(|_| {
+        send_error(
+            StatusCode::BAD_REQUEST,
+            "解析 multipart 请求失败",
+            "invalid_request_error",
+        )
+    })?;
+    let mut object = serde_json::Map::new();
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(send_error(
+                    StatusCode::BAD_REQUEST,
+                    "读取 multipart 字段失败",
+                    "invalid_request_error",
+                ));
+            }
+        };
+        let Some(name) = field.name().map(str::to_string) else {
+            continue;
+        };
+
+        if name == "image" || name == "mask" {
+            let content_type = field.content_type().map(str::to_string);
+            let bytes = field.bytes().await.map_err(|_| {
+                send_error(
+                    StatusCode::BAD_REQUEST,
+                    "读取 multipart 文件失败",
+                    "invalid_request_error",
+                )
+            })?;
+            let mime = content_type.unwrap_or_else(|| "image/png".to_string());
+            let data_url = format!(
+                "data:{};base64,{}",
+                mime,
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            );
+            insert_multipart_value(&mut object, &name, serde_json::Value::String(data_url));
+        } else {
+            let text = field.text().await.map_err(|_| {
+                send_error(
+                    StatusCode::BAD_REQUEST,
+                    "读取 multipart 文本字段失败",
+                    "invalid_request_error",
+                )
+            })?;
+            insert_multipart_value(&mut object, &name, parse_multipart_text_value(text));
+        }
+    }
+
+    Ok(serde_json::Value::Object(object))
+}
+
+fn parse_multipart_text_value(text: String) -> serde_json::Value {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return value;
+        }
+    }
+    serde_json::Value::String(text)
+}
+
+fn insert_multipart_value(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: serde_json::Value,
+) {
+    match object.get_mut(name) {
+        Some(existing) => match existing {
+            serde_json::Value::Array(values) => values.push(value),
+            _ => {
+                let first = std::mem::replace(existing, serde_json::Value::Null);
+                *existing = serde_json::Value::Array(vec![first, value]);
+            }
+        },
+        None => {
+            object.insert(name.to_string(), value);
+        }
+    }
 }
 
 #[derive(Debug)]
