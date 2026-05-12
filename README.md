@@ -10,9 +10,12 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - `POST /v1/responses`（流式/非流式，透传上游 Responses SSE 或 response 对象）
   - `POST /v1/responses/compact`（流式/非流式，透传上游 Compact 响应）
   - `POST /v1/chat/completions`（流式/非流式，上游 Responses SSE → Chat Completions 转换）
+  - `POST /v1/completions`（流式/非流式，OpenAI legacy Completions 兼容）
+  - `POST /v1/images/generations` / `POST /v1/images/edits`（OpenAI Images 兼容桥接，支持 JSON 与 edits multipart）
   - `GET /v1/models`（生成 thinking 后缀与 `-fast` 变体）
 - Claude 兼容端点：
   - `POST /v1/messages`（流式/非流式，Codex Responses SSE → Claude Messages 格式）
+  - `POST /v1/messages/count_tokens`（本地估算 token 数）
 - 管理端点：
   - `GET /stats`（账号 summary + RPM + token totals + quota raw JSON cache）
   - `POST /check-quota`（SSE，批量查询 `/backend-api/wham/usage`）
@@ -263,7 +266,7 @@ flowchart TD
 
 ## 现状与差异（相对 Go）
 
-- 已实现：`/v1/responses`（含 websocket fallback）、`/v1/responses/compact`、`/v1/chat/completions`、`/v1/messages`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
+- 已实现：`/v1/responses`（含 websocket fallback 与 `response.append` 基础续写）、`/v1/responses/compact`、`/v1/chat/completions`、`/v1/completions`、`/v1/images/generations`、`/v1/images/edits`、`/v1/messages`、`/v1/messages/count_tokens`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
 - 未实现（待补齐）：上游原生 websocket 转发等（当前只实现 Go 同款 fallback）
 
 更多对齐清单见 `docs/parity.md`。

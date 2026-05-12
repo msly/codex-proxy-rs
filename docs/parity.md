@@ -13,10 +13,14 @@
 | `GET /v1/models` | ✅ | Go 同款 per-model suffix matrix + `gpt-5.4-mini` + `-fast` |
 | `POST /v1/responses` | ✅ | stream/non-stream passthrough（含内部重试 SSE gate） |
 | `POST /v1/chat/completions` | ✅ | stream/non-stream（上游 Responses → Chat Completions 转换） |
+| `POST /v1/completions` | ✅ | stream/non-stream（legacy Completions → Chat Completions → Completions 转换） |
+| `POST /v1/images/generations` | ✅ | OpenAI Images JSON 兼容桥接到 Responses `image_generation` |
+| `POST /v1/images/edits` | ✅ | 支持 JSON `image`/`images[]`/`mask` 与 multipart `image`/`image[]`/`mask` |
 | `POST /refresh` | ✅ | SSE；强制刷新所有账号 Token（成功后会查询 quota） |
 | `POST /v1/messages` | ✅ | stream/non-stream（Codex Responses SSE → Claude Messages 格式） |
+| `POST /v1/messages/count_tokens` | ✅ | Claude 兼容本地 token 估算 |
 | `POST /v1/responses/compact` | ✅ | stream/non-stream passthrough（上游 `/responses/compact`） |
-| `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
+| `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` / `response.append` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
 
 ## 中间件与基础行为
 
@@ -42,14 +46,16 @@
 | Quota-first 选择器 | ✅ | `selector: quota-first` 按 used_percent 最低优先 |
 | 内部重试切换账号 | ✅ | 400/403 不重试，其它可重试 |
 | non-stream 空响应换号重试 | ✅ | `empty-retry-max` 仅用于 Chat Completions 非流式 |
+| Codex capacity error 重试 | ✅ | 窄匹配 model capacity 错误并按 429 类失败换号 |
 | SSE gate（2xx 前不写下游） | ✅ | integration test 已锁定 |
 
 ## 上游请求头（Codex）
 
 | 项 | Rust | 说明 |
 |---|---:|---|
-| `Version` / `User-Agent` / `Origin` / `Referer` / `Originator` | ✅ | 与 Go 保持一致 |
+| `Version` / `User-Agent` / `Origin` / `Referer` / `Originator` | ✅ | 默认值与 Go 保持一致，支持白名单下游透传覆盖 |
 | `Session_id` | ✅ | 每次请求生成 UUID（对齐 Go） |
+| `X-Codex-Turn-Metadata` / `X-Client-Request-Id` | ✅ | 白名单透传 |
 
 ## 上游失败副作用（账号状态）
 
