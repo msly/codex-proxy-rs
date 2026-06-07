@@ -39,26 +39,65 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - health checker：探测 `/responses` 并对 401/403/429 做移除/冷却处理
   - keepalive：周期性 HEAD ping 上游，保持连接池热度
 
-## 运行
+## 本地启动
 
 ```bash
 cd codex-proxy-rs
 cp config.example.yaml config.yaml
+mkdir -p auths data
 cargo run -- --config config.yaml
 ```
 
-首次使用独立管理前端：
+默认配置监听 `:18080`，浏览器打开：
+
+```text
+http://127.0.0.1:18080/
+```
+
+后端会托管 `frontend/dist`。如果改动了管理前端代码，先构建前端再启动后端：
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run build
 cd ..
 cargo run -- --config config.yaml
 ```
 
-后端会托管 `frontend/dist`，浏览器打开监听地址即可访问管理 UI。
-如果配置了 `api-keys`，管理 UI 顶部输入同一个 API key 后会用 Bearer header 访问管理端点。
+`config.example.yaml` 默认配置了 `api-keys: ["sk-123"]`。管理 UI 顶部输入同一个 API key 后，会用 `Authorization: Bearer <api-key>` 访问 `/stats`、`/admin/*`、`/refresh` 等受保护端点。
+
+启动前至少需要在 `auths/` 放入一个账号 JSON。只有 `access_token` 也可以启动和发请求；带 `refresh_token` 的账号会参与自动刷新。
+
+### 快速验收
+
+```bash
+curl -sS http://127.0.0.1:18080/health
+
+curl -sS http://127.0.0.1:18080/admin/persistence \
+  -H 'Authorization: Bearer sk-123'
+
+curl -sS http://127.0.0.1:18080/admin/rate-limits \
+  -H 'Authorization: Bearer sk-123'
+```
+
+发一条非流式请求：
+
+```bash
+curl -sS http://127.0.0.1:18080/v1/responses \
+  -H 'Authorization: Bearer sk-123' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-5.4","stream":false,"input":"hello"}'
+```
+
+请求完成后可检查 SQLite 日志：
+
+```bash
+curl -sS 'http://127.0.0.1:18080/admin/request-logs?limit=10' \
+  -H 'Authorization: Bearer sk-123'
+
+curl -sS 'http://127.0.0.1:18080/admin/usage-logs?limit=10' \
+  -H 'Authorization: Bearer sk-123'
+```
 
 ## Docker
 
@@ -66,17 +105,20 @@ cargo run -- --config config.yaml
 
 ```bash
 cd codex-proxy-rs
-docker build -t codex-proxy-rs .
-docker run --rm -p 8080:8080 \
+docker build --network=host -t codex-proxy-rs .
+docker run --rm -p 18080:18080 \
   -v $(pwd)/config.yaml:/app/config.yaml:ro \
   -v $(pwd)/auths:/app/auths \
-  codex-proxy-rs
+  -v $(pwd)/data:/app/data \
+  codex-proxy-rs:latest
 ```
 
-如果构建阶段出现 DNS/解析超时（如 `crates.io` / `deb.debian.org`），可尝试：
+`--network=host` 主要用于构建阶段访问 `crates.io`、`registry.npmjs.org`、`deb.debian.org` 等外部源；如果你的 Docker 网络环境正常，也可以去掉。
+
+如果要按当前验收镜像名构建：
 
 ```bash
-docker build --network=host -t codex-proxy-rs .
+docker build --network=host -t codex-proxy-rs:verify .
 ```
 
 也提供 `docker-compose.yml`：
@@ -143,14 +185,14 @@ api-key: <api-key>
 ### 1) 模型列表
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/models \
+curl -sS http://127.0.0.1:18080/v1/models \
   -H 'Authorization: Bearer your-api-key'
 ```
 
 ### 2) Responses API（非流式）
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/responses \
+curl -sS http://127.0.0.1:18080/v1/responses \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4","stream":false,"input":"hello"}'
@@ -159,7 +201,7 @@ curl -sS http://127.0.0.1:8080/v1/responses \
 ### 3) Responses API（流式）
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/responses \
+curl -N http://127.0.0.1:18080/v1/responses \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4","stream":true,"input":"hello"}'
@@ -168,7 +210,7 @@ curl -N http://127.0.0.1:8080/v1/responses \
 ### 3.1) Responses Compact（流式）
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/responses/compact \
+curl -N http://127.0.0.1:18080/v1/responses/compact \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4","stream":true,"input":"hello"}'
@@ -177,7 +219,7 @@ curl -N http://127.0.0.1:8080/v1/responses/compact \
 ### 4) Chat Completions（非流式）
 
 ```bash
-curl -sS http://127.0.0.1:8080/v1/chat/completions \
+curl -sS http://127.0.0.1:18080/v1/chat/completions \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4","stream":false,"messages":[{"role":"user","content":"hello"}]}'
@@ -186,7 +228,7 @@ curl -sS http://127.0.0.1:8080/v1/chat/completions \
 ### 5) Chat Completions（流式）
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/chat/completions \
+curl -N http://127.0.0.1:18080/v1/chat/completions \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}'
@@ -195,7 +237,7 @@ curl -N http://127.0.0.1:8080/v1/chat/completions \
 ### 5.1) Claude Messages（流式）
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/messages \
+curl -N http://127.0.0.1:18080/v1/messages \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-5.4","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
@@ -204,21 +246,21 @@ curl -N http://127.0.0.1:8080/v1/messages \
 ### 6) 查询剩余额度（SSE）
 
 ```bash
-curl -N -X POST http://127.0.0.1:8080/check-quota \
+curl -N -X POST http://127.0.0.1:18080/check-quota \
   -H 'Authorization: Bearer your-api-key'
 ```
 
 ### 7) 查看账号统计 + quota cache
 
 ```bash
-curl -sS http://127.0.0.1:8080/stats \
+curl -sS http://127.0.0.1:18080/stats \
   -H 'Authorization: Bearer your-api-key'
 ```
 
 ### 8) 手动刷新所有账号 Token（SSE）
 
 ```bash
-curl -N -X POST http://127.0.0.1:8080/refresh \
+curl -N -X POST http://127.0.0.1:18080/refresh \
   -H 'Authorization: Bearer your-api-key'
 ```
 
