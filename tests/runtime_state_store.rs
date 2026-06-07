@@ -132,3 +132,24 @@ fn runtime_state_store_save_now_if_dirty_persists_runtime_only_changes() {
     assert!(restored.quota_exhausted);
     assert!(restored.cooldown_until_ms > now_ms);
 }
+
+#[test]
+fn runtime_state_store_trims_response_account_bindings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = RuntimeStateStore::new(dir.path());
+
+    store.bind_response_account("resp_0", "/tmp/a.json");
+    for idx in 1..=20_000 {
+        store.bind_response_account(&format!("resp_{idx}"), "/tmp/a.json");
+    }
+
+    assert!(store.account_for_response("resp_0").is_none());
+    assert_eq!(
+        store.account_for_response("resp_1").as_deref(),
+        Some("/tmp/a.json")
+    );
+    assert_eq!(
+        store.account_for_response("resp_20000").as_deref(),
+        Some("/tmp/a.json")
+    );
+}

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use crate::core::{AccountRuntimeSnapshot, Manager, now_unix_ms};
 const STATE_FILE_NAME: &str = ".codex-proxy-state.json";
 const HOUR_MS: i64 = 3_600_000;
 const MAX_HOURLY_BUCKETS: usize = 168;
+const MAX_RESPONSE_ACCOUNT_BINDINGS: usize = 20_000;
 const DEFAULT_SAVE_INTERVAL_SECS: u64 = 5;
 const SAVE_INTERVAL_ENV: &str = "CODEX_PROXY_RUNTIME_STATE_SAVE_INTERVAL_SECS";
 
@@ -42,6 +43,8 @@ pub struct HourlyTrendPoint {
 #[derive(Debug, Default)]
 struct RuntimeState {
     hourly: BTreeMap<i64, HourlyTrendPoint>,
+    response_accounts: HashMap<String, String>,
+    response_account_order: VecDeque<String>,
 }
 
 #[derive(Debug)]
@@ -138,6 +141,33 @@ impl RuntimeStateStore {
         inner.hourly.values().cloned().collect()
     }
 
+    pub fn bind_response_account(&self, response_id: &str, account_file_path: &str) {
+        let response_id = response_id.trim();
+        let account_file_path = account_file_path.trim();
+        if response_id.is_empty() || account_file_path.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().expect("runtime state lock poisoned");
+        if !inner.response_accounts.contains_key(response_id) {
+            inner
+                .response_account_order
+                .push_back(response_id.to_string());
+        }
+        inner
+            .response_accounts
+            .insert(response_id.to_string(), account_file_path.to_string());
+        trim_response_account_bindings(&mut inner);
+    }
+
+    pub fn account_for_response(&self, response_id: &str) -> Option<String> {
+        let response_id = response_id.trim();
+        if response_id.is_empty() {
+            return None;
+        }
+        let inner = self.inner.read().expect("runtime state lock poisoned");
+        inner.response_accounts.get(response_id).cloned()
+    }
+
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
@@ -223,5 +253,14 @@ fn trim_hourly_map(hourly: &mut BTreeMap<i64, HourlyTrendPoint>) {
             break;
         };
         hourly.remove(&first_key);
+    }
+}
+
+fn trim_response_account_bindings(state: &mut RuntimeState) {
+    while state.response_accounts.len() > MAX_RESPONSE_ACCOUNT_BINDINGS {
+        let Some(response_id) = state.response_account_order.pop_front() else {
+            break;
+        };
+        state.response_accounts.remove(&response_id);
     }
 }

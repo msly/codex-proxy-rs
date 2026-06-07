@@ -425,7 +425,20 @@ async fn api_v1_responses_websocket_fallback_accepts_append_and_forwards_handsha
         serde_json::json!({
             "type": "response.append",
             "response": {
-                "input": "next turn"
+                "input": [
+                    {
+                        "id": "item_dup",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type":"input_text","text":"old"}]
+                    },
+                    {
+                        "id": "item_dup",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type":"input_text","text":"new"}]
+                    }
+                ]
             }
         })
         .to_string()
@@ -481,6 +494,14 @@ async fn api_v1_responses_websocket_fallback_accepts_append_and_forwards_handsha
             Some("req-ws-1")
         );
     }
+    drop(captured_headers);
+
+    let captured_bodies = captured_bodies.lock().unwrap();
+    assert_eq!(captured_bodies.len(), 2);
+    let append_input = captured_bodies[1]["input"].as_array().unwrap();
+    assert_eq!(append_input.len(), 1);
+    assert_eq!(append_input[0]["id"], "item_dup");
+    assert_eq!(append_input[0]["content"][0]["text"], "new");
 }
 
 #[tokio::test]

@@ -79,6 +79,13 @@ async fn invalid_image_upstream_responses() -> (axum::http::StatusCode, &'static
     )
 }
 
+async fn failed_image_upstream_responses() -> (axum::http::StatusCode, &'static str) {
+    (
+        axum::http::StatusCode::OK,
+        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"status\":\"failed\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"image prompt rejected\"}}}\n\n",
+    )
+}
+
 async fn start_slow_image_upstream() -> (Url, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
@@ -104,6 +111,19 @@ async fn start_invalid_image_upstream() -> Url {
     let app = Router::new().route(
         "/backend-api/codex/responses",
         post(invalid_image_upstream_responses),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn start_failed_image_upstream() -> Url {
+    let app = Router::new().route(
+        "/backend-api/codex/responses",
+        post(failed_image_upstream_responses),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -286,6 +306,43 @@ async fn api_v1_images_conversion_failure_is_persisted_to_request_logs() {
             .unwrap_or_default()
             .contains("image_generation_call")
     );
+}
+
+#[tokio::test]
+async fn api_v1_images_surfaces_upstream_response_failed_error() {
+    let base_url = start_failed_image_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager, dir.path()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "prompt": "draw a cat"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["type"], "invalid_request_error");
+    assert_eq!(value["error"]["message"], "image prompt rejected");
 }
 
 #[tokio::test]

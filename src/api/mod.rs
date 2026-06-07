@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -46,6 +46,7 @@ use crate::translate::{
 use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, UpstreamResponse};
 
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
+const INVALID_STREAM_FIELD_TYPE_MESSAGE: &str = "stream field must be a boolean when provided";
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -418,6 +419,152 @@ fn record_usage_from_sse_bytes(
     None
 }
 
+fn parse_stream_field(value: &serde_json::Value) -> Result<bool, &'static str> {
+    match value.get("stream") {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(stream)) => Ok(*stream),
+        Some(_) => Err(INVALID_STREAM_FIELD_TYPE_MESSAGE),
+    }
+}
+
+fn bind_response_account_from_value(
+    runtime_state: &RuntimeStateStore,
+    account: &Account,
+    value: &serde_json::Value,
+) {
+    if let Some(response_id) = extract_response_id_from_value(value) {
+        runtime_state.bind_response_account(response_id, account.file_path());
+    }
+}
+
+fn bind_response_account_from_json_bytes(
+    runtime_state: &RuntimeStateStore,
+    account: &Account,
+    bytes: &[u8],
+) {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        bind_response_account_from_value(runtime_state, account, &value);
+    }
+}
+
+fn bind_response_account_from_sse_line(
+    runtime_state: &RuntimeStateStore,
+    account: &Account,
+    line: &[u8],
+) {
+    let line = trim_ascii(line);
+    if !line.starts_with(b"data:") {
+        return;
+    }
+    let payload = trim_ascii(&line[5..]);
+    if payload.is_empty() || payload == b"[DONE]" {
+        return;
+    }
+    bind_response_account_from_json_bytes(runtime_state, account, payload);
+}
+
+fn extract_response_id_from_value(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(|id| id.as_str())
+        .or_else(|| value.get("id").and_then(|id| id.as_str()))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+fn previous_response_id_from_value(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("previous_response_id")
+        .and_then(|id| id.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+fn sticky_initial_excluded_for_previous_response(
+    state: &AppState,
+    previous_response_id: Option<&str>,
+) -> HashSet<String> {
+    let Some(previous_response_id) = previous_response_id else {
+        return HashSet::new();
+    };
+    let Some(sticky_account_path) = state
+        .runtime_state
+        .account_for_response(previous_response_id)
+    else {
+        return HashSet::new();
+    };
+
+    let accounts = state.manager.accounts_snapshot();
+    if !accounts
+        .iter()
+        .any(|account| account.file_path() == sticky_account_path)
+    {
+        return HashSet::new();
+    }
+
+    accounts
+        .iter()
+        .filter_map(|account| {
+            let file_path = account.file_path();
+            if file_path == sticky_account_path {
+                None
+            } else {
+                Some(file_path.to_string())
+            }
+        })
+        .collect()
+}
+
+fn response_failed_error_from_sse_bytes(bytes: &[u8]) -> Option<(String, String)> {
+    for line in bytes.split(|b| *b == b'\n') {
+        let line = trim_ascii(line);
+        if !line.starts_with(b"data:") {
+            continue;
+        }
+        let payload = trim_ascii(&line[5..]);
+        if payload.is_empty() || payload == b"[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            continue;
+        };
+        if value.get("type").and_then(|value| value.as_str()) != Some("response.failed") {
+            continue;
+        }
+        let error = value
+            .get("response")
+            .and_then(|response| response.get("error"))
+            .or_else(|| value.get("error"));
+        let message = error
+            .and_then(|error| error.get("message"))
+            .and_then(|message| message.as_str())
+            .or_else(|| error.and_then(|error| error.as_str()))
+            .unwrap_or("upstream response failed")
+            .trim()
+            .to_string();
+        let err_type = error
+            .and_then(|error| error.get("type"))
+            .and_then(|err_type| err_type.as_str())
+            .unwrap_or("api_error")
+            .trim()
+            .to_string();
+        return Some((
+            if message.is_empty() {
+                "upstream response failed".to_string()
+            } else {
+                message
+            },
+            if err_type.is_empty() {
+                "api_error".to_string()
+            } else {
+                err_type
+            },
+        ));
+    }
+    None
+}
+
 fn build_passthrough_sse_response(
     endpoint: &'static str,
     model: String,
@@ -481,6 +628,7 @@ fn build_passthrough_sse_response(
                 if line.is_empty() {
                     continue;
                 }
+                bind_response_account_from_sse_line(runtime_state.as_ref(), account.as_ref(), line);
                 if let Some(usage) = record_usage_from_sse_line(
                     account.as_ref(),
                     runtime_state.as_ref(),
@@ -504,6 +652,7 @@ fn build_passthrough_sse_response(
         if !recorded_usage {
             let line = trim_ascii(buf.as_ref());
             if !line.is_empty() {
+                bind_response_account_from_sse_line(runtime_state.as_ref(), account.as_ref(), line);
                 if let Some(usage) = record_usage_from_sse_line(
                     account.as_ref(),
                     runtime_state.as_ref(),
@@ -1024,10 +1173,12 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
             "invalid_request_error",
         );
     }
-    let stream = body_value
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let stream = match parse_stream_field(&body_value) {
+        Ok(stream) => stream,
+        Err(message) => {
+            return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+        }
+    };
 
     tracing::info!(model = %model, stream, "received /v1/responses request");
 
@@ -1037,6 +1188,10 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     let base_model = apply_thinking_to_value(&mut body_value, &model);
     let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, stream);
+    let initial_excluded = sticky_initial_excluded_for_previous_response(
+        &state,
+        previous_response_id_from_value(&codex_value),
+    );
     let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
     let url = match state.codex_client.responses_url() {
@@ -1058,7 +1213,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         codex_body,
         stream,
         passthrough_headers.as_ref(),
-        &HashSet::new(),
+        &initial_excluded,
     )
     .await
     {
@@ -1163,6 +1318,7 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         }
     };
     let now_ms = crate::core::now_unix_ms();
+    bind_response_account_from_json_bytes(state.runtime_state.as_ref(), account.as_ref(), &bytes);
     if let Some(usage) = record_usage_from_json_bytes(
         account.as_ref(),
         state.runtime_state.as_ref(),
@@ -1391,6 +1547,7 @@ fn build_responses_ws_request(
         serde_json::Value::String(model.clone()),
     );
 
+    dedupe_input_items_by_id(&mut request_value);
     validate_function_call_output_context_with_known_ids(&request_value, &session.tool_call_ids)?;
 
     session.last_request = Some(request_value.clone());
@@ -1399,6 +1556,46 @@ fn build_responses_ws_request(
     let request_body =
         serde_json::to_vec(&request_value).map_err(|_| "序列化请求失败".to_string())?;
     Ok((request_body, model))
+}
+
+fn dedupe_input_items_by_id(value: &mut serde_json::Value) {
+    let Some(input) = value
+        .get_mut("input")
+        .and_then(|input| input.as_array_mut())
+    else {
+        return;
+    };
+    if input.len() < 2 {
+        return;
+    }
+
+    let mut last_index_by_id = HashMap::<String, usize>::new();
+    for (index, item) in input.iter().enumerate() {
+        if let Some(item_id) = item
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            last_index_by_id.insert(item_id.to_string(), index);
+        }
+    }
+    if last_index_by_id.is_empty() {
+        return;
+    }
+
+    let mut index = 0usize;
+    input.retain(|item| {
+        let keep = item
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .and_then(|item_id| last_index_by_id.get(item_id).copied())
+            .is_none_or(|last_index| last_index == index);
+        index += 1;
+        keep
+    });
 }
 
 async fn forward_responses_sse_as_ws(
@@ -1415,6 +1612,10 @@ async fn forward_responses_sse_as_ws(
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let base_model = apply_thinking_to_value(&mut body_value, model);
     let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
+    let initial_excluded = sticky_initial_excluded_for_previous_response(
+        state,
+        previous_response_id_from_value(&codex_value),
+    );
     let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
     let url = state
@@ -1429,7 +1630,7 @@ async fn forward_responses_sse_as_ws(
         codex_body,
         true,
         passthrough_headers,
-        &HashSet::new(),
+        &initial_excluded,
     )
     .await
     .map_err(ResponsesWsError::Upstream)?;
@@ -1465,6 +1666,11 @@ async fn forward_responses_sse_as_ws(
             let mut outbound_text = None;
             if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(payload) {
                 update_responses_ws_session_from_event(session, &v);
+                bind_response_account_from_value(
+                    state.runtime_state.as_ref(),
+                    account.as_ref(),
+                    &v,
+                );
                 let had_stream_output = has_text || has_tool;
                 if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
                     match typ {
@@ -2180,10 +2386,12 @@ async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>)
             "invalid_request_error",
         );
     }
-    let stream = body_value
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let stream = match parse_stream_field(&body_value) {
+        Ok(stream) => stream,
+        Err(message) => {
+            return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+        }
+    };
 
     tracing::info!(model = %model, stream, "received /v1/responses/compact request");
 
@@ -2427,10 +2635,12 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
             "invalid_request_error",
         );
     }
-    let stream = body_value
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let stream = match parse_stream_field(&body_value) {
+        Ok(stream) => stream,
+        Err(message) => {
+            return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+        }
+    };
 
     tracing::info!(model = %model, stream, "received /v1/chat/completions request");
 
@@ -2839,10 +3049,12 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
             "invalid_request_error",
         );
     }
-    let stream = body_value
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let stream = match parse_stream_field(&body_value) {
+        Ok(stream) => stream,
+        Err(message) => {
+            return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+        }
+    };
 
     tracing::info!(model = %model, stream, "received /v1/completions request");
 
@@ -3293,6 +3505,21 @@ async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response 
             account.as_ref(),
             usage,
         );
+    }
+    if let Some((message, err_type)) = response_failed_error_from_sse_bytes(&bytes) {
+        record_persist_account_error(
+            state.persist_store.as_ref(),
+            endpoint,
+            &base_model,
+            false,
+            StatusCode::BAD_GATEWAY,
+            attempts,
+            api_key,
+            account.as_ref(),
+            message.clone(),
+            crate::core::now_unix_ms().saturating_sub(started_ms),
+        );
+        return send_error(StatusCode::BAD_GATEWAY, &message, &err_type);
     }
     let Some(out) = convert_responses_sse_to_images_json(&bytes, &response_format) else {
         record_persist_account_error(
