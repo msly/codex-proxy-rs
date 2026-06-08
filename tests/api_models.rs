@@ -81,6 +81,8 @@ async fn api_v1_models_contains_expected_variants() {
     assert!(ids.contains("gpt-5.1-codex-max"));
     assert!(ids.contains("gpt-5.1-codex-max-fast"));
     assert!(ids.contains("gpt-5.1-codex-max-xhigh"));
+    assert!(ids.contains("codex-auto-review"));
+    assert!(ids.contains("codex-auto-review-high-fast"));
     assert!(!ids.contains("gpt-5-max"));
     assert!(!ids.contains("gpt-5-none"));
     assert!(!ids.contains("gpt-5.1-codex-none"));

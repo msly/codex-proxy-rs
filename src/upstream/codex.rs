@@ -11,8 +11,8 @@ use uuid::Uuid;
 use crate::core::{Account, Manager};
 use crate::limit::{AccountLimitGuard, RateLimiter};
 
-pub const CODEX_CLIENT_VERSION: &str = "0.120.0";
-pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.120.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
+pub const CODEX_CLIENT_VERSION: &str = "0.137.0";
+pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.137.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 pub type On401Hook = Arc<dyn Fn(Arc<Account>) + Send + Sync>;

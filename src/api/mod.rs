@@ -3896,6 +3896,10 @@ const MODEL_LIST: &[ModelListEntry] = &[
         base: "gpt-5.5",
         suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
     },
+    ModelListEntry {
+        base: "codex-auto-review",
+        suffixes: &["low", "medium", "high", "xhigh"],
+    },
 ];
 
 #[derive(Debug, Serialize)]

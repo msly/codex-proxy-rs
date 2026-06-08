@@ -285,6 +285,7 @@ curl -N -X POST http://127.0.0.1:18080/refresh \
 - `gpt-5-low` / `gpt-5-medium` / `gpt-5-high` / `gpt-5-auto`
 - `gpt-5.1-codex-low|medium|high|max|auto`
 - `gpt-5.1-codex-max-low|medium|high|xhigh|auto`
+- `codex-auto-review-low|medium|high|xhigh`
 - `model-<budget>`（数字预算 > 100，会映射为等级）
 
 完整可用模型矩阵请直接调用 `GET /v1/models`。
