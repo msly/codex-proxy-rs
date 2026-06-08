@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State};
 use axum::http::header;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use uuid::Uuid;
 
 use crate::admin::AdminAuth;
 use crate::core::{Account, Manager};
@@ -1121,6 +1122,7 @@ async fn execute_codex_request(
     passthrough_headers: Option<&HeaderMap>,
     initial_excluded: &HashSet<String>,
 ) -> Result<UpstreamResponse, UpstreamError> {
+    let stable_headers = codex_passthrough_headers_with_stable_session(passthrough_headers, &body);
     state
         .codex_client
         .execute(UpstreamRequest {
@@ -1130,12 +1132,71 @@ async fn execute_codex_request(
             body,
             stream,
             max_retry: state.max_retry,
-            passthrough_headers,
+            passthrough_headers: stable_headers.as_ref(),
             on_401: state.on_401.clone(),
             initial_excluded,
             rate_limiter: state.rate_limiter.as_ref(),
         })
         .await
+}
+
+fn codex_passthrough_headers_with_stable_session(
+    passthrough_headers: Option<&HeaderMap>,
+    body: &[u8],
+) -> Option<HeaderMap> {
+    let mut headers = passthrough_headers.cloned().unwrap_or_default();
+    if headers.get("Session_id").is_none()
+        && let Some(seed) = codex_stable_session_seed(passthrough_headers, body)
+    {
+        let session_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("codex-proxy-rs:codex-session:{seed}").as_bytes(),
+        )
+        .to_string();
+        if let Ok(value) = HeaderValue::from_str(&session_id) {
+            headers.insert("Session_id", value);
+        }
+    }
+    if headers.is_empty() {
+        None
+    } else {
+        Some(headers)
+    }
+}
+
+fn codex_stable_session_seed(
+    passthrough_headers: Option<&HeaderMap>,
+    body: &[u8],
+) -> Option<String> {
+    if let Some(seed) = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt_cache_key")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("prompt_cache_key:{value}"))
+        })
+    {
+        return Some(seed);
+    }
+
+    for header_name in [
+        "Conversation_id",
+        "conversation_id",
+        "X-Codex-Turn-Metadata",
+    ] {
+        if let Some(value) = passthrough_headers
+            .and_then(|headers| headers.get(header_name))
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(format!("header:{header_name}:{value}"));
+        }
+    }
+    None
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1269,6 +1330,8 @@ fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
     for name in [
         "Version",
         "Session_id",
+        "Conversation_id",
+        "conversation_id",
         "Originator",
         "X-Codex-Turn-Metadata",
         "X-Client-Request-Id",

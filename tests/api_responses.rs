@@ -731,6 +731,75 @@ async fn api_v1_responses_forwards_whitelisted_codex_identity_headers() {
 }
 
 #[tokio::test]
+async fn api_v1_responses_derives_stable_session_id_from_prompt_cache_key() {
+    let captured = Arc::new(Mutex::new(Vec::<HeaderMap>::new()));
+    let base_url = start_upstream_capture_headers(captured.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at2").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        empty_retry_max: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
+    });
+
+    for prompt_cache_key in ["cache-a", "cache-a", "cache-b"] {
+        let res = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": "gpt-5.4",
+                            "stream": false,
+                            "prompt_cache_key": prompt_cache_key,
+                            "input": "hi"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+    }
+
+    let captured = captured.lock().unwrap();
+    let session_ids: Vec<_> = captured
+        .iter()
+        .map(|headers| {
+            headers
+                .get("Session_id")
+                .and_then(|value| value.to_str().ok())
+                .expect("Session_id")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(session_ids.len(), 3);
+    assert!(uuid::Uuid::parse_str(&session_ids[0]).is_ok());
+    assert_eq!(session_ids[0], session_ids[1]);
+    assert_ne!(session_ids[0], session_ids[2]);
+}
+
+#[tokio::test]
 async fn api_v1_responses_non_retryable_failure_counts_as_failed_request() {
     let calls = Arc::new(AtomicUsize::new(0));
     let base_url = start_upstream(calls.clone()).await;
