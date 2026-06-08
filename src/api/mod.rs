@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State};
@@ -19,11 +20,12 @@ use bytes::BytesMut;
 use futures_util::StreamExt;
 use futures_util::stream::unfold;
 use memchr::memchr;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::admin::AdminAuth;
 use crate::core::{Account, Manager};
 use crate::limit::{AccountLimitGuard, RateLimiter, RequestLimitGuard};
 use crate::persist::{PersistStore, RequestLogInput, UsageLogInput};
@@ -54,6 +56,24 @@ struct HealthResponse {
     accounts: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct AdminLoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminSetupRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub manager: Arc<Manager>,
@@ -74,6 +94,22 @@ pub struct AppState {
 
 #[derive(Debug, Clone)]
 struct RequestApiKey(Option<String>);
+
+static ADMIN_AUTH: OnceLock<ArcSwap<AdminAuth>> = OnceLock::new();
+
+pub fn set_admin_auth(auth: Arc<AdminAuth>) {
+    admin_auth_swap().store(auth);
+}
+
+fn admin_auth_swap() -> &'static ArcSwap<AdminAuth> {
+    ADMIN_AUTH.get_or_init(|| {
+        ArcSwap::from_pointee(AdminAuth::new(
+            "config.yaml",
+            "admin".to_string(),
+            String::new(),
+        ))
+    })
+}
 
 #[derive(Debug, Default)]
 pub struct RequestStats {
@@ -693,10 +729,20 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/account-status", get(admin_account_status))
         .route("/admin/rate-limits", get(admin_rate_limits))
         .route("/admin/persistence", get(admin_persistence))
-        .route("/refresh", post(refresh))
-        .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
+        .route("/admin/logout", post(admin_logout))
+        .route("/admin/change-password", post(admin_change_password))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin_session_auth,
+        ));
+
+    let admin_public = Router::new()
+        .route("/admin/status", get(admin_status))
+        .route("/admin/setup", post(admin_setup))
+        .route("/admin/login", post(admin_login));
 
     let mgmt_sse = Router::new()
+        .route("/refresh", post(refresh))
         .route("/check-quota", post(check_quota))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
@@ -718,6 +764,7 @@ pub fn router(state: AppState) -> Router {
     let non_v1 = Router::new()
         .route("/health", get(health))
         .merge(mgmt)
+        .merge(admin_public)
         .fallback_service(frontend)
         .layer(CompressionLayer::new());
 
@@ -837,6 +884,38 @@ async fn api_key_auth(State(state): State<AppState>, req: Request<Body>, next: N
                 "message": "无效的 API Key",
                 "type": "invalid_request_error",
                 "code": "invalid_api_key",
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn admin_session_auth(
+    State(_state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let (token, token_source) = extract_api_key(req.headers());
+    if let Some(token) = token.as_deref() {
+        if admin_auth_swap().load().is_valid_token(token) {
+            return next.run(req).await;
+        }
+    }
+
+    tracing::debug!(
+        path = %req.uri().path(),
+        token_source,
+        has_authorization = req.headers().get(axum::http::header::AUTHORIZATION).is_some(),
+        "admin session auth failed"
+    );
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "message": "invalid admin session",
+                "type": "invalid_request_error",
+                "code": "invalid_admin_session",
             }
         })),
     )
@@ -4151,6 +4230,63 @@ async fn admin_request_logs(
     match store.list_request_logs(query.limit).await {
         Ok(data) => Json(json!({ "data": data })).into_response(),
         Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
+    }
+}
+
+async fn admin_status() -> Response {
+    Json(json!({ "data": admin_auth_swap().load().status() })).into_response()
+}
+
+async fn admin_setup(Json(input): Json<AdminSetupRequest>) -> Response {
+    let auth = admin_auth_swap().load();
+    match auth.setup(&input.username, &input.password) {
+        Ok(token) => Json(json!({
+            "data": {
+                "token": token,
+                "status": auth.status(),
+            }
+        }))
+        .into_response(),
+        Err(err) => send_error(StatusCode::BAD_REQUEST, &err, "invalid_request_error"),
+    }
+}
+
+async fn admin_login(Json(input): Json<AdminLoginRequest>) -> Response {
+    let auth = admin_auth_swap().load();
+    match auth.login(&input.username, &input.password) {
+        Ok(token) => Json(json!({
+            "data": {
+                "token": token,
+                "status": auth.status(),
+            }
+        }))
+        .into_response(),
+        Err(err) => send_error(StatusCode::UNAUTHORIZED, &err, "invalid_request_error"),
+    }
+}
+
+async fn admin_logout(headers: HeaderMap) -> Response {
+    if let (Some(token), _) = extract_api_key(&headers) {
+        admin_auth_swap().load().logout(&token);
+    }
+    Json(json!({ "data": { "ok": true } })).into_response()
+}
+
+async fn admin_change_password(
+    headers: HeaderMap,
+    Json(input): Json<AdminChangePasswordRequest>,
+) -> Response {
+    let Some((token, _)) = extract_api_key(&headers).0.map(|token| (token, ())) else {
+        return send_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid admin session",
+            "invalid_request_error",
+        );
+    };
+    let auth = admin_auth_swap().load();
+    match auth.change_password(&token, &input.current_password, &input.new_password) {
+        Ok(()) => Json(json!({ "data": auth.status() })).into_response(),
+        Err(err) => send_error(StatusCode::BAD_REQUEST, &err, "invalid_request_error"),
     }
 }
 

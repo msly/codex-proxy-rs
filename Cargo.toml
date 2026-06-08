@@ -5,12 +5,14 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.4", features = ["ws", "multipart"] }
+argon2 = "0.5.3"
 arc-swap = "1.7.1"
 base64 = "0.22.1"
 bytes = "1.11.1"
 futures-util = "0.3.31"
 memchr = "2.8.0"
 reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"

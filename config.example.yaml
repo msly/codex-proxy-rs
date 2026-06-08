@@ -24,6 +24,12 @@ selector: "round-robin" # or "quota-first"
 api-keys:
   - "sk-123"
 
+# Admin web UI account. Leave password-hash empty on first start; the UI will
+# prompt you to initialize the admin password and write an Argon2 hash here.
+admin:
+  username: "admin"
+  password-hash: ""
+
 # SQLite persistence for request logs, usage logs, and latest account status.
 persistence:
   enabled: true

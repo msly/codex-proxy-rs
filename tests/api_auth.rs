@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use codex_proxy_rs::admin::AdminAuth;
 use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::Manager;
 use codex_proxy_rs::quota::QuotaChecker;
@@ -46,6 +47,193 @@ fn build_state(api_keys: &[&str]) -> AppState {
         rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
         persist_store: None,
     }
+}
+
+#[tokio::test]
+async fn admin_auth_setup_login_and_change_password() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("config.yaml");
+    std::fs::write(
+        &config_path,
+        r#"# top comment
+listen: ":18080"
+
+# admin comment
+admin:
+  # username comment
+  username: "admin"
+  password-hash: ""
+
+# keep this
+api-keys:
+  - "sk-123"
+"#,
+    )
+    .unwrap();
+    api::set_admin_auth(Arc::new(AdminAuth::new(
+        &config_path,
+        "admin".to_string(),
+        String::new(),
+    )));
+
+    let app = api::router(build_state(&[]));
+
+    let setup_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/setup")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "username": "admin",
+                        "password": "password123"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup_res.status(), StatusCode::OK);
+    let setup_body = axum::body::to_bytes(setup_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let setup_json: serde_json::Value = serde_json::from_slice(&setup_body).unwrap();
+    let token = setup_json["data"]["token"].as_str().unwrap().to_string();
+
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    assert!(config.contains("# top comment"));
+    assert!(config.contains("# admin comment"));
+    assert!(config.contains("# keep this"));
+    assert!(config.contains("listen: \":18080\""));
+    assert!(config.contains("api-keys:"));
+    assert!(config.contains("password-hash"));
+    assert!(!config.contains("password123"));
+
+    let stats_without_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_without_token.status(), StatusCode::UNAUTHORIZED);
+
+    let stats_with_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stats_with_token.status(), StatusCode::OK);
+
+    let logout_without_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/logout")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_without_token.status(), StatusCode::UNAUTHORIZED);
+
+    let change_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/change-password")
+                .header("Authorization", format!("Bearer {token}"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "current_password": "password123",
+                        "new_password": "password456"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(change_res.status(), StatusCode::OK);
+
+    let old_token_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_token_res.status(), StatusCode::UNAUTHORIZED);
+
+    let login_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "username": "admin",
+                        "password": "password456"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_res.status(), StatusCode::OK);
+    let login_body = axum::body::to_bytes(login_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let login_json: serde_json::Value = serde_json::from_slice(&login_body).unwrap();
+    let new_token = login_json["data"]["token"].as_str().unwrap().to_string();
+
+    let logout_with_token = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/logout")
+                .header("Authorization", format!("Bearer {new_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_with_token.status(), StatusCode::OK);
+
+    let logged_out_res = app
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .header("Authorization", format!("Bearer {new_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logged_out_res.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

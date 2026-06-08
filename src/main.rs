@@ -11,6 +11,7 @@ use codex_proxy_rs::refresh::{
     refresh_account_with_options,
 };
 use codex_proxy_rs::{
+    admin::AdminAuth,
     api,
     config::Config,
     core::{Account, Manager, QuotaFirstSelector, RoundRobinSelector, Selector},
@@ -28,6 +29,11 @@ async fn main() -> Result<(), String> {
     let cfg = Config::load(&config_path)?;
 
     init_tracing(&cfg.log_level);
+    api::set_admin_auth(Arc::new(AdminAuth::new(
+        &config_path,
+        cfg.admin.username.clone(),
+        cfg.admin.password_hash.clone(),
+    )));
 
     let selector: Arc<dyn Selector> = if cfg.selector == "quota-first" {
         Arc::new(QuotaFirstSelector::new())

@@ -8,6 +8,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
+use codex_proxy_rs::admin::AdminAuth;
 use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::config::RateLimitConfig;
 use codex_proxy_rs::core::Manager;
@@ -853,12 +854,44 @@ async fn api_v1_responses_stats_expose_cached_and_reasoning_tokens() {
         rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
         persist_store: None,
     });
+    let admin_config = dir.path().join("admin-config.yaml");
+    std::fs::write(&admin_config, "{}\n").unwrap();
+    api::set_admin_auth(Arc::new(AdminAuth::new(
+        &admin_config,
+        "admin".to_string(),
+        String::new(),
+    )));
+    let setup_res = stats_app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/admin/setup")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "username": "admin",
+                        "password": "password123"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup_res.status(), axum::http::StatusCode::OK);
+    let setup_body = axum::body::to_bytes(setup_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let setup_json: serde_json::Value = serde_json::from_slice(&setup_body).unwrap();
+    let admin_token = setup_json["data"]["token"].as_str().unwrap();
 
     let stats_res = stats_app
         .oneshot(
             axum::http::Request::builder()
                 .method("GET")
                 .uri("/stats")
+                .header("Authorization", format!("Bearer {admin_token}"))
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )

@@ -64,7 +64,9 @@ cd ..
 cargo run -- --config config.yaml
 ```
 
-`config.example.yaml` 默认配置了 `api-keys: ["sk-123"]`。管理 UI 顶部输入同一个 API key 后，会用 `Authorization: Bearer <api-key>` 访问 `/stats`、`/admin/*`、`/refresh` 等受保护端点。
+管理 UI 使用独立的管理员账号登录。`admin.password-hash` 为空时，首次打开页面会要求初始化用户名和密码；服务端会把 Argon2 密码哈希写回当前 `config.yaml`，不会保存明文密码。登录后可在 Settings 页面修改密码。
+
+`config.example.yaml` 默认配置了 `api-keys: ["sk-123"]`。这个 key 用于 `/v1/*`、`/check-quota`、`/refresh` 等接口调用，不作为管理 UI 登录密码。
 
 启动前至少需要在 `auths/` 放入一个账号 JSON。只有 `access_token` 也可以启动和发请求；带 `refresh_token` 的账号会参与自动刷新。
 

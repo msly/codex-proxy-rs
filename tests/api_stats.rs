@@ -4,6 +4,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
+use codex_proxy_rs::admin::AdminAuth;
 use codex_proxy_rs::api::{self, AppState};
 use codex_proxy_rs::core::{Manager, QuotaInfo};
 use codex_proxy_rs::quota::QuotaChecker;
@@ -125,10 +126,43 @@ async fn api_stats_returns_cached_quota_raw_json() {
     };
 
     let app = api::router(state);
+    let admin_config = dir.path().join("admin-config.yaml");
+    std::fs::write(&admin_config, "{}\n").unwrap();
+    api::set_admin_auth(Arc::new(AdminAuth::new(
+        &admin_config,
+        "admin".to_string(),
+        String::new(),
+    )));
+    let setup_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/setup")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "username": "admin",
+                        "password": "password123"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(setup_res.status(), StatusCode::OK);
+    let setup_body = axum::body::to_bytes(setup_res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let setup_json: serde_json::Value = serde_json::from_slice(&setup_body).unwrap();
+    let admin_token = setup_json["data"]["token"].as_str().unwrap();
+
     let res = app
         .oneshot(
             Request::builder()
                 .uri("/stats")
+                .header("Authorization", format!("Bearer {admin_token}"))
                 .body(Body::empty())
                 .unwrap(),
         )

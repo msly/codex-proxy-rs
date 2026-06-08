@@ -114,9 +114,29 @@ pub struct Config {
     #[serde(default)]
     pub persistence: PersistenceConfig,
 
+    #[serde(default)]
+    pub admin: AdminConfig,
+
     #[serde(rename = "rate-limits")]
     #[serde(default)]
     pub rate_limits: RateLimitConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AdminConfig {
+    pub username: String,
+    #[serde(rename = "password-hash")]
+    pub password_hash: String,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            username: "admin".to_string(),
+            password_hash: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -193,6 +213,7 @@ impl Default for Config {
             client_version: String::new(),
             user_agent: String::new(),
             persistence: PersistenceConfig::default(),
+            admin: AdminConfig::default(),
             rate_limits: RateLimitConfig::default(),
         }
     }
@@ -326,6 +347,11 @@ impl Config {
         }
         if self.persistence.request_log_retention_days == 0 {
             self.persistence.request_log_retention_days = 30;
+        }
+        self.admin.username = self.admin.username.trim().to_string();
+        self.admin.password_hash = self.admin.password_hash.trim().to_string();
+        if self.admin.username.is_empty() {
+            self.admin.username = "admin".to_string();
         }
     }
 
