@@ -19,6 +19,11 @@ const UPSTREAM_SSE: &str = concat!(
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"created_at\":111,\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2},\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}}\n\n",
 );
 
+const UPSTREAM_FAILED_SSE: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"created_at\":222,\"model\":\"gpt-5.4\"}}\n\n",
+    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r2\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream failed\"}}}\n\n",
+);
+
 #[derive(Clone)]
 struct UpstreamState;
 
@@ -29,9 +34,32 @@ async fn upstream_responses(
     (axum::http::StatusCode::OK, UPSTREAM_SSE)
 }
 
+async fn upstream_responses_failed(
+    State(_state): State<UpstreamState>,
+    _headers: HeaderMap,
+) -> (axum::http::StatusCode, &'static str) {
+    (axum::http::StatusCode::OK, UPSTREAM_FAILED_SSE)
+}
+
 async fn start_upstream() -> Url {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
+        .with_state(UpstreamState);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn start_failed_upstream() -> Url {
+    let app = Router::new()
+        .route(
+            "/backend-api/codex/responses",
+            post(upstream_responses_failed),
+        )
         .with_state(UpstreamState);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -167,4 +195,46 @@ async fn api_v1_completions_stream_returns_text_completion_chunks() {
     );
     assert!(body.contains("\"text\":\"hi\""), "body: {body}");
     assert!(body.contains("data: [DONE]"), "body: {body}");
+}
+
+#[tokio::test]
+async fn api_v1_completions_stream_surfaces_response_failed() {
+    let base_url = start_failed_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager.clone()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "prompt": "hi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("\"error\""), "body: {body}");
+    assert!(body.contains("upstream failed"), "body: {body}");
+    assert!(!body.contains("data: [DONE]"), "body: {body}");
+
+    let stats = manager.accounts_snapshot()[0].stats_snapshot();
+    assert_eq!(stats.failed_requests, 1);
 }

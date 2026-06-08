@@ -30,6 +30,15 @@ const UPSTREAM_EMPTY_SSE: &str = concat!(
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r3\",\"created_at\":333,\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1},\"output\":[]}}\n\n",
 );
 
+const UPSTREAM_FAILED_SSE: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r4\",\"created_at\":444,\"model\":\"gpt-5.4\"}}\n\n",
+    "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"r4\",\"error\":{\"type\":\"content_policy_violation\",\"message\":\"This content was flagged\"}}}\n\n",
+);
+
+const UPSTREAM_MISSING_TERMINAL_SSE: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r5\",\"created_at\":555,\"model\":\"gpt-5.4\"}}\n\n",
+);
+
 #[derive(Clone)]
 struct UpstreamState;
 
@@ -62,9 +71,55 @@ async fn upstream_responses_empty_then_text(
     }
 }
 
+async fn upstream_responses_failed(
+    State(_state): State<UpstreamState>,
+    _headers: HeaderMap,
+) -> (axum::http::StatusCode, &'static str) {
+    (axum::http::StatusCode::OK, UPSTREAM_FAILED_SSE)
+}
+
+async fn upstream_responses_missing_terminal(
+    State(_state): State<UpstreamState>,
+    _headers: HeaderMap,
+) -> (axum::http::StatusCode, &'static str) {
+    (axum::http::StatusCode::OK, UPSTREAM_MISSING_TERMINAL_SSE)
+}
+
 async fn start_upstream() -> Url {
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
+        .with_state(UpstreamState);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn start_failed_upstream() -> Url {
+    let app = Router::new()
+        .route(
+            "/backend-api/codex/responses",
+            post(upstream_responses_failed),
+        )
+        .with_state(UpstreamState);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn start_missing_terminal_upstream() -> Url {
+    let app = Router::new()
+        .route(
+            "/backend-api/codex/responses",
+            post(upstream_responses_missing_terminal),
+        )
         .with_state(UpstreamState);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -249,6 +304,132 @@ async fn api_v1_chat_completions_stream_converts_sse_and_appends_done() {
     );
     assert!(body.contains("\"content\":\"hi\""), "body: {body}");
     assert!(body.contains("data: [DONE]"), "body: {body}");
+}
+
+#[tokio::test]
+async fn api_v1_chat_completions_stream_surfaces_response_failed() {
+    let base_url = start_failed_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager.clone()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "messages": [{"role":"user","content":"hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("\"error\""), "body: {body}");
+    assert!(body.contains("This content was flagged"), "body: {body}");
+    assert!(body.contains("content_policy_violation"), "body: {body}");
+
+    let stats = manager.accounts_snapshot()[0].stats_snapshot();
+    assert_eq!(stats.failed_requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_chat_completions_stream_reports_missing_terminal() {
+    let base_url = start_missing_terminal_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager.clone()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "messages": [{"role":"user","content":"hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("\"error\""), "body: {body}");
+    assert!(body.contains("response.completed"), "body: {body}");
+    assert!(!body.contains("data: [DONE]"), "body: {body}");
+
+    let stats = manager.accounts_snapshot()[0].stats_snapshot();
+    assert_eq!(stats.failed_requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_chat_completions_stream_reports_empty_completed_response() {
+    let base_url = start_empty_retry_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at-empty").await;
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(build_state(base_url, manager.clone()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "messages": [{"role":"user","content":"hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("\"error\""), "body: {body}");
+    assert!(body.contains("empty response"), "body: {body}");
+    assert!(!body.contains("data: [DONE]"), "body: {body}");
+
+    let stats = manager.accounts_snapshot()[0].stats_snapshot();
+    assert_eq!(stats.failed_requests, 1);
 }
 
 #[tokio::test]

@@ -555,50 +555,112 @@ fn sticky_initial_excluded_for_previous_response(
 fn response_failed_error_from_sse_bytes(bytes: &[u8]) -> Option<(String, String)> {
     for line in bytes.split(|b| *b == b'\n') {
         let line = trim_ascii(line);
-        if !line.starts_with(b"data:") {
-            continue;
+        if let Some(err) = response_failed_error_from_sse_line(line) {
+            return Some(err);
         }
-        let payload = trim_ascii(&line[5..]);
-        if payload.is_empty() || payload == b"[DONE]" {
-            continue;
-        }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-            continue;
-        };
-        if value.get("type").and_then(|value| value.as_str()) != Some("response.failed") {
-            continue;
-        }
-        let error = value
-            .get("response")
-            .and_then(|response| response.get("error"))
-            .or_else(|| value.get("error"));
-        let message = error
-            .and_then(|error| error.get("message"))
-            .and_then(|message| message.as_str())
-            .or_else(|| error.and_then(|error| error.as_str()))
-            .unwrap_or("upstream response failed")
-            .trim()
-            .to_string();
-        let err_type = error
-            .and_then(|error| error.get("type"))
-            .and_then(|err_type| err_type.as_str())
-            .unwrap_or("api_error")
-            .trim()
-            .to_string();
-        return Some((
-            if message.is_empty() {
-                "upstream response failed".to_string()
-            } else {
-                message
-            },
-            if err_type.is_empty() {
-                "api_error".to_string()
-            } else {
-                err_type
-            },
-        ));
     }
     None
+}
+
+fn response_failed_error_from_sse_line(line: &[u8]) -> Option<(String, String)> {
+    if !line.starts_with(b"data:") {
+        return None;
+    }
+    let payload = trim_ascii(&line[5..]);
+    if payload.is_empty() || payload == b"[DONE]" {
+        return None;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return None;
+    };
+    if value.get("type").and_then(|value| value.as_str()) != Some("response.failed") {
+        return None;
+    }
+    let error = value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| value.get("error"));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .or_else(|| error.and_then(|error| error.as_str()))
+        .unwrap_or("upstream response failed")
+        .trim()
+        .to_string();
+    let err_type = error
+        .and_then(|error| error.get("type"))
+        .and_then(|err_type| err_type.as_str())
+        .unwrap_or("api_error")
+        .trim()
+        .to_string();
+    Some((
+        if message.is_empty() {
+            "upstream response failed".to_string()
+        } else {
+            message
+        },
+        if err_type.is_empty() {
+            "api_error".to_string()
+        } else {
+            err_type
+        },
+    ))
+}
+
+fn openai_stream_error_event(message: &str, err_type: &str) -> Vec<u8> {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "error": {
+                "message": message,
+                "type": err_type,
+            }
+        })
+    )
+    .into_bytes()
+}
+
+fn claude_stream_error_event(message: &str, err_type: &str) -> Vec<u8> {
+    format!(
+        "event: error\ndata: {}\n\n",
+        json!({
+            "type": "error",
+            "error": {
+                "type": err_type,
+                "message": message,
+            }
+        })
+    )
+    .into_bytes()
+}
+
+fn record_stream_account_failure(
+    persist_store: Option<&Arc<PersistStore>>,
+    endpoint: &'static str,
+    model: &str,
+    attempts: usize,
+    api_key: Option<String>,
+    account: &Account,
+    runtime_state: &RuntimeStateStore,
+    message: String,
+    started_ms: i64,
+) {
+    let now_ms = crate::core::now_unix_ms();
+    account.record_failure(now_ms);
+    account.record_client_failure();
+    runtime_state.mark_dirty();
+    record_persist_account_error(
+        persist_store,
+        endpoint,
+        model,
+        true,
+        StatusCode::BAD_GATEWAY,
+        attempts,
+        api_key,
+        account,
+        message,
+        now_ms.saturating_sub(started_ms),
+    );
 }
 
 fn build_passthrough_sse_response(
@@ -1940,6 +2002,7 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
         let model_for_log = base_model.clone();
         let persist_store = state.persist_store.clone();
         let api_key_for_persist = api_key.clone();
+        let started_ms_for_stream = started_ms;
         tokio::spawn(async move {
             let _account_limit_guard = account_limit_guard;
             let _request_limit_guard = request_limit_guard;
@@ -1995,6 +2058,30 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                         );
                     }
 
+                    if let Some((message, err_type)) = response_failed_error_from_sse_line(line) {
+                        log_stream_incomplete(
+                            endpoint,
+                            &model_for_log,
+                            account_for_log.as_ref(),
+                            "response.failed",
+                        );
+                        record_stream_account_failure(
+                            persist_store.as_ref(),
+                            endpoint,
+                            &model_for_log,
+                            attempts,
+                            api_key_for_persist.clone(),
+                            account_for_log.as_ref(),
+                            runtime_state.as_ref(),
+                            message.clone(),
+                            started_ms_for_stream,
+                        );
+                        let _ = tx
+                            .send(Ok(claude_stream_error_event(&message, &err_type)))
+                            .await;
+                        return;
+                    }
+
                     let events = convert_codex_stream_to_claude_events(line, &mut state);
                     for evt in events {
                         if tx.send(Ok(evt.into_bytes())).await.is_err() {
@@ -2030,12 +2117,27 @@ async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Respo
                     );
                 }
             } else {
+                let message = "上游响应缺少 response.completed";
                 log_stream_incomplete(
                     endpoint,
                     &model_for_log,
                     account_for_log.as_ref(),
                     "missing response.completed",
                 );
+                record_stream_account_failure(
+                    persist_store.as_ref(),
+                    endpoint,
+                    &model_for_log,
+                    attempts,
+                    api_key_for_persist.clone(),
+                    account_for_log.as_ref(),
+                    runtime_state.as_ref(),
+                    message.to_string(),
+                    started_ms_for_stream,
+                );
+                let _ = tx
+                    .send(Ok(claude_stream_error_event(message, "api_error")))
+                    .await;
             }
         });
 
@@ -2800,6 +2902,7 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
         let model_for_log = base_model.clone();
         let persist_store = state.persist_store.clone();
         let api_key_for_persist = api_key.clone();
+        let started_ms_for_stream = started_ms;
         tokio::spawn(async move {
             let _account_limit_guard = account_limit_guard;
             let _request_limit_guard = request_limit_guard;
@@ -2838,6 +2941,29 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                     let line = trim_ascii(line.as_ref());
                     if line.is_empty() {
                         continue;
+                    }
+                    if let Some((message, err_type)) = response_failed_error_from_sse_line(line) {
+                        log_stream_incomplete(
+                            endpoint,
+                            &model_for_log,
+                            account.as_ref(),
+                            "response.failed",
+                        );
+                        record_stream_account_failure(
+                            persist_store.as_ref(),
+                            endpoint,
+                            &model_for_log,
+                            attempts,
+                            api_key_for_persist.clone(),
+                            account.as_ref(),
+                            runtime_state.as_ref(),
+                            message.clone(),
+                            started_ms_for_stream,
+                        );
+                        let _ = tx
+                            .send(Ok(openai_stream_error_event(&message, &err_type)))
+                            .await;
+                        return;
                     }
                     let chunks = convert_stream_chunk(line, &mut state, &reverse_tool_map);
                     for chunk in chunks {
@@ -2890,12 +3016,30 @@ async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) 
                 );
                 let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
             } else {
-                log_stream_incomplete(
+                let (message, err_type, reason) = if state.completed {
+                    ("empty response", "invalid_response", "empty response")
+                } else {
+                    (
+                        "上游响应缺少 response.completed",
+                        "api_error",
+                        "missing response.completed",
+                    )
+                };
+                log_stream_incomplete(endpoint, &model_for_log, account.as_ref(), reason);
+                record_stream_account_failure(
+                    persist_store.as_ref(),
                     endpoint,
                     &model_for_log,
+                    attempts,
+                    api_key_for_persist.clone(),
                     account.as_ref(),
-                    "missing usable output",
+                    runtime_state.as_ref(),
+                    message.to_string(),
+                    started_ms_for_stream,
                 );
+                let _ = tx
+                    .send(Ok(openai_stream_error_event(message, err_type)))
+                    .await;
             }
         });
 
@@ -3214,6 +3358,7 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
         let model_for_log = base_model.clone();
         let persist_store = state.persist_store.clone();
         let api_key_for_persist = api_key.clone();
+        let started_ms_for_stream = started_ms;
         tokio::spawn(async move {
             let _account_limit_guard = account_limit_guard;
             let _request_limit_guard = request_limit_guard;
@@ -3252,6 +3397,29 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
                     let line = trim_ascii(line.as_ref());
                     if line.is_empty() {
                         continue;
+                    }
+                    if let Some((message, err_type)) = response_failed_error_from_sse_line(line) {
+                        log_stream_incomplete(
+                            endpoint,
+                            &model_for_log,
+                            account.as_ref(),
+                            "response.failed",
+                        );
+                        record_stream_account_failure(
+                            persist_store.as_ref(),
+                            endpoint,
+                            &model_for_log,
+                            attempts,
+                            api_key_for_persist.clone(),
+                            account.as_ref(),
+                            runtime_state.as_ref(),
+                            message.clone(),
+                            started_ms_for_stream,
+                        );
+                        let _ = tx
+                            .send(Ok(openai_stream_error_event(&message, &err_type)))
+                            .await;
+                        return;
                     }
                     let chunks = convert_stream_chunk(line, &mut state, &reverse_tool_map);
                     for chunk in chunks {
@@ -3306,12 +3474,30 @@ async fn v1_completions(State(state): State<AppState>, req: Request<Body>) -> Re
                 );
                 let _ = tx.send(Ok(b"data: [DONE]\n\n".to_vec())).await;
             } else {
-                log_stream_incomplete(
+                let (message, err_type, reason) = if state.completed {
+                    ("empty response", "invalid_response", "empty response")
+                } else {
+                    (
+                        "上游响应缺少 response.completed",
+                        "api_error",
+                        "missing response.completed",
+                    )
+                };
+                log_stream_incomplete(endpoint, &model_for_log, account.as_ref(), reason);
+                record_stream_account_failure(
+                    persist_store.as_ref(),
                     endpoint,
                     &model_for_log,
+                    attempts,
+                    api_key_for_persist.clone(),
                     account.as_ref(),
-                    "missing usable output",
+                    runtime_state.as_ref(),
+                    message.to_string(),
+                    started_ms_for_stream,
                 );
+                let _ = tx
+                    .send(Ok(openai_stream_error_event(message, err_type)))
+                    .await;
             }
         });
 
