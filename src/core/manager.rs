@@ -12,6 +12,7 @@ use super::account::{Account, TokenData, TokenFile, parse_id_token_claims};
 use super::selector::{RoundRobinSelector, Selector};
 
 const RUNTIME_STATE_FILE_NAME: &str = ".codex-proxy-state.json";
+const SUB2API_SPLIT_NAME_MAX_LEN: usize = 80;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ScanOutcome {
@@ -50,8 +51,8 @@ impl Manager {
             if !is_json_file(&path) {
                 continue;
             }
-            match load_account_from_file(&path) {
-                Ok(acc) => accounts.push(acc),
+            match load_accounts_from_auth_file(&path) {
+                Ok(loaded) => accounts.extend(loaded),
                 Err(err) => {
                     warn_invalid_auth_file(&path, &err);
                     if err.should_delete_file() {
@@ -175,14 +176,18 @@ impl Manager {
             if !is_json_file(&path) {
                 continue;
             }
-            let file_path = path.to_string_lossy().to_string();
-            disk_files.insert(file_path.clone());
-            if existing.contains(&file_path) {
-                continue;
-            }
 
-            match load_account_from_file(&path) {
-                Ok(acc) => added.push(acc),
+            match load_accounts_from_auth_file(&path) {
+                Ok(accounts) => {
+                    for acc in accounts {
+                        let file_path = acc.file_path().to_string();
+                        disk_files.insert(file_path.clone());
+                        if existing.contains(&file_path) {
+                            continue;
+                        }
+                        added.push(acc);
+                    }
+                }
                 Err(err) => {
                     warn_invalid_auth_file(&path, &err);
                     if err.should_delete_file() {
@@ -277,6 +282,19 @@ fn delete_invalid_auth_file(path: &Path, reason: &str) {
     }
 }
 
+fn load_accounts_from_auth_file(path: &Path) -> Result<Vec<Arc<Account>>, LoadAccountError> {
+    let paths = match migrate_sub2api_multi_account_export(path)? {
+        Some(paths) => paths,
+        None => vec![path.to_path_buf()],
+    };
+
+    let mut accounts = Vec::with_capacity(paths.len());
+    for path in paths {
+        accounts.push(load_account_from_file(&path)?);
+    }
+    Ok(accounts)
+}
+
 fn load_account_from_file(path: &Path) -> Result<Arc<Account>, LoadAccountError> {
     let data = fs::read_to_string(path).map_err(|e| LoadAccountError::Read(e.to_string()))?;
     let tf = parse_token_file(&data)?;
@@ -326,35 +344,195 @@ fn parse_token_file(data: &str) -> Result<TokenFile, LoadAccountError> {
     }
 }
 
+fn migrate_sub2api_multi_account_export(
+    path: &Path,
+) -> Result<Option<Vec<PathBuf>>, LoadAccountError> {
+    let data = fs::read_to_string(path).map_err(|e| LoadAccountError::Read(e.to_string()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
+    let account_count = value
+        .get("accounts")
+        .and_then(|accounts| accounts.as_array())
+        .map(|accounts| accounts.len())
+        .unwrap_or(0);
+    if account_count <= 1 {
+        return Ok(None);
+    }
+    let export: Sub2ApiExport =
+        serde_json::from_value(value).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| LoadAccountError::Read(format!("无效路径: {}", path.display())))?;
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("sub2api");
+
+    let mut split_payloads = Vec::with_capacity(export.accounts.len());
+    for (idx, account) in export.accounts.into_iter().enumerate() {
+        let tf = sub2api_account_to_token_file(account).ok_or_else(|| {
+            LoadAccountError::Parse(format!(
+                "sub2api 多账号导出第 {} 个账号缺少 access_token，跳过迁移以保留原文件",
+                idx + 1
+            ))
+        })?;
+        let target = next_available_split_path(parent, stem, idx, &tf);
+        let data = serde_json::to_string_pretty(&tf)
+            .map_err(|e| LoadAccountError::Parse(format!("序列化拆分账号失败: {e}")))?;
+        split_payloads.push((target, data));
+    }
+
+    let mut split_files = Vec::with_capacity(split_payloads.len());
+    for (target, data) in split_payloads {
+        if let Err(err) = fs::write(&target, data) {
+            cleanup_split_files(&split_files);
+            return Err(LoadAccountError::Read(err.to_string()));
+        }
+        split_files.push(target);
+    }
+
+    if let Err(err) = fs::remove_file(path) {
+        cleanup_split_files(&split_files);
+        return Err(LoadAccountError::Read(format!(
+            "删除 sub2api 原始导出文件失败: {err}"
+        )));
+    }
+
+    tracing::info!(
+        source = %path.display(),
+        split_count = split_files.len(),
+        "sub2api multi-account export migrated"
+    );
+    Ok(Some(split_files))
+}
+
+fn cleanup_split_files(split_files: &[PathBuf]) {
+    for split_file in split_files {
+        let _ = fs::remove_file(split_file);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Sub2ApiExport {
+    #[serde(default)]
+    accounts: Vec<Sub2ApiAccount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Sub2ApiAccount {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    credentials: Sub2ApiCredentials,
+    #[serde(default)]
+    extra: Sub2ApiExtra,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Sub2ApiCredentials {
+    #[serde(default)]
+    access_token: String,
+    #[serde(default)]
+    refresh_token: String,
+    #[serde(default)]
+    id_token: String,
+    #[serde(default)]
+    chatgpt_account_id: String,
+    #[serde(default)]
+    organization_id: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    expires_at: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Sub2ApiExtra {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    last_refresh: String,
+}
+
+fn sub2api_account_to_token_file(account: Sub2ApiAccount) -> Option<TokenFile> {
+    let credentials = account.credentials;
+    if credentials.access_token.trim().is_empty() {
+        return None;
+    }
+
+    let account_id = if credentials.chatgpt_account_id.trim().is_empty() {
+        credentials.organization_id
+    } else {
+        credentials.chatgpt_account_id
+    };
+    let email = if !credentials.email.trim().is_empty() {
+        credentials.email
+    } else if !account.extra.email.trim().is_empty() {
+        account.extra.email
+    } else {
+        account.name
+    };
+
+    Some(TokenFile {
+        id_token: credentials.id_token,
+        access_token: credentials.access_token,
+        refresh_token: credentials.refresh_token,
+        account_id,
+        last_refresh: account.extra.last_refresh,
+        email,
+        token_type: "codex".to_string(),
+        expired: format_expires_at(credentials.expires_at),
+    })
+}
+
+fn next_available_split_path(parent: &Path, stem: &str, idx: usize, tf: &TokenFile) -> PathBuf {
+    let label = if !tf.email.trim().is_empty() {
+        tf.email.as_str()
+    } else if !tf.account_id.trim().is_empty() {
+        tf.account_id.as_str()
+    } else {
+        "account"
+    };
+    let label = sanitize_split_file_component(label);
+    let base_name = format!("{stem}-{:04}-{label}", idx + 1);
+    let mut path = parent.join(format!("{base_name}.json"));
+    let mut suffix = 2;
+    while path.exists() {
+        path = parent.join(format!("{base_name}-{suffix}.json"));
+        suffix += 1;
+    }
+    path
+}
+
+fn sanitize_split_file_component(input: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in input.trim().chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            last_dash = false;
+            ch
+        } else if !last_dash {
+            last_dash = true;
+            '-'
+        } else {
+            continue;
+        };
+        out.push(next);
+        if out.len() >= SUB2API_SPLIT_NAME_MAX_LEN {
+            break;
+        }
+    }
+    let out = out.trim_matches(['.', '-', '_']).to_string();
+    if out.is_empty() {
+        "account".to_string()
+    } else {
+        out
+    }
+}
+
 fn parse_sub2api_token_file(data: &str) -> Result<Option<TokenFile>, LoadAccountError> {
-    #[derive(Debug, Deserialize)]
-    struct Sub2ApiExport {
-        #[serde(default)]
-        accounts: Vec<Sub2ApiAccount>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct Sub2ApiAccount {
-        #[serde(default)]
-        name: String,
-        #[serde(default)]
-        credentials: Sub2ApiCredentials,
-    }
-
-    #[derive(Debug, Default, Deserialize)]
-    struct Sub2ApiCredentials {
-        #[serde(default)]
-        access_token: String,
-        #[serde(default)]
-        refresh_token: String,
-        #[serde(default)]
-        chatgpt_account_id: String,
-        #[serde(default)]
-        organization_id: String,
-        #[serde(default)]
-        expires_at: i64,
-    }
-
     let export: Sub2ApiExport =
         serde_json::from_str(data).map_err(|e| LoadAccountError::Parse(e.to_string()))?;
     if export.accounts.is_empty() {
@@ -372,27 +550,7 @@ fn parse_sub2api_token_file(data: &str) -> Result<Option<TokenFile>, LoadAccount
         .into_iter()
         .next()
         .expect("checked len == 1");
-    let credentials = account.credentials;
-    if credentials.access_token.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let account_id = if credentials.chatgpt_account_id.trim().is_empty() {
-        credentials.organization_id
-    } else {
-        credentials.chatgpt_account_id
-    };
-
-    Ok(Some(TokenFile {
-        id_token: String::new(),
-        access_token: credentials.access_token,
-        refresh_token: credentials.refresh_token,
-        account_id,
-        last_refresh: String::new(),
-        email: account.name,
-        token_type: "codex".to_string(),
-        expired: format_expires_at(credentials.expires_at),
-    }))
+    Ok(sub2api_account_to_token_file(account))
 }
 
 fn format_expires_at(expires_at_unix_seconds: i64) -> String {
@@ -739,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn core_manager_skips_sub2api_multi_account_export() {
+    fn core_manager_migrates_sub2api_multi_account_export() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("sub.json");
         fs::write(
@@ -774,11 +932,155 @@ mod tests {
         .expect("write sub.json");
 
         let manager = Manager::new(dir.path());
+        let count = manager.load_accounts().expect("load accounts");
+        assert_eq!(count, 2);
+        assert!(
+            !auth_path.exists(),
+            "multi-account export should be removed after migration"
+        );
+
+        let mut split_files: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| is_json_file(path))
+            .collect();
+        split_files.sort();
+        assert_eq!(split_files.len(), 2);
+        assert!(
+            split_files[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("a-example.com")
+        );
+        assert!(
+            split_files[1]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("b-example.com")
+        );
+
+        let mut tokens: Vec<_> = manager
+            .accounts_snapshot()
+            .iter()
+            .map(|acc| acc.token_clone())
+            .collect();
+        tokens.sort_by(|a, b| a.email.cmp(&b.email));
+        assert_eq!(tokens[0].access_token, "at-a");
+        assert_eq!(tokens[0].refresh_token, "rt-a");
+        assert_eq!(tokens[0].account_id, "acc-a");
+        assert_eq!(tokens[0].email, "a@example.com");
+        assert_eq!(tokens[1].access_token, "at-b");
+        assert_eq!(tokens[1].refresh_token, "rt-b");
+        assert_eq!(tokens[1].account_id, "acc-b");
+        assert_eq!(tokens[1].email, "b@example.com");
+    }
+
+    #[test]
+    fn core_manager_scan_new_files_migrates_sub2api_multi_account_export() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = Manager::new(dir.path());
+
+        assert_eq!(
+            manager.scan_new_files().expect("initial scan"),
+            ScanOutcome::default()
+        );
+
+        let auth_path = dir.path().join("sub.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "accounts": [
+    {
+      "name": "a@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-a",
+        "refresh_token": "rt-a",
+        "chatgpt_account_id": "acc-a",
+        "expires_at": 4070908800
+      }
+    },
+    {
+      "name": "b@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-b",
+        "refresh_token": "rt-b",
+        "chatgpt_account_id": "acc-b",
+        "expires_at": 4070908800
+      }
+    }
+  ],
+  "proxies": [],
+  "exported_at": "2026-04-11T11:35:09Z"
+}"#,
+        )
+        .expect("write sub.json");
+
+        assert_eq!(
+            manager.scan_new_files().expect("hot load"),
+            ScanOutcome {
+                added: 2,
+                removed: 0
+            }
+        );
+        assert_eq!(manager.account_count(), 2);
+        assert!(
+            !auth_path.exists(),
+            "multi-account export should be removed after hot-scan migration"
+        );
+    }
+
+    #[test]
+    fn core_manager_sub2api_multi_account_migration_keeps_source_on_invalid_account() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("sub.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "accounts": [
+    {
+      "name": "a@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-a",
+        "refresh_token": "rt-a",
+        "chatgpt_account_id": "acc-a",
+        "expires_at": 4070908800
+      }
+    },
+    {
+      "name": "b@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "",
+        "refresh_token": "rt-b",
+        "chatgpt_account_id": "acc-b",
+        "expires_at": 4070908800
+      }
+    }
+  ],
+  "proxies": [],
+  "exported_at": "2026-04-11T11:35:09Z"
+}"#,
+        )
+        .expect("write sub.json");
+
+        let manager = Manager::new(dir.path());
         let err = manager.load_accounts().expect_err("should error");
         assert!(err.contains("未找到有效"), "got err: {err}");
         assert!(
             auth_path.exists(),
-            "multi-account export should not be deleted"
+            "source export should be kept when migration fails"
         );
+
+        let json_files: Vec<_> = fs::read_dir(dir.path())
+            .expect("read dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| is_json_file(path))
+            .collect();
+        assert_eq!(json_files, vec![auth_path]);
     }
 }
