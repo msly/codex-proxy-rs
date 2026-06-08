@@ -445,7 +445,7 @@ struct Sub2ApiCredentials {
     #[serde(default)]
     email: String,
     #[serde(default)]
-    expires_at: i64,
+    expires_at: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -483,8 +483,27 @@ fn sub2api_account_to_token_file(account: Sub2ApiAccount) -> Option<TokenFile> {
         last_refresh: account.extra.last_refresh,
         email,
         token_type: "codex".to_string(),
-        expired: format_expires_at(credentials.expires_at),
+        expired: format_sub2api_expires_at(&credentials.expires_at),
     })
+}
+
+fn format_sub2api_expires_at(expires_at: &serde_json::Value) -> String {
+    if let Some(v) = expires_at.as_i64() {
+        return format_expires_at(v);
+    }
+    if let Some(v) = expires_at.as_u64().and_then(|v| i64::try_from(v).ok()) {
+        return format_expires_at(v);
+    }
+    let Some(raw) = expires_at.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    if let Ok(v) = raw.parse::<i64>() {
+        return format_expires_at(v);
+    }
+    OffsetDateTime::parse(raw, &Rfc3339)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn next_available_split_path(parent: &Path, stem: &str, idx: usize, tf: &TokenFile) -> PathBuf {
@@ -894,6 +913,45 @@ mod tests {
         assert_eq!(token.account_id, "acc-sub");
         assert_eq!(token.email, "sub@example.com");
         assert_eq!(token.expired, "2099-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn core_manager_loads_sub2api_string_expires_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("sub.json");
+        fs::write(
+            &auth_path,
+            r#"{
+  "accounts": [
+    {
+      "name": "sub@example.com",
+      "type": "oauth",
+      "credentials": {
+        "access_token": "at-sub",
+        "refresh_token": "rt-sub",
+        "chatgpt_account_id": "acc-sub",
+        "organization_id": "org-sub",
+        "email": "sub@example.com",
+        "expires_at": "2026-06-17T22:36:07.000Z"
+      }
+    }
+  ],
+  "proxies": [],
+  "exported_at": "2026-04-11T11:35:09Z"
+}"#,
+        )
+        .expect("write sub.json");
+
+        let manager = Manager::new(dir.path());
+        let count = manager.load_accounts().expect("load accounts");
+        assert_eq!(count, 1);
+
+        let token = manager.accounts_snapshot()[0].token_clone();
+        assert_eq!(token.access_token, "at-sub");
+        assert_eq!(token.refresh_token, "rt-sub");
+        assert_eq!(token.account_id, "acc-sub");
+        assert_eq!(token.email, "sub@example.com");
+        assert_eq!(token.expired, "2026-06-17T22:36:07Z");
     }
 
     #[test]
