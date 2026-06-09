@@ -14,6 +14,8 @@ const STATE_FILE_NAME: &str = ".codex-proxy-state.json";
 const HOUR_MS: i64 = 3_600_000;
 const MAX_HOURLY_BUCKETS: usize = 168;
 const MAX_RESPONSE_ACCOUNT_BINDINGS: usize = 20_000;
+const MAX_SESSION_ACCOUNT_BINDINGS: usize = 20_000;
+const SESSION_ACCOUNT_TTL_MS: i64 = 3_600_000;
 const DEFAULT_SAVE_INTERVAL_SECS: u64 = 5;
 const SAVE_INTERVAL_ENV: &str = "CODEX_PROXY_RUNTIME_STATE_SAVE_INTERVAL_SECS";
 
@@ -45,6 +47,14 @@ struct RuntimeState {
     hourly: BTreeMap<i64, HourlyTrendPoint>,
     response_accounts: HashMap<String, String>,
     response_account_order: VecDeque<String>,
+    session_accounts: HashMap<String, AccountBinding>,
+    session_account_order: VecDeque<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AccountBinding {
+    account_file_path: String,
+    expires_at_ms: i64,
 }
 
 #[derive(Debug)]
@@ -168,6 +178,43 @@ impl RuntimeStateStore {
         inner.response_accounts.get(response_id).cloned()
     }
 
+    pub fn bind_session_account(&self, session_key: &str, account_file_path: &str) {
+        let session_key = session_key.trim();
+        let account_file_path = account_file_path.trim();
+        if session_key.is_empty() || account_file_path.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write().expect("runtime state lock poisoned");
+        if !inner.session_accounts.contains_key(session_key) {
+            inner
+                .session_account_order
+                .push_back(session_key.to_string());
+        }
+        inner.session_accounts.insert(
+            session_key.to_string(),
+            AccountBinding {
+                account_file_path: account_file_path.to_string(),
+                expires_at_ms: now_unix_ms().saturating_add(SESSION_ACCOUNT_TTL_MS),
+            },
+        );
+        trim_session_account_bindings(&mut inner);
+    }
+
+    pub fn account_for_session(&self, session_key: &str) -> Option<String> {
+        let session_key = session_key.trim();
+        if session_key.is_empty() {
+            return None;
+        }
+        let now_ms = now_unix_ms();
+        let mut inner = self.inner.write().expect("runtime state lock poisoned");
+        let binding = inner.session_accounts.get(session_key)?;
+        if binding.expires_at_ms <= now_ms {
+            inner.session_accounts.remove(session_key);
+            return None;
+        }
+        Some(binding.account_file_path.clone())
+    }
+
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
@@ -262,5 +309,46 @@ fn trim_response_account_bindings(state: &mut RuntimeState) {
             break;
         };
         state.response_accounts.remove(&response_id);
+    }
+}
+
+fn trim_session_account_bindings(state: &mut RuntimeState) {
+    let now_ms = now_unix_ms();
+    state
+        .session_accounts
+        .retain(|_, binding| binding.expires_at_ms > now_ms);
+    while state.session_accounts.len() > MAX_SESSION_ACCOUNT_BINDINGS {
+        let Some(session_key) = state.session_account_order.pop_front() else {
+            break;
+        };
+        state.session_accounts.remove(&session_key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_account_binding_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RuntimeStateStore::new(dir.path());
+
+        store.bind_session_account("Session_id:abc", "a.json");
+        assert_eq!(
+            store.account_for_session("Session_id:abc").as_deref(),
+            Some("a.json")
+        );
+
+        {
+            let mut inner = store.inner.write().unwrap();
+            inner
+                .session_accounts
+                .get_mut("Session_id:abc")
+                .unwrap()
+                .expires_at_ms = now_unix_ms().saturating_sub(1);
+        }
+
+        assert!(store.account_for_session("Session_id:abc").is_none());
     }
 }

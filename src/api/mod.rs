@@ -48,6 +48,8 @@ use crate::translate::{
 };
 use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, UpstreamResponse};
 
+pub mod models;
+
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
 const INVALID_STREAM_FIELD_TYPE_MESSAGE: &str = "stream field must be a boolean when provided";
 
@@ -518,20 +520,30 @@ fn previous_response_id_from_value(value: &serde_json::Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-fn sticky_initial_excluded_for_previous_response(
+fn sticky_initial_excluded_for_request(
     state: &AppState,
     previous_response_id: Option<&str>,
+    session_keys: &[String],
 ) -> HashSet<String> {
-    let Some(previous_response_id) = previous_response_id else {
-        return HashSet::new();
-    };
-    let Some(sticky_account_path) = state
-        .runtime_state
-        .account_for_response(previous_response_id)
-    else {
-        return HashSet::new();
-    };
+    if let Some(previous_response_id) = previous_response_id
+        && let Some(sticky_account_path) = state
+            .runtime_state
+            .account_for_response(previous_response_id)
+    {
+        return sticky_initial_excluded_for_account(state, &sticky_account_path);
+    }
+    for session_key in session_keys {
+        if let Some(sticky_account_path) = state.runtime_state.account_for_session(session_key) {
+            return sticky_initial_excluded_for_account(state, &sticky_account_path);
+        }
+    }
+    HashSet::new()
+}
 
+fn sticky_initial_excluded_for_account(
+    state: &AppState,
+    sticky_account_path: &str,
+) -> HashSet<String> {
     let accounts = state.manager.accounts_snapshot();
     if !accounts
         .iter()
@@ -551,6 +563,71 @@ fn sticky_initial_excluded_for_previous_response(
             }
         })
         .collect()
+}
+
+fn bind_session_accounts(
+    runtime_state: &RuntimeStateStore,
+    account: &Account,
+    session_keys: &[String],
+) {
+    for session_key in session_keys {
+        runtime_state.bind_session_account(session_key, account.file_path());
+    }
+}
+
+fn session_keys_from_request(
+    headers: Option<&HeaderMap>,
+    value: &serde_json::Value,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    for header_name in [
+        "Session_id",
+        "X-Session-ID",
+        "x-session-id",
+        "Conversation_id",
+        "conversation_id",
+    ] {
+        if let Some(session) = headers
+            .and_then(|headers| headers.get(header_name))
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            push_unique_session_key(&mut keys, header_name, session);
+        }
+    }
+
+    if let Some(user_id) = value
+        .get("metadata")
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(|user_id| user_id.as_str())
+        .map(str::trim)
+        .filter(|user_id| !user_id.is_empty())
+    {
+        if let Some(session_id) = serde_json::from_str::<serde_json::Value>(user_id)
+            .ok()
+            .and_then(|v| {
+                v.get("session_id")
+                    .and_then(|session_id| session_id.as_str())
+                    .map(str::trim)
+                    .filter(|session_id| !session_id.is_empty())
+                    .map(str::to_string)
+            })
+        {
+            push_unique_session_key(&mut keys, "metadata.user_id.session_id", &session_id);
+        } else {
+            push_unique_session_key(&mut keys, "metadata.user_id", user_id);
+        }
+    }
+
+    keys
+}
+
+fn push_unique_session_key(keys: &mut Vec<String>, source: &str, value: &str) {
+    let key = format!("{source}:{}", value.trim());
+    if !keys.iter().any(|existing| existing == &key) {
+        keys.push(key);
+    }
 }
 
 fn response_failed_error_from_sse_bytes(bytes: &[u8]) -> Option<(String, String)> {
@@ -812,7 +889,7 @@ pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/responses", post(v1_responses).get(v1_responses_ws))
         .route("/responses/compact", post(v1_responses_compact))
-        .route("/models", get(v1_models))
+        .route("/models", get(models::v1_models))
         .route("/chat/completions", post(v1_chat_completions))
         .route("/completions", post(v1_completions))
         .route("/images/generations", post(v1_images_generations))
@@ -1330,6 +1407,7 @@ fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
     for name in [
         "Version",
         "Session_id",
+        "X-Session-ID",
         "Conversation_id",
         "conversation_id",
         "Originator",
@@ -1392,9 +1470,11 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
 
     let base_model = apply_thinking_to_value(&mut body_value, &model);
     let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, stream);
-    let initial_excluded = sticky_initial_excluded_for_previous_response(
+    let session_keys = session_keys_from_request(passthrough_headers.as_ref(), &codex_value);
+    let initial_excluded = sticky_initial_excluded_for_request(
         &state,
         previous_response_id_from_value(&codex_value),
+        &session_keys,
     );
     let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
@@ -1445,6 +1525,11 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
     if stream {
         let status = upstream.status();
         let now_ms = crate::core::now_unix_ms();
+        bind_session_accounts(
+            state.runtime_state.as_ref(),
+            account.as_ref(),
+            &session_keys,
+        );
         record_client_success(
             account.as_ref(),
             state.request_stats.as_ref(),
@@ -1522,6 +1607,11 @@ async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Resp
         }
     };
     let now_ms = crate::core::now_unix_ms();
+    bind_session_accounts(
+        state.runtime_state.as_ref(),
+        account.as_ref(),
+        &session_keys,
+    );
     bind_response_account_from_json_bytes(state.runtime_state.as_ref(), account.as_ref(), &bytes);
     if let Some(usage) = record_usage_from_json_bytes(
         account.as_ref(),
@@ -1816,9 +1906,11 @@ async fn forward_responses_sse_as_ws(
         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let base_model = apply_thinking_to_value(&mut body_value, model);
     let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
-    let initial_excluded = sticky_initial_excluded_for_previous_response(
+    let session_keys = session_keys_from_request(passthrough_headers, &codex_value);
+    let initial_excluded = sticky_initial_excluded_for_request(
         state,
         previous_response_id_from_value(&codex_value),
+        &session_keys,
     );
     let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
 
@@ -1841,6 +1933,11 @@ async fn forward_responses_sse_as_ws(
     let upstream = upstream_result.response;
     let account = upstream_result.account;
     let _account_limit_guard = upstream_result.account_limit_guard;
+    bind_session_accounts(
+        state.runtime_state.as_ref(),
+        account.as_ref(),
+        &session_keys,
+    );
 
     let mut has_text = false;
     let mut has_tool = false;
@@ -4085,122 +4182,6 @@ fn trim_ascii(input: &[u8]) -> &[u8] {
         end -= 1;
     }
     &input[start..end]
-}
-
-struct ModelListEntry {
-    base: &'static str,
-    suffixes: &'static [&'static str],
-}
-
-const MODEL_LIST: &[ModelListEntry] = &[
-    ModelListEntry {
-        base: "gpt-5",
-        suffixes: &["low", "medium", "high", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5-codex",
-        suffixes: &["low", "medium", "high", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5-codex-mini",
-        suffixes: &["low", "medium", "high", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.1",
-        suffixes: &["low", "medium", "high", "none", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.1-codex",
-        suffixes: &["low", "medium", "high", "max", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.1-codex-mini",
-        suffixes: &["low", "medium", "high", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.1-codex-max",
-        suffixes: &["low", "medium", "high", "xhigh", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.2",
-        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.2-codex",
-        suffixes: &["low", "medium", "high", "xhigh", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.3-codex",
-        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.4",
-        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.4-mini",
-        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
-    },
-    ModelListEntry {
-        base: "gpt-5.5",
-        suffixes: &["low", "medium", "high", "xhigh", "none", "auto"],
-    },
-    ModelListEntry {
-        base: "codex-auto-review",
-        suffixes: &["low", "medium", "high", "xhigh"],
-    },
-];
-
-#[derive(Debug, Serialize)]
-struct ModelItem {
-    id: String,
-    object: &'static str,
-    owned_by: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ModelsResponse {
-    object: &'static str,
-    data: Vec<ModelItem>,
-}
-
-async fn v1_models() -> Json<ModelsResponse> {
-    let mut capacity = 0usize;
-    for entry in MODEL_LIST {
-        capacity += 2 + entry.suffixes.len() * 2;
-    }
-    let mut data = Vec::with_capacity(capacity);
-
-    for entry in MODEL_LIST {
-        let base = entry.base;
-        data.push(ModelItem {
-            id: base.to_string(),
-            object: "model",
-            owned_by: "openai",
-        });
-        data.push(ModelItem {
-            id: format!("{base}-fast"),
-            object: "model",
-            owned_by: "openai",
-        });
-        for suffix in entry.suffixes {
-            data.push(ModelItem {
-                id: format!("{base}-{suffix}"),
-                object: "model",
-                owned_by: "openai",
-            });
-            data.push(ModelItem {
-                id: format!("{base}-{suffix}-fast"),
-                object: "model",
-                owned_by: "openai",
-            });
-        }
-    }
-
-    Json(ModelsResponse {
-        object: "list",
-        data,
-    })
 }
 
 async fn check_quota(

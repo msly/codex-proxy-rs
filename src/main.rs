@@ -29,6 +29,11 @@ async fn main() -> Result<(), String> {
     let cfg = Config::load(&config_path)?;
 
     init_tracing(&cfg.log_level);
+    if !cfg.models_path.is_empty() {
+        let catalog = api::models::ModelCatalog::load(&cfg.models_path)?;
+        api::models::set_model_catalog(catalog);
+        tracing::info!(models_path = %cfg.models_path, "custom models catalog loaded");
+    }
     api::set_admin_auth(Arc::new(AdminAuth::new(
         &config_path,
         cfg.admin.username.clone(),
@@ -353,6 +358,11 @@ async fn main() -> Result<(), String> {
 
     if let Err(err) = runtime_state.save_now(manager.as_ref()) {
         tracing::warn!("final runtime state save failed: {err}");
+    }
+    if let Some(store) = persist_store.as_ref()
+        && let Err(err) = store.shutdown_timeout(shutdown_timeout)
+    {
+        tracing::warn!("sqlite persist shutdown failed: {err}");
     }
 
     Ok(())

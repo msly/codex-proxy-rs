@@ -24,6 +24,9 @@ selector: "round-robin" # or "quota-first"
 api-keys:
   - "sk-123"
 
+# Optional YAML/JSON model catalog. Leave empty to use the built-in list.
+models-path: ""
+
 # Admin web UI account. Leave password-hash empty on first start; the UI will
 # prompt you to initialize the admin password and write an Argon2 hash here.
 admin:
@@ -43,6 +46,7 @@ rate-limits:
   account-rpm: 0
   account-concurrency: 0
   image-concurrency: 0
+  cache-ttl-sec: 300
 
 # Health checker. Set interval to 0 to disable.
 health-check-interval: 0
@@ -81,4 +85,3 @@ upstream-timeout-sec: 0
 # Override upstream client identity headers (leave empty to use defaults).
 client-version: "0.137.0"
 user-agent: "codex_cli_rs/0.137.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
-

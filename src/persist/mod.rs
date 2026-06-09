@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::thread;
+use std::time::Duration;
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
@@ -32,6 +33,7 @@ enum PersistEvent {
     Usage(UsageLogInput),
     AccountStatus(AccountStatusInput),
     Cleanup { older_than_ms: i64 },
+    Shutdown { ack: SyncSender<()> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,16 +196,30 @@ impl PersistStore {
                 }
                 while let Ok(first) = rx.recv() {
                     let mut events = Vec::with_capacity(WRITE_BATCH_SIZE);
-                    events.push(first);
+                    let mut shutdown_ack = None;
+                    match first {
+                        PersistEvent::Shutdown { ack } => shutdown_ack = Some(ack),
+                        event => events.push(event),
+                    }
                     while events.len() < WRITE_BATCH_SIZE {
                         match rx.try_recv() {
+                            Ok(PersistEvent::Shutdown { ack }) => {
+                                shutdown_ack = Some(ack);
+                                break;
+                            }
                             Ok(event) => events.push(event),
                             Err(_) => break,
                         }
                     }
-                    if let Err(err) = write_events(&mut conn, events) {
+                    if !events.is_empty()
+                        && let Err(err) = write_events(&mut conn, events)
+                    {
                         worker_runtime.write_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!("sqlite write failed: {err}");
+                    }
+                    if let Some(ack) = shutdown_ack {
+                        let _ = ack.send(());
+                        break;
                     }
                 }
                 worker_runtime
@@ -242,6 +258,16 @@ impl PersistStore {
             dropped_events: self.runtime.dropped_events.load(Ordering::Relaxed),
             write_errors: self.runtime.write_errors.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn shutdown_timeout(&self, timeout: Duration) -> Result<(), String> {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(PersistEvent::Shutdown { ack: ack_tx })
+            .map_err(|_| "SQLite writer 已停止".to_string())?;
+        ack_rx
+            .recv_timeout(timeout)
+            .map_err(|e| format!("等待 SQLite writer flush 超时或失败: {e}"))
     }
 
     fn enqueue(&self, event: PersistEvent) {
@@ -487,6 +513,7 @@ ON CONFLICT(file_path) DO UPDATE SET
                 params![older_than_ms],
             )?;
         }
+        PersistEvent::Shutdown { .. } => {}
     }
     Ok(())
 }
@@ -618,5 +645,28 @@ mod tests {
             "expected bounded queue to drop events under burst load"
         );
         assert!(store.status().writer_running);
+    }
+
+    #[test]
+    fn persist_shutdown_flushes_queued_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("persist.sqlite3");
+        let store = PersistStore::start_with_capacity(&db_path, 8).expect("persist store");
+        store.record_request(RequestLogInput {
+            ts_ms: 1,
+            endpoint: "/flush".to_string(),
+            model: "gpt-test".to_string(),
+            status: 200,
+            ..RequestLogInput::default()
+        });
+
+        store
+            .shutdown_timeout(Duration::from_secs(2))
+            .expect("shutdown flush");
+
+        assert!(!store.status().writer_running);
+        let rows = query_request_logs(&db_path, 10).expect("query rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].endpoint, "/flush");
     }
 }

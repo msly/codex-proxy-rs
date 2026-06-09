@@ -105,6 +105,9 @@ pub struct Config {
     #[serde(default)]
     pub api_keys: Vec<String>,
 
+    #[serde(rename = "models-path")]
+    pub models_path: String,
+
     #[serde(rename = "client-version")]
     pub client_version: String,
 
@@ -172,6 +175,8 @@ pub struct RateLimitConfig {
     pub account_concurrency: usize,
     #[serde(rename = "image-concurrency")]
     pub image_concurrency: usize,
+    #[serde(rename = "cache-ttl-sec")]
+    pub cache_ttl_sec: u64,
 }
 
 impl Default for Config {
@@ -210,6 +215,7 @@ impl Default for Config {
             selector: "round-robin".to_string(),
             refresh_batch_size: 0,
             api_keys: Vec::new(),
+            models_path: String::new(),
             client_version: String::new(),
             user_agent: String::new(),
             persistence: PersistenceConfig::default(),
@@ -240,6 +246,7 @@ impl Config {
         self.backend_domain = self.backend_domain.trim().to_string();
         self.backend_resolve_address = self.backend_resolve_address.trim().to_string();
         self.base_url = self.base_url.trim().to_string();
+        self.models_path = self.models_path.trim().to_string();
         self.log_level = self.log_level.trim().to_lowercase();
 
         if self.listen.is_empty() {
@@ -332,6 +339,9 @@ impl Config {
         self.selector = self.selector.trim().to_lowercase();
         if self.selector != "quota-first" {
             self.selector = "round-robin".to_string();
+        }
+        if self.rate_limits.cache_ttl_sec == 0 {
+            self.rate_limits.cache_ttl_sec = 300;
         }
 
         match self.log_level.as_str() {
