@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
-use axum::extract::ws::{CloseCode, CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State};
 use axum::http::header;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -51,10 +50,9 @@ use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, Upstre
 pub mod models;
 mod responses;
 
+#[cfg(test)]
 use responses::{
-    ResponsesWsSession, bind_session_accounts, build_responses_ws_request,
-    session_keys_from_request, sticky_initial_excluded_for_request,
-    update_responses_ws_session_from_event,
+    ResponsesWsSession, build_responses_ws_request, update_responses_ws_session_from_event,
 };
 
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
@@ -157,7 +155,7 @@ impl RequestStats {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct UsageTokens {
+pub(super) struct UsageTokens {
     input_tokens: i64,
     output_tokens: i64,
     cached_tokens: i64,
@@ -192,7 +190,7 @@ fn record_hourly_usage(runtime_state: &RuntimeStateStore, now_ms: i64, usage: Us
     }
 }
 
-fn record_client_success(
+pub(super) fn record_client_success(
     account: &Account,
     request_stats: &RequestStats,
     runtime_state: &RuntimeStateStore,
@@ -204,17 +202,17 @@ fn record_client_success(
     record_hourly_request(runtime_state, now_ms);
 }
 
-fn api_key_from_req(req: &Request<Body>) -> Option<String> {
+pub(super) fn api_key_from_req(req: &Request<Body>) -> Option<String> {
     req.extensions()
         .get::<RequestApiKey>()
         .and_then(|v| v.0.clone())
 }
 
-fn request_limit_guard_from_req(req: &Request<Body>) -> Option<Arc<RequestLimitGuard>> {
+pub(super) fn request_limit_guard_from_req(req: &Request<Body>) -> Option<Arc<RequestLimitGuard>> {
     req.extensions().get::<Arc<RequestLimitGuard>>().cloned()
 }
 
-fn record_persist_request(
+pub(super) fn record_persist_request(
     persist_store: Option<&Arc<PersistStore>>,
     endpoint: &'static str,
     model: &str,
@@ -246,7 +244,7 @@ fn record_persist_request(
     }
 }
 
-fn record_persist_error(
+pub(super) fn record_persist_error(
     persist_store: Option<&Arc<PersistStore>>,
     endpoint: &'static str,
     model: &str,
@@ -273,7 +271,7 @@ fn record_persist_error(
     });
 }
 
-fn record_persist_account_error(
+pub(super) fn record_persist_account_error(
     persist_store: Option<&Arc<PersistStore>>,
     endpoint: &'static str,
     model: &str,
@@ -305,7 +303,7 @@ fn record_persist_account_error(
     store.record_account_status((&snap).into());
 }
 
-fn record_persist_usage(
+pub(super) fn record_persist_usage(
     persist_store: Option<&Arc<PersistStore>>,
     endpoint: &'static str,
     model: &str,
@@ -416,7 +414,7 @@ fn record_usage_from_value(
     Some(usage)
 }
 
-fn record_usage_from_json_bytes(
+pub(super) fn record_usage_from_json_bytes(
     account: &Account,
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
@@ -465,7 +463,7 @@ fn record_usage_from_sse_bytes(
     None
 }
 
-fn parse_stream_field(value: &serde_json::Value) -> Result<bool, &'static str> {
+pub(super) fn parse_stream_field(value: &serde_json::Value) -> Result<bool, &'static str> {
     match value.get("stream") {
         None | Some(serde_json::Value::Null) => Ok(false),
         Some(serde_json::Value::Bool(stream)) => Ok(*stream),
@@ -473,7 +471,7 @@ fn parse_stream_field(value: &serde_json::Value) -> Result<bool, &'static str> {
     }
 }
 
-fn bind_response_account_from_value(
+pub(super) fn bind_response_account_from_value(
     runtime_state: &RuntimeStateStore,
     account: &Account,
     value: &serde_json::Value,
@@ -483,7 +481,7 @@ fn bind_response_account_from_value(
     }
 }
 
-fn bind_response_account_from_json_bytes(
+pub(super) fn bind_response_account_from_json_bytes(
     runtime_state: &RuntimeStateStore,
     account: &Account,
     bytes: &[u8],
@@ -519,7 +517,7 @@ fn extract_response_id_from_value(value: &serde_json::Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-fn previous_response_id_from_value(value: &serde_json::Value) -> Option<&str> {
+pub(super) fn previous_response_id_from_value(value: &serde_json::Value) -> Option<&str> {
     value
         .get("previous_response_id")
         .and_then(|id| id.as_str())
@@ -638,7 +636,7 @@ fn record_stream_account_failure(
     );
 }
 
-fn build_passthrough_sse_response(
+pub(super) fn build_passthrough_sse_response(
     endpoint: &'static str,
     model: String,
     upstream: reqwest::Response,
@@ -784,7 +782,10 @@ pub fn router(state: AppState) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
     let v1 = Router::new()
-        .route("/responses", post(v1_responses).get(v1_responses_ws))
+        .route(
+            "/responses",
+            post(responses::v1_responses).get(responses::v1_responses_ws),
+        )
         .route("/responses/compact", post(v1_responses_compact))
         .route("/models", get(models::v1_models))
         .route("/chat/completions", post(v1_chat_completions))
@@ -1026,7 +1027,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-fn send_error(status: StatusCode, message: &str, err_type: &str) -> Response {
+pub(super) fn send_error(status: StatusCode, message: &str, err_type: &str) -> Response {
     (
         status,
         Json(json!({
@@ -1053,7 +1054,7 @@ fn send_claude_error(status: StatusCode, err_type: &str, message: &str) -> Respo
         .into_response()
 }
 
-fn send_upstream_error(err: UpstreamError) -> Response {
+pub(super) fn send_upstream_error(err: UpstreamError) -> Response {
     match err {
         UpstreamError::Status { code, body } => {
             let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1087,7 +1088,7 @@ fn send_claude_upstream_error(err: UpstreamError) -> Response {
     }
 }
 
-async fn execute_codex_request(
+pub(super) async fn execute_codex_request(
     state: &AppState,
     model: &str,
     url: url::Url,
@@ -1187,7 +1188,7 @@ fn preview_body_for_log(body: &[u8], max_chars: usize) -> String {
     truncate_for_log(&String::from_utf8_lossy(body), max_chars)
 }
 
-fn log_upstream_request_error(
+pub(super) fn log_upstream_request_error(
     endpoint: &'static str,
     model: &str,
     stream: bool,
@@ -1219,7 +1220,7 @@ fn log_upstream_request_error(
     }
 }
 
-fn log_request_completed(
+pub(super) fn log_request_completed(
     endpoint: &'static str,
     model: &str,
     stream: bool,
@@ -1250,7 +1251,7 @@ fn log_request_completed(
     }
 }
 
-fn log_response_read_failed(
+pub(super) fn log_response_read_failed(
     endpoint: &'static str,
     model: &str,
     stream: bool,
@@ -1299,7 +1300,7 @@ fn log_stream_incomplete(
     );
 }
 
-fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
+pub(super) fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
     let mut passthrough = HeaderMap::new();
     for name in [
         "Version",
@@ -1320,514 +1321,6 @@ fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
     } else {
         Some(passthrough)
     }
-}
-
-async fn v1_responses(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let api_key = api_key_from_req(&req);
-    let request_limit_guard = request_limit_guard_from_req(&req);
-    let started_ms = crate::core::now_unix_ms();
-    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
-    let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return send_error(
-                StatusCode::BAD_REQUEST,
-                "读取请求体失败",
-                "invalid_request_error",
-            );
-        }
-    };
-
-    let mut body_value: serde_json::Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    let model = body_value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if model.trim().is_empty() {
-        return send_error(
-            StatusCode::BAD_REQUEST,
-            "缺少 model 字段",
-            "invalid_request_error",
-        );
-    }
-    let stream = match parse_stream_field(&body_value) {
-        Ok(stream) => stream,
-        Err(message) => {
-            return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
-        }
-    };
-
-    tracing::info!(model = %model, stream, "received /v1/responses request");
-
-    if let Err(message) = validate_function_call_output_context(&body_value) {
-        return send_error(StatusCode::BAD_REQUEST, &message, "invalid_request_error");
-    }
-
-    let base_model = apply_thinking_to_value(&mut body_value, &model);
-    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, stream);
-    let session_keys = session_keys_from_request(passthrough_headers.as_ref(), &codex_value);
-    let initial_excluded = sticky_initial_excluded_for_request(
-        &state,
-        previous_response_id_from_value(&codex_value),
-        &session_keys,
-    );
-    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
-
-    let url = match state.codex_client.responses_url() {
-        Ok(u) => u,
-        Err(err) => {
-            return send_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("构建上游 URL 失败: {err}"),
-                "server_error",
-            );
-        }
-    };
-
-    let endpoint = "/v1/responses";
-    let upstream_result = match execute_codex_request(
-        &state,
-        &base_model,
-        url,
-        codex_body,
-        stream,
-        passthrough_headers.as_ref(),
-        &initial_excluded,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            log_upstream_request_error(endpoint, &base_model, stream, &err);
-            record_persist_error(
-                state.persist_store.as_ref(),
-                endpoint,
-                &base_model,
-                stream,
-                StatusCode::BAD_GATEWAY,
-                api_key,
-                err.to_string(),
-                crate::core::now_unix_ms().saturating_sub(started_ms),
-            );
-            return send_upstream_error(err);
-        }
-    };
-    let upstream = upstream_result.response;
-    let account = upstream_result.account;
-    let attempts = upstream_result.attempts;
-    let account_limit_guard = upstream_result.account_limit_guard;
-
-    if stream {
-        let status = upstream.status();
-        let now_ms = crate::core::now_unix_ms();
-        bind_session_accounts(
-            state.runtime_state.as_ref(),
-            account.as_ref(),
-            &session_keys,
-        );
-        record_client_success(
-            account.as_ref(),
-            state.request_stats.as_ref(),
-            state.runtime_state.as_ref(),
-            now_ms,
-        );
-        log_request_completed(
-            endpoint,
-            &base_model,
-            true,
-            status,
-            attempts,
-            account.as_ref(),
-        );
-        record_persist_request(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            true,
-            status,
-            attempts,
-            api_key.clone(),
-            Some(account.as_ref()),
-            crate::core::now_unix_ms().saturating_sub(started_ms),
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-cache"),
-        );
-        headers.insert(
-            header::CONNECTION,
-            axum::http::HeaderValue::from_static("keep-alive"),
-        );
-        return build_passthrough_sse_response(
-            endpoint,
-            base_model,
-            upstream,
-            account,
-            state.runtime_state.clone(),
-            headers,
-            account_limit_guard,
-            request_limit_guard,
-            state.persist_store.clone(),
-            api_key,
-        );
-    }
-
-    let status = upstream.status();
-    let bytes = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(err) => {
-            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
-            record_persist_account_error(
-                state.persist_store.as_ref(),
-                endpoint,
-                &base_model,
-                false,
-                StatusCode::BAD_GATEWAY,
-                attempts,
-                api_key,
-                account.as_ref(),
-                format!("读取上游响应失败: {err}"),
-                crate::core::now_unix_ms().saturating_sub(started_ms),
-            );
-            return send_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("读取上游响应失败: {err}"),
-                "api_error",
-            );
-        }
-    };
-    let now_ms = crate::core::now_unix_ms();
-    bind_session_accounts(
-        state.runtime_state.as_ref(),
-        account.as_ref(),
-        &session_keys,
-    );
-    bind_response_account_from_json_bytes(state.runtime_state.as_ref(), account.as_ref(), &bytes);
-    if let Some(usage) = record_usage_from_json_bytes(
-        account.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-        bytes.as_ref(),
-    ) {
-        record_persist_usage(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            api_key.clone(),
-            account.as_ref(),
-            usage,
-        );
-    }
-    record_client_success(
-        account.as_ref(),
-        state.request_stats.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-    );
-    log_request_completed(
-        endpoint,
-        &base_model,
-        false,
-        status,
-        attempts,
-        account.as_ref(),
-    );
-    record_persist_request(
-        state.persist_store.as_ref(),
-        endpoint,
-        &base_model,
-        false,
-        status,
-        attempts,
-        api_key,
-        Some(account.as_ref()),
-        now_ms.saturating_sub(started_ms),
-    );
-
-    let mut resp = Response::new(Body::from(bytes));
-    let _request_limit_guard = request_limit_guard;
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    resp
-}
-
-async fn v1_responses_ws(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let passthrough_headers = extract_codex_passthrough_headers(&headers);
-    ws.on_upgrade(move |socket| handle_responses_ws(socket, state, passthrough_headers))
-        .into_response()
-}
-
-async fn handle_responses_ws(
-    mut socket: WebSocket,
-    state: AppState,
-    passthrough_headers: Option<HeaderMap>,
-) {
-    let mut session = ResponsesWsSession::default();
-    loop {
-        let msg = match socket.recv().await {
-            Some(Ok(m)) => m,
-            Some(Err(_)) => return,
-            None => return,
-        };
-
-        match msg {
-            Message::Text(text) => {
-                let value: serde_json::Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        write_ws_error(&mut socket, "invalid_request_error", "非法 JSON").await;
-                        continue;
-                    }
-                };
-                let event_type = value
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-
-                match event_type {
-                    "response.create" | "response.append" => {
-                        let (request_body, model) =
-                            match build_responses_ws_request(&value, &mut session) {
-                                Ok(v) => v,
-                                Err(message) => {
-                                    write_ws_error(&mut socket, "invalid_request_error", &message)
-                                        .await;
-                                    continue;
-                                }
-                            };
-                        let stream_result = forward_responses_sse_as_ws(
-                            &mut socket,
-                            &state,
-                            request_body,
-                            &model,
-                            passthrough_headers.as_ref(),
-                            &mut session,
-                        )
-                        .await;
-                        match stream_result {
-                            Ok(()) => continue,
-                            Err(ResponsesWsError::EmptyResponse) => {
-                                write_ws_error(&mut socket, "invalid_response", "empty response")
-                                    .await;
-                                close_ws(&mut socket, close_code::POLICY, "empty response").await;
-                                return;
-                            }
-                            Err(ResponsesWsError::Upstream(err)) => {
-                                write_ws_error(&mut socket, "api_error", &err.to_string()).await;
-                                return;
-                            }
-                            Err(ResponsesWsError::Local(msg)) => {
-                                write_ws_error(&mut socket, "api_error", &msg).await;
-                                return;
-                            }
-                        }
-                    }
-                    "response.cancel" | "response.close" => {
-                        close_ws(&mut socket, close_code::NORMAL, "closed").await;
-                        return;
-                    }
-                    _ => {
-                        write_ws_error(&mut socket, "invalid_request_error", "不支持的事件类型")
-                            .await;
-                    }
-                }
-            }
-            Message::Close(_) => return,
-            Message::Ping(v) => {
-                let _ = socket.send(Message::Pong(v)).await;
-            }
-            Message::Pong(_) => {}
-            _ => {
-                write_ws_error(&mut socket, "invalid_request_error", "仅支持文本帧").await;
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ResponsesWsError {
-    EmptyResponse,
-    Upstream(UpstreamError),
-    Local(String),
-}
-
-async fn forward_responses_sse_as_ws(
-    socket: &mut WebSocket,
-    state: &AppState,
-    request_body: Vec<u8>,
-    model: &str,
-    passthrough_headers: Option<&HeaderMap>,
-    session: &mut ResponsesWsSession,
-) -> Result<(), ResponsesWsError> {
-    tracing::info!(model = %model, "responses ws: fallback to HTTP/SSE forwarding");
-
-    let mut body_value: serde_json::Value = serde_json::from_slice(&request_body)
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    let base_model = apply_thinking_to_value(&mut body_value, model);
-    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
-    let session_keys = session_keys_from_request(passthrough_headers, &codex_value);
-    let initial_excluded = sticky_initial_excluded_for_request(
-        state,
-        previous_response_id_from_value(&codex_value),
-        &session_keys,
-    );
-    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
-
-    let url = state
-        .codex_client
-        .responses_url()
-        .map_err(ResponsesWsError::Local)?;
-
-    let upstream_result = execute_codex_request(
-        state,
-        &base_model,
-        url,
-        codex_body,
-        true,
-        passthrough_headers,
-        &initial_excluded,
-    )
-    .await
-    .map_err(ResponsesWsError::Upstream)?;
-    let upstream = upstream_result.response;
-    let account = upstream_result.account;
-    let _account_limit_guard = upstream_result.account_limit_guard;
-    bind_session_accounts(
-        state.runtime_state.as_ref(),
-        account.as_ref(),
-        &session_keys,
-    );
-
-    let mut has_text = false;
-    let mut has_tool = false;
-    let mut has_completed_output = false;
-    let mut buf = BytesMut::new();
-    let mut upstream_stream = upstream.bytes_stream();
-
-    while let Some(chunk) = upstream_stream.next().await {
-        let chunk = chunk.map_err(|e| ResponsesWsError::Local(format!("读取上游响应失败: {e}")))?;
-        buf.extend_from_slice(&chunk);
-
-        while let Some(pos) = memchr(b'\n', buf.as_ref()) {
-            let mut line = buf.split_to(pos + 1);
-            line.truncate(pos);
-            let line = trim_ascii(line.as_ref());
-            if line.is_empty() {
-                continue;
-            }
-            if !line.starts_with(b"data:") {
-                continue;
-            }
-            let payload = trim_ascii(&line[5..]);
-            if payload.is_empty() || payload == b"[DONE]" {
-                continue;
-            }
-
-            let mut outbound_text = None;
-            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(payload) {
-                update_responses_ws_session_from_event(session, &v);
-                bind_response_account_from_value(
-                    state.runtime_state.as_ref(),
-                    account.as_ref(),
-                    &v,
-                );
-                let had_stream_output = has_text || has_tool;
-                if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
-                    match typ {
-                        "response.output_text.delta" => {
-                            if v.get("delta").and_then(|v| v.as_str()).unwrap_or_default() != "" {
-                                has_text = true;
-                            }
-                        }
-                        "response.output_item.added"
-                        | "response.function_call_arguments.delta"
-                        | "response.function_call_arguments.done"
-                        | "response.output_item.done" => {
-                            has_tool = true;
-                        }
-                        "response.completed" => {
-                            let (_, completed_has_output) = convert_non_stream_response(
-                                payload,
-                                &std::collections::HashMap::new(),
-                            );
-                            if completed_has_output {
-                                has_completed_output = true;
-                            }
-                            if completed_has_output && had_stream_output {
-                                if let Some(response) = v
-                                    .get_mut("response")
-                                    .and_then(|value| value.as_object_mut())
-                                {
-                                    response.remove("output");
-                                }
-                                outbound_text = Some(v.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if socket
-                .send(Message::Text(
-                    outbound_text
-                        .unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
-                        .into(),
-                ))
-                .await
-                .is_err()
-            {
-                return Ok(());
-            }
-        }
-    }
-
-    if !has_text && !has_tool && !has_completed_output {
-        return Err(ResponsesWsError::EmptyResponse);
-    }
-
-    let now_ms = crate::core::now_unix_ms();
-    record_client_success(
-        account.as_ref(),
-        state.request_stats.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-    );
-    Ok(())
-}
-
-async fn write_ws_error(socket: &mut WebSocket, err_type: &str, message: &str) {
-    let body = json!({
-        "type": "error",
-        "error": {
-            "type": err_type,
-            "message": message,
-        }
-    });
-    let _ = socket.send(Message::Text(body.to_string().into())).await;
-}
-
-async fn close_ws(socket: &mut WebSocket, code: CloseCode, reason: &str) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
-            code,
-            reason: reason.to_string().into(),
-        })))
-        .await;
 }
 
 async fn v1_messages(State(state): State<AppState>, req: Request<Body>) -> Response {
@@ -2307,7 +1800,7 @@ fn count_text_chars(value: &serde_json::Value) -> usize {
     }
 }
 
-fn validate_function_call_output_context(v: &serde_json::Value) -> Result<(), String> {
+pub(super) fn validate_function_call_output_context(v: &serde_json::Value) -> Result<(), String> {
     validate_function_call_output_context_with_known_ids(v, &HashSet::new())
 }
 
@@ -3884,7 +3377,7 @@ fn parse_chat_non_stream_response(
     }
 }
 
-fn trim_ascii(input: &[u8]) -> &[u8] {
+pub(super) fn trim_ascii(input: &[u8]) -> &[u8] {
     let mut start = 0usize;
     let mut end = input.len();
     while start < end && input[start].is_ascii_whitespace() {
