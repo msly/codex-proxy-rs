@@ -35,7 +35,6 @@ use crate::state::RuntimeStateStore;
 use crate::thinking::apply::apply_thinking_to_value;
 use crate::translate::request::{
     build_reverse_tool_name_map_from_value, convert_openai_value_to_codex_value,
-    normalize_codex_instructions,
 };
 use crate::translate::{
     ClaudeStreamState, StreamState, convert_chat_completion_chunk_to_completion_chunk,
@@ -52,7 +51,8 @@ mod responses;
 
 #[cfg(test)]
 use responses::{
-    ResponsesWsSession, build_responses_ws_request, update_responses_ws_session_from_event,
+    ResponsesWsSession, build_responses_ws_request, clean_compact_value_to_vec,
+    update_responses_ws_session_from_event,
 };
 
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
@@ -786,7 +786,7 @@ pub fn router(state: AppState) -> Router {
             "/responses",
             post(responses::v1_responses).get(responses::v1_responses_ws),
         )
-        .route("/responses/compact", post(v1_responses_compact))
+        .route("/responses/compact", post(responses::v1_responses_compact))
         .route("/models", get(models::v1_models))
         .route("/chat/completions", post(v1_chat_completions))
         .route("/completions", post(v1_completions))
@@ -1900,255 +1900,6 @@ pub(super) fn validate_function_call_output_context_with_known_ids(
     }
 
     Err("function_call_output requires matching function_call context, item_reference ids, or previous_response_id on HTTP requests".to_string())
-}
-
-async fn v1_responses_compact(State(state): State<AppState>, req: Request<Body>) -> Response {
-    let api_key = api_key_from_req(&req);
-    let request_limit_guard = request_limit_guard_from_req(&req);
-    let started_ms = crate::core::now_unix_ms();
-    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
-    let raw = match axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => {
-            return send_error(
-                StatusCode::BAD_REQUEST,
-                "读取请求体失败",
-                "invalid_request_error",
-            );
-        }
-    };
-
-    let mut body_value: serde_json::Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    let model = body_value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if model.trim().is_empty() {
-        return send_error(
-            StatusCode::BAD_REQUEST,
-            "缺少 model 字段",
-            "invalid_request_error",
-        );
-    }
-    let stream = match parse_stream_field(&body_value) {
-        Ok(stream) => stream,
-        Err(message) => {
-            return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
-        }
-    };
-
-    tracing::info!(model = %model, stream, "received /v1/responses/compact request");
-
-    let base_model = apply_thinking_to_value(&mut body_value, &model);
-    let codex_body = clean_compact_value_to_vec(body_value, &base_model);
-
-    let url = match state.codex_client.responses_compact_url() {
-        Ok(u) => u,
-        Err(err) => {
-            return send_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("构建上游 URL 失败: {err}"),
-                "server_error",
-            );
-        }
-    };
-
-    let endpoint = "/v1/responses/compact";
-    let upstream_result = match execute_codex_request(
-        &state,
-        &base_model,
-        url,
-        codex_body,
-        stream,
-        passthrough_headers.as_ref(),
-        &HashSet::new(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            log_upstream_request_error(endpoint, &base_model, stream, &err);
-            record_persist_error(
-                state.persist_store.as_ref(),
-                endpoint,
-                &base_model,
-                stream,
-                StatusCode::BAD_GATEWAY,
-                api_key,
-                err.to_string(),
-                crate::core::now_unix_ms().saturating_sub(started_ms),
-            );
-            return send_upstream_error(err);
-        }
-    };
-    let upstream = upstream_result.response;
-    let account = upstream_result.account;
-    let attempts = upstream_result.attempts;
-    let account_limit_guard = upstream_result.account_limit_guard;
-
-    if stream {
-        let headers = upstream.headers().clone();
-        let status = upstream.status();
-        let now_ms = crate::core::now_unix_ms();
-        record_client_success(
-            account.as_ref(),
-            state.request_stats.as_ref(),
-            state.runtime_state.as_ref(),
-            now_ms,
-        );
-        log_request_completed(
-            endpoint,
-            &base_model,
-            true,
-            status,
-            attempts,
-            account.as_ref(),
-        );
-        record_persist_request(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            true,
-            status,
-            attempts,
-            api_key.clone(),
-            Some(account.as_ref()),
-            crate::core::now_unix_ms().saturating_sub(started_ms),
-        );
-        return build_passthrough_sse_response(
-            endpoint,
-            base_model,
-            upstream,
-            account,
-            state.runtime_state.clone(),
-            headers,
-            account_limit_guard,
-            request_limit_guard,
-            state.persist_store.clone(),
-            api_key,
-        );
-    }
-
-    let bytes = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(err) => {
-            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
-            record_persist_account_error(
-                state.persist_store.as_ref(),
-                endpoint,
-                &base_model,
-                false,
-                StatusCode::BAD_GATEWAY,
-                attempts,
-                api_key,
-                account.as_ref(),
-                format!("读取上游响应失败: {err}"),
-                crate::core::now_unix_ms().saturating_sub(started_ms),
-            );
-            return send_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("读取上游响应失败: {err}"),
-                "api_error",
-            );
-        }
-    };
-    let now_ms = crate::core::now_unix_ms();
-    if let Some(usage) = record_usage_from_json_bytes(
-        account.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-        bytes.as_ref(),
-    ) {
-        record_persist_usage(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            api_key.clone(),
-            account.as_ref(),
-            usage,
-        );
-    }
-    record_client_success(
-        account.as_ref(),
-        state.request_stats.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-    );
-    log_request_completed(
-        endpoint,
-        &base_model,
-        false,
-        StatusCode::OK,
-        attempts,
-        account.as_ref(),
-    );
-    record_persist_request(
-        state.persist_store.as_ref(),
-        endpoint,
-        &base_model,
-        false,
-        StatusCode::OK,
-        attempts,
-        api_key,
-        Some(account.as_ref()),
-        now_ms.saturating_sub(started_ms),
-    );
-
-    let mut resp = Response::new(Body::from(bytes));
-    let _request_limit_guard = request_limit_guard;
-    *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    resp
-}
-
-fn clean_compact_value_to_vec(mut v: serde_json::Value, base_model: &str) -> Vec<u8> {
-    {
-        let obj = match v.as_object_mut() {
-            Some(m) => m,
-            None => {
-                v = serde_json::Value::Object(Default::default());
-                v.as_object_mut().unwrap()
-            }
-        };
-
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(base_model.to_string()),
-        );
-
-        for key in [
-            "stream",
-            "stream_options",
-            "parallel_tool_calls",
-            "reasoning",
-            "include",
-            "previous_response_id",
-            "prompt_cache_retention",
-            "safety_identifier",
-            "generate",
-            "store",
-            "reasoning_effort",
-            "max_output_tokens",
-            "max_completion_tokens",
-            "temperature",
-            "top_p",
-            "truncation",
-            "context_management",
-            "user",
-            "service_tier",
-        ] {
-            obj.remove(key);
-        }
-    }
-
-    normalize_codex_instructions(&mut v);
-
-    serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec())
 }
 
 async fn v1_chat_completions(State(state): State<AppState>, req: Request<Body>) -> Response {
