@@ -120,7 +120,6 @@ type RateLimits = {
   key_concurrency: number;
   account_rpm: number;
   account_concurrency: number;
-  image_concurrency: number;
 };
 
 type PersistenceStatus = {
@@ -836,8 +835,7 @@ function RuntimePage({
     ["Key RPM", limits?.key_rpm],
     ["Key Concurrency", limits?.key_concurrency],
     ["Account RPM", limits?.account_rpm],
-    ["Account Concurrency", limits?.account_concurrency],
-    ["Image Concurrency", limits?.image_concurrency]
+    ["Account Concurrency", limits?.account_concurrency]
   ];
 
   const persistRows = [

@@ -200,7 +200,6 @@ async fn main() -> Result<(), String> {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(api_keys),
         max_retry: cfg.max_retry,
-        empty_retry_max: cfg.empty_retry_max,
         refresher: refresher.clone(),
         save_queue: save_queue.clone(),
         refresh_concurrency: cfg.refresh_concurrency as usize,

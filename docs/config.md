@@ -26,7 +26,6 @@
   | rate-limits.key-concurrency | 0 | 单个 API key 并发上限；0 关闭 |
   | rate-limits.account-rpm | 0 | 单个账号每分钟上游请求上限；0 关闭 |
   | rate-limits.account-concurrency | 0 | 单个账号上游并发上限；0 关闭 |
-  | rate-limits.image-concurrency | 0 | 图片端点进程级并发上限；0 关闭 |
 
   刷新与运行时
   | 配置项 | 默认值 | 含义 |
@@ -45,7 +44,6 @@
   | quota-check-concurrency | 跟随 refresh-concurrency | quota 查询并发；默认配置下最终是 50 |
   | keepalive-interval | 60 | keepalive ping 间隔，秒 |
   | upstream-timeout-sec | 0 | 等待上游首包/响应头超时；0 表示不启用这个超时 |
-  | empty-retry-max | 2 | /v1/chat/completions 非流式遇到空响应时，换账号重试次数 |
   | selector | round-robin | 账号选择策略：round-robin 或 quota-first |
   | refresh-batch-size | 0 | refresh 分批大小；0 表示本轮待刷新的账号一次性全处理 |
 

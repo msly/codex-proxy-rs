@@ -1,23 +1,6 @@
-pub mod claude;
-pub mod completions;
-pub mod images;
 pub mod request;
-pub mod response;
 
-pub use claude::{
-    ClaudeNonStreamResult, ClaudeStreamState, convert_claude_request_to_openai,
-    convert_codex_full_sse_to_claude_response_with_meta, convert_codex_stream_to_claude_events,
-};
-pub use completions::{
-    convert_chat_completion_chunk_to_completion_chunk, convert_chat_completion_to_completion,
-    convert_completions_request_to_chat_value,
-};
-pub use images::{convert_image_request_to_responses_value, convert_responses_sse_to_images_json};
-pub use request::{build_reverse_tool_name_map, convert_openai_request_to_codex};
-pub use response::{
-    StreamState, convert_non_stream_response, convert_stream_chunk,
-    extract_completed_response_payload,
-};
+pub use request::convert_openai_request_to_codex;
 
 #[cfg(test)]
 mod tests {
@@ -47,36 +30,19 @@ mod tests {
     }
 
     #[test]
-    fn translate_chat_completions_messages_to_input_array() {
+    fn translate_existing_input_json_format_adds_json_instruction() {
         let input = json!({
-            "messages": [
-                {"role":"system","content":"s"},
-                {"role":"user","content":"u"},
-                {"role":"tool","tool_call_id":"c1","content":"out"}
-            ]
-        });
-        let out =
-            convert_openai_request_to_codex("gpt-5.4", &serde_json::to_vec(&input).unwrap(), false);
-        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
-
-        assert_eq!(v["model"], "gpt-5.4");
-        assert_eq!(v["stream"], false);
-        assert!(v["input"].is_array());
-        assert_eq!(v["input"][0]["type"], "message");
-        assert_eq!(v["input"][0]["role"], "developer"); // system -> developer
-        assert_eq!(v["input"][1]["role"], "user");
-        assert_eq!(v["input"][2]["type"], "function_call_output");
-        assert_eq!(v["input"][2]["call_id"], "c1");
-    }
-
-    #[test]
-    fn translate_json_object_adds_format_and_json_instruction() {
-        let input = json!({
-            "messages": [
-                {"role":"user","content":"return object"}
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "return object"}]
+                }
             ],
-            "response_format": {
-                "type": "json_object"
+            "text": {
+                "format": {
+                    "type": "json_object"
+                }
             }
         });
         let out =
@@ -107,6 +73,25 @@ mod tests {
             "input": [
                 {
                     "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "tool output"
+                }
+            ]
+        });
+        let out =
+            convert_openai_request_to_codex("gpt-5.4", &serde_json::to_vec(&input).unwrap(), true);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        assert_eq!(v["previous_response_id"], "resp_prev");
+    }
+
+    #[test]
+    fn translate_existing_input_keeps_previous_response_id_for_custom_tool_outputs() {
+        let input = json!({
+            "previous_response_id": "resp_prev",
+            "input": [
+                {
+                    "type": "custom_tool_call_output",
                     "call_id": "call_1",
                     "output": "tool output"
                 }

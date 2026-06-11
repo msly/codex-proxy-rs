@@ -17,7 +17,6 @@ log-level: "info"
 
 # Internal retry count. Total attempts = max-retry + 1.
 max-retry: 30
-empty-retry-max: 20
 selector: "round-robin" # or "quota-first"
 
 # Optional API keys. Leave empty to disable auth.
@@ -45,7 +44,6 @@ rate-limits:
   key-concurrency: 0
   account-rpm: 0
   account-concurrency: 0
-  image-concurrency: 0
   cache-ttl-sec: 300
 
 # Health checker. Set interval to 0 to disable.

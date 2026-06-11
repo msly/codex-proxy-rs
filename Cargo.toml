@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.4", features = ["ws", "multipart"] }
+axum = { version = "0.8.4", features = ["ws"] }
 argon2 = "0.5.3"
 arc-swap = "1.7.1"
 base64 = "0.22.1"

@@ -38,7 +38,6 @@ fn build_state(api_keys: &[&str]) -> AppState {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(keys),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -341,6 +340,40 @@ async fn api_auth_middleware_protects_v1_routes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn removed_conversion_routes_are_not_registered() {
+    let app = api::router(build_state(&[]));
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/images/generations",
+        "/v1/images/edits",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                res.status(),
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{path}: {}",
+            res.status()
+        );
+    }
 }
 
 #[tokio::test]

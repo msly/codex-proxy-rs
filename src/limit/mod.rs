@@ -15,7 +15,6 @@ pub struct RateLimiter {
     account_windows: Arc<Mutex<HashMap<String, FixedWindow>>>,
     key_semaphores: Arc<Mutex<HashMap<String, CachedSemaphore>>>,
     account_semaphores: Arc<Mutex<HashMap<String, CachedSemaphore>>>,
-    image_semaphore: Option<Arc<Semaphore>>,
     cache_ttl_ms: i64,
     last_prune_ms: AtomicI64,
 }
@@ -39,22 +38,17 @@ pub struct RateLimitSnapshot {
     pub key_concurrency: usize,
     pub account_rpm: u64,
     pub account_concurrency: usize,
-    pub image_concurrency: usize,
     pub cache_ttl_sec: u64,
 }
 
 #[derive(Debug)]
 pub struct RequestLimitGuard {
     _key_permit: Option<OwnedSemaphorePermit>,
-    _image_permit: Option<OwnedSemaphorePermit>,
 }
 
 impl RequestLimitGuard {
     pub fn disabled() -> Self {
-        Self {
-            _key_permit: None,
-            _image_permit: None,
-        }
+        Self { _key_permit: None }
     }
 }
 
@@ -86,11 +80,6 @@ impl RateLimiter {
         };
         let cache_ttl_ms = (cache_ttl_sec as i64).saturating_mul(1000);
         Self {
-            image_semaphore: if cfg.image_concurrency > 0 {
-                Some(Arc::new(Semaphore::new(cfg.image_concurrency)))
-            } else {
-                None
-            },
             cfg,
             key_windows: Arc::new(Mutex::new(HashMap::new())),
             account_windows: Arc::new(Mutex::new(HashMap::new())),
@@ -107,16 +96,11 @@ impl RateLimiter {
             key_concurrency: self.cfg.key_concurrency,
             account_rpm: self.cfg.account_rpm,
             account_concurrency: self.cfg.account_concurrency,
-            image_concurrency: self.cfg.image_concurrency,
             cache_ttl_sec: self.cache_ttl_ms.div_euclid(1000) as u64,
         }
     }
 
-    pub fn check_request(
-        &self,
-        api_key: Option<&str>,
-        is_image: bool,
-    ) -> Result<RequestLimitGuard, LimitError> {
+    pub fn check_request(&self, api_key: Option<&str>) -> Result<RequestLimitGuard, LimitError> {
         self.prune_if_due();
         if let Some(api_key) = api_key.filter(|v| !v.trim().is_empty()) {
             if self.cfg.key_rpm > 0 {
@@ -144,24 +128,8 @@ impl RateLimiter {
             None
         };
 
-        let image_permit =
-            if is_image {
-                match &self.image_semaphore {
-                    Some(semaphore) => Some(semaphore.clone().try_acquire_owned().map_err(
-                        |_| LimitError {
-                            scope: "image",
-                            message: "Image concurrency limit exceeded".to_string(),
-                        },
-                    )?),
-                    None => None,
-                }
-            } else {
-                None
-            };
-
         Ok(RequestLimitGuard {
             _key_permit: key_permit,
-            _image_permit: image_permit,
         })
     }
 
@@ -308,8 +276,8 @@ mod tests {
             ..RateLimitConfig::default()
         });
 
-        assert!(limiter.check_request(Some("k1"), false).is_ok());
-        let err = limiter.check_request(Some("k1"), false).unwrap_err();
+        assert!(limiter.check_request(Some("k1")).is_ok());
+        let err = limiter.check_request(Some("k1")).unwrap_err();
         assert_eq!(err.scope, "api_key");
     }
 
@@ -320,10 +288,10 @@ mod tests {
             ..RateLimitConfig::default()
         });
 
-        let guard = limiter.check_request(Some("k1"), false).unwrap();
-        assert!(limiter.check_request(Some("k1"), false).is_err());
+        let guard = limiter.check_request(Some("k1")).unwrap();
+        assert!(limiter.check_request(Some("k1")).is_err());
         drop(guard);
-        assert!(limiter.check_request(Some("k1"), false).is_ok());
+        assert!(limiter.check_request(Some("k1")).is_ok());
     }
 
     #[test]
@@ -341,20 +309,6 @@ mod tests {
     }
 
     #[test]
-    fn image_concurrency_is_global_for_image_requests() {
-        let limiter = limiter(RateLimitConfig {
-            image_concurrency: 1,
-            ..RateLimitConfig::default()
-        });
-
-        let guard = limiter.check_request(Some("k1"), true).unwrap();
-        assert!(limiter.check_request(Some("k2"), true).is_err());
-        assert!(limiter.check_request(Some("k2"), false).is_ok());
-        drop(guard);
-        assert!(limiter.check_request(Some("k2"), true).is_ok());
-    }
-
-    #[test]
     fn stale_key_limit_cache_entries_are_pruned() {
         let limiter = limiter(RateLimitConfig {
             key_rpm: 10,
@@ -363,7 +317,7 @@ mod tests {
             ..RateLimitConfig::default()
         });
 
-        limiter.check_request(Some("old"), false).unwrap();
+        limiter.check_request(Some("old")).unwrap();
         let stale_ms = now_unix_ms().saturating_sub(2_000);
         limiter
             .key_windows
@@ -383,7 +337,7 @@ mod tests {
             .last_prune_ms
             .store(now_unix_ms().saturating_sub(61_000), Ordering::Relaxed);
 
-        limiter.check_request(Some("new"), false).unwrap();
+        limiter.check_request(Some("new")).unwrap();
 
         assert!(!limiter.key_windows.lock().unwrap().contains_key("old"));
         assert!(!limiter.key_semaphores.lock().unwrap().contains_key("old"));

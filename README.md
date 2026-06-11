@@ -2,24 +2,19 @@
 
 Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现）。
 
-提供 OpenAI 兼容的 HTTP 端点，将请求转换为 ChatGPT Codex 后端 `/backend-api/codex/responses` 请求并在多账号之间做内部重试。
+提供 Codex Responses 代理端点，将请求转发到 ChatGPT Codex 后端 `/backend-api/codex/responses` 并在多账号之间做内部重试。
 
 ## 功能概览
 
-- OpenAI 兼容端点：
+- Codex 代理端点：
   - `POST /v1/responses`（流式/非流式，透传上游 Responses SSE 或 response 对象）
   - `POST /v1/responses/compact`（流式/非流式，透传上游 Compact 响应）
-  - `POST /v1/chat/completions`（流式/非流式，上游 Responses SSE → Chat Completions 转换）
-  - `POST /v1/completions`（流式/非流式，OpenAI legacy Completions 兼容）
-  - `POST /v1/images/generations` / `POST /v1/images/edits`（OpenAI Images 兼容桥接，支持 JSON 与 edits multipart）
   - `GET /v1/models`（生成 thinking 后缀与 `-fast` 变体）
-- Claude 兼容端点：
-  - `POST /v1/messages`（流式/非流式，Codex Responses SSE → Claude Messages 格式）
-  - `POST /v1/messages/count_tokens`（本地估算 token 数）
+  - 不再提供 `/v1/chat/completions`、`/v1/completions`、`/v1/messages`、`/v1/images/*` 等格式转换/桥接端点；这些能力由上层 gateway 处理。
 - 管理端点：
   - `GET /stats`（账号 summary + RPM + token totals + quota raw JSON cache）
   - `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status`（SQLite 持久化查询，需开启 `persistence.enabled`）
-  - `GET /admin/rate-limits`（当前 key/account/image 限流配置）
+  - `GET /admin/rate-limits`（当前 key/account 限流配置）
   - `GET /admin/persistence`（SQLite writer 状态与 dropped/write error 计数）
   - `POST /check-quota`（SSE，批量查询 `/backend-api/wham/usage`）
   - `POST /refresh`（SSE，强制刷新所有账号 Token）
@@ -28,7 +23,6 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
   - SQLite 持久化 request log / usage log / account status
   - API key 级 RPM 与并发限制
   - account 级 RPM 与并发限制
-  - 图片生成独立进程级并发限制
 - 多账号池 + 内部重试：
   - 从 `auth-dir` 读取 `*.json`（`access_token` 必填；`refresh_token` 可选）
   - 兼容 `sub2api` 的单账号导出 JSON（顶层 `accounts[0].credentials`）
@@ -218,41 +212,14 @@ curl -N http://127.0.0.1:18080/v1/responses/compact \
   -d '{"model":"gpt-5.4","stream":true,"input":"hello"}'
 ```
 
-### 4) Chat Completions（非流式）
-
-```bash
-curl -sS http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Authorization: Bearer your-api-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.4","stream":false,"messages":[{"role":"user","content":"hello"}]}'
-```
-
-### 5) Chat Completions（流式）
-
-```bash
-curl -N http://127.0.0.1:18080/v1/chat/completions \
-  -H 'Authorization: Bearer your-api-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hello"}]}'
-```
-
-### 5.1) Claude Messages（流式）
-
-```bash
-curl -N http://127.0.0.1:18080/v1/messages \
-  -H 'Authorization: Bearer your-api-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-5.4","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"hello"}]}'
-```
-
-### 6) 查询剩余额度（SSE）
+### 4) 查询剩余额度（SSE）
 
 ```bash
 curl -N -X POST http://127.0.0.1:18080/check-quota \
   -H 'Authorization: Bearer your-api-key'
 ```
 
-### 7) 查看账号统计 + quota cache
+### 5) 查看账号统计 + quota cache
 
 ```bash
 curl -sS http://127.0.0.1:18080/stats \
@@ -332,7 +299,8 @@ flowchart TD
 
 ## 现状与差异（相对 Go）
 
-- 已实现：`/v1/responses`（含 websocket fallback 与 `response.append` 基础续写）、`/v1/responses/compact`、`/v1/chat/completions`、`/v1/completions`、`/v1/images/generations`、`/v1/images/edits`、`/v1/messages`、`/v1/messages/count_tokens`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
+- 已实现：`/v1/responses`（含 websocket fallback 与 `response.append` 基础续写）、`/v1/responses/compact`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
+- 已移除：`/v1/chat/completions`、`/v1/completions`、`/v1/messages`、`/v1/messages/count_tokens`、`/v1/images/*` 及相关转换/桥接策略
 - 未实现（待补齐）：上游原生 websocket 转发等（当前只实现 Go 同款 fallback）
 
 更多对齐清单见 `docs/parity.md`。

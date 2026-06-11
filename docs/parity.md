@@ -12,17 +12,12 @@
 | `GET /stats` | ✅ | summary + rpm + token totals + accounts + quota raw JSON cache |
 | `GET /v1/models` | ✅ | Go 同款 per-model suffix matrix + `gpt-5.4-mini` + `-fast` |
 | `POST /v1/responses` | ✅ | stream/non-stream passthrough（含内部重试 SSE gate） |
-| `POST /v1/chat/completions` | ✅ | stream/non-stream（上游 Responses → Chat Completions 转换） |
-| `POST /v1/completions` | ✅ | stream/non-stream（legacy Completions → Chat Completions → Completions 转换） |
-| `POST /v1/images/generations` | ✅ | OpenAI Images JSON 兼容桥接到 Responses `image_generation` |
-| `POST /v1/images/edits` | ✅ | 支持 JSON `image`/`images[]`/`mask` 与 multipart `image`/`image[]`/`mask` |
 | `POST /refresh` | ✅ | SSE；强制刷新所有账号 Token（成功后会查询 quota） |
-| `POST /v1/messages` | ✅ | stream/non-stream（Codex Responses SSE → Claude Messages 格式） |
-| `POST /v1/messages/count_tokens` | ✅ | Claude 兼容本地 token 估算 |
 | `POST /v1/responses/compact` | ✅ | stream/non-stream passthrough（上游 `/responses/compact`） |
 | `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` / `response.append` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
+| `POST /v1/chat/completions` / `POST /v1/completions` / `POST /v1/messages` / `POST /v1/images/*` | 移除 | 格式转换与图片桥接由上层 gateway 负责，本服务只保留 Codex 代理 |
 | `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status` | ✅ | SQLite 持久化查询 |
-| `GET /admin/rate-limits` | ✅ | 暴露 key/account/image 当前限流配置 |
+| `GET /admin/rate-limits` | ✅ | 暴露 key/account 当前限流配置 |
 | `GET /admin/persistence` | ✅ | 暴露 SQLite writer 运行状态、丢弃事件数、写错误数 |
 
 ## 中间件与基础行为
@@ -33,7 +28,7 @@
 | CORS headers | ✅ | `Access-Control-Allow-Origin` + `Vary: Origin` |
 | gzip | ✅ | 仅 non-`/v1/*`；SSE 不压缩 |
 | SQLite persistence | ✅ | request log / usage log / latest account status |
-| rate limiting | ✅ | API key RPM/并发、account RPM/并发、图片独立并发 |
+| rate limiting | ✅ | API key RPM/并发、account RPM/并发 |
 
 ## 鉴权
 
@@ -50,7 +45,6 @@
 | Round-robin 选择器 | ✅ | used_percent 排序（unknown 排最后） |
 | Quota-first 选择器 | ✅ | `selector: quota-first` 按 used_percent 最低优先 |
 | 内部重试切换账号 | ✅ | 400/403 不重试，其它可重试 |
-| non-stream 空响应换号重试 | ✅ | `empty-retry-max` 仅用于 Chat Completions 非流式 |
 | Codex capacity error 重试 | ✅ | 窄匹配 model capacity 错误并按 429 类失败换号 |
 | SSE gate（2xx 前不写下游） | ✅ | integration test 已锁定 |
 
@@ -97,4 +91,3 @@
 ## 语义差异（已知）
 
 - `/check-quota`：Rust 会更新 used_percent 排序缓存；Go 当前实现只更新 quota raw_data（不刷新 used_percent cache）。如需严格对齐，可单独调整为 Go 行为并补测试。
-- Chat Completions 响应转换：已实现基础 text/tool_calls/usage 映射，但可能与 Go 在边界事件顺序/细节上仍有差异（需要更多 fixture 回归）。

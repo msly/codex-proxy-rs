@@ -93,9 +93,6 @@ pub struct Config {
     #[serde(rename = "upstream-timeout-sec")]
     pub upstream_timeout_sec: u64,
 
-    #[serde(rename = "empty-retry-max")]
-    pub empty_retry_max: usize,
-
     pub selector: String,
 
     #[serde(rename = "refresh-batch-size")]
@@ -173,8 +170,6 @@ pub struct RateLimitConfig {
     pub account_rpm: u64,
     #[serde(rename = "account-concurrency")]
     pub account_concurrency: usize,
-    #[serde(rename = "image-concurrency")]
-    pub image_concurrency: usize,
     #[serde(rename = "cache-ttl-sec")]
     pub cache_ttl_sec: u64,
 }
@@ -211,7 +206,6 @@ impl Default for Config {
             quota_check_concurrency: 0,
             keepalive_interval: 60,
             upstream_timeout_sec: 0,
-            empty_retry_max: 2,
             selector: "round-robin".to_string(),
             refresh_batch_size: 0,
             api_keys: Vec::new(),

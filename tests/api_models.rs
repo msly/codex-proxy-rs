@@ -34,7 +34,6 @@ fn build_state() -> AppState {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,

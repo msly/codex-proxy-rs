@@ -15,7 +15,6 @@ use serde_json::json;
 use crate::core::Account;
 use crate::state::RuntimeStateStore;
 use crate::thinking::apply::apply_thinking_to_value;
-use crate::translate::convert_non_stream_response;
 use crate::translate::request::{
     convert_openai_value_to_codex_value, normalize_codex_instructions,
 };
@@ -68,6 +67,13 @@ pub(super) async fn v1_responses(State(state): State<AppState>, req: Request<Bod
             return send_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
         }
     };
+    if body_value.get("input").is_none() {
+        return send_error(
+            StatusCode::BAD_REQUEST,
+            "缺少 input 字段",
+            "invalid_request_error",
+        );
+    }
 
     tracing::info!(model = %model, stream, "received /v1/responses request");
 
@@ -620,6 +626,75 @@ async fn handle_responses_ws(
     }
 }
 
+fn completed_response_has_output(payload: &[u8]) -> bool {
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return false;
+    };
+    let Some(output) = root
+        .get("response")
+        .and_then(|response| response.get("output"))
+        .and_then(|output| output.as_array())
+    else {
+        return false;
+    };
+
+    output.iter().any(output_item_has_visible_content)
+}
+
+fn output_item_has_visible_content(item: &serde_json::Value) -> bool {
+    match item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+    {
+        "function_call" | "custom_tool_call" | "tool_search_call" | "image_generation_call" => true,
+        "reasoning" | "reasoning_text" => {
+            item.get("encrypted_content")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.is_empty())
+                || item
+                    .get("summary")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|items| {
+                        items.iter().any(|part| {
+                            part.get("text")
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|value| !value.is_empty())
+                        })
+                    })
+                || item
+                    .get("content")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|items| {
+                        items.iter().any(|part| {
+                            part.get("text")
+                                .and_then(|value| value.as_str())
+                                .is_some_and(|value| !value.is_empty())
+                        })
+                    })
+        }
+        "message" => item
+            .get("content")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| {
+                items.iter().any(
+                    |part| match part.get("type").and_then(|value| value.as_str()) {
+                        Some("output_text") | Some("text") => part
+                            .get("text")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|value| !value.is_empty()),
+                        Some("refusal") => part
+                            .get("refusal")
+                            .and_then(|value| value.as_str())
+                            .is_some_and(|value| !value.is_empty()),
+                        _ => false,
+                    },
+                )
+            }),
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 enum ResponsesWsError {
     EmptyResponse,
@@ -722,10 +797,7 @@ async fn forward_responses_sse_as_ws(
                             has_tool = true;
                         }
                         "response.completed" => {
-                            let (_, completed_has_output) = convert_non_stream_response(
-                                payload,
-                                &std::collections::HashMap::new(),
-                            );
+                            let completed_has_output = completed_response_has_output(payload);
                             if completed_has_output {
                                 has_completed_output = true;
                             }

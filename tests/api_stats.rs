@@ -115,7 +115,6 @@ async fn api_stats_returns_cached_quota_raw_json() {
         request_stats: request_stats.clone(),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,

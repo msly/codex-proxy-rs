@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::post;
@@ -16,6 +16,7 @@ use codex_proxy_rs::limit::RateLimiter;
 use codex_proxy_rs::quota::QuotaChecker;
 use codex_proxy_rs::refresh::{Refresher, SaveQueue};
 use codex_proxy_rs::upstream::codex::{CodexClient, On401Hook};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::util::ServiceExt;
 use url::Url;
 
@@ -111,6 +112,38 @@ async fn start_slow_upstream() -> Url {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
+async fn start_stream_read_error_upstream() -> Url {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let first = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+            first.len() + 1024
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(first).await.unwrap();
+        socket.flush().await.unwrap();
+        let _ = socket.shutdown().await;
     });
 
     Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
@@ -217,7 +250,6 @@ async fn api_v1_responses_rejects_non_boolean_stream_without_upstream_call() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -255,6 +287,119 @@ async fn api_v1_responses_rejects_non_boolean_stream_without_upstream_call() {
 }
 
 #[tokio::test]
+async fn api_v1_responses_rejects_messages_without_input_without_upstream_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
+    });
+
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+    assert_eq!(v["error"]["message"], "缺少 input 字段");
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn api_v1_responses_stream_read_error_emits_response_failed_event() {
+    let base_url = start_stream_read_error_upstream().await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
+    });
+
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": true,
+                        "input": "hello"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+        .await
+        .expect("proxy should close stream with response.failed event");
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains("response.output_text.delta"), "{body}");
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains("\"type\":\"response.failed\""), "{body}");
+    assert!(body.contains("\"status\":\"failed\""), "{body}");
+    assert!(body.contains("\"code\":\"server_error\""), "{body}");
+}
+
+#[tokio::test]
 async fn api_v1_responses_previous_response_id_reuses_bound_account() {
     let auths = Arc::new(Mutex::new(Vec::<String>::new()));
     let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
@@ -274,7 +419,6 @@ async fn api_v1_responses_previous_response_id_reuses_bound_account() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -337,7 +481,6 @@ async fn api_v1_responses_does_not_stick_when_previous_response_id_is_dropped() 
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -397,7 +540,6 @@ async fn api_v1_responses_key_concurrency_is_held_until_upstream_finishes() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(keys),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -421,7 +563,7 @@ async fn api_v1_responses_key_concurrency_is_held_until_upstream_finishes() {
                     .header("Authorization", "Bearer k1")
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
-                        serde_json::json!({"model":"gpt-5.4"}).to_string(),
+                        serde_json::json!({"model":"gpt-5.4","input":"first"}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -439,7 +581,7 @@ async fn api_v1_responses_key_concurrency_is_held_until_upstream_finishes() {
                 .header("Authorization", "Bearer k1")
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
                 .body(axum::body::Body::from(
-                    serde_json::json!({"model":"gpt-5.4"}).to_string(),
+                    serde_json::json!({"model":"gpt-5.4","input":"second"}).to_string(),
                 ))
                 .unwrap(),
         )
@@ -482,7 +624,6 @@ async fn api_v1_responses_stream_passthrough_uses_internal_retry_gate() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 1,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -579,7 +720,6 @@ async fn api_v1_responses_non_stream_passthrough_returns_json() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 1,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -665,7 +805,6 @@ async fn api_v1_responses_forwards_whitelisted_codex_identity_headers() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -748,7 +887,6 @@ async fn api_v1_responses_derives_stable_session_id_from_prompt_cache_key() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -817,7 +955,6 @@ async fn api_v1_responses_non_retryable_failure_counts_as_failed_request() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 1,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -877,7 +1014,6 @@ async fn api_v1_responses_stats_expose_cached_and_reasoning_tokens() {
         request_stats: request_stats.clone(),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -914,7 +1050,6 @@ async fn api_v1_responses_stats_expose_cached_and_reasoning_tokens() {
         request_stats,
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -1006,7 +1141,6 @@ async fn api_v1_responses_persist_cached_and_reasoning_tokens_to_state_file() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -1075,7 +1209,6 @@ async fn api_v1_responses_rejects_function_call_output_without_context() {
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,
@@ -1116,9 +1249,62 @@ async fn api_v1_responses_rejects_function_call_output_without_context() {
         v["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("function_call_output")
+            .contains("tool output")
     );
     assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn api_v1_responses_allows_custom_tool_output_with_matching_context() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let base_url = start_upstream(calls.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at3").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+
+    let app = api::router(AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(CodexClient::new(base_url, "").unwrap()),
+        request_stats: Arc::new(api::RequestStats::default()),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: Arc::new(codex_proxy_rs::state::RuntimeStateStore::new(dir.path())),
+        on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
+    });
+
+    let res = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "model": "gpt-5.4",
+                        "stream": false,
+                        "input": [
+                            {"type":"custom_tool_call","call_id":"call_1","name":"x"},
+                            {"type":"custom_tool_call_output","call_id":"call_1","output":"tool output"}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    assert!(calls.load(Ordering::Relaxed) >= 1);
 }
 
 #[tokio::test]
@@ -1139,7 +1325,6 @@ async fn api_v1_responses_allows_function_call_output_with_previous_response_id(
         request_stats: Arc::new(api::RequestStats::default()),
         api_keys: Arc::new(HashSet::new()),
         max_retry: 0,
-        empty_retry_max: 0,
         refresher: Refresher::new("").unwrap(),
         save_queue: SaveQueue::start(1),
         refresh_concurrency: 1,

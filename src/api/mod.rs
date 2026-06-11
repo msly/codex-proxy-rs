@@ -27,13 +27,9 @@ use crate::persist::PersistStore;
 use crate::quota::QuotaChecker;
 use crate::refresh::{Refresher, SaveQueue};
 use crate::state::RuntimeStateStore;
-use crate::translate::{convert_non_stream_response, extract_completed_response_payload};
 use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, UpstreamResponse};
 
-mod chat;
-mod images;
 mod management;
-mod messages;
 pub mod models;
 mod responses;
 mod telemetry;
@@ -45,10 +41,9 @@ use responses::{
 };
 
 use telemetry::{
-    UsageTokens, extract_usage_tokens, record_client_success, record_hourly_usage,
-    record_persist_account_error, record_persist_error, record_persist_request,
-    record_persist_usage, record_stream_account_failure, record_usage_from_json_bytes,
-    record_usage_from_sse_bytes, record_usage_from_sse_line,
+    record_client_success, record_persist_account_error, record_persist_error,
+    record_persist_request, record_persist_usage, record_usage_from_json_bytes,
+    record_usage_from_sse_line,
 };
 
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
@@ -62,7 +57,6 @@ pub struct AppState {
     pub request_stats: Arc<RequestStats>,
     pub api_keys: Arc<HashSet<String>>,
     pub max_retry: usize,
-    pub empty_retry_max: usize,
     pub refresher: Refresher,
     pub save_queue: SaveQueue,
     pub refresh_concurrency: usize,
@@ -198,88 +192,6 @@ pub(super) fn previous_response_id_from_value(value: &serde_json::Value) -> Opti
         .filter(|id| !id.is_empty())
 }
 
-fn response_failed_error_from_sse_bytes(bytes: &[u8]) -> Option<(String, String)> {
-    for line in bytes.split(|b| *b == b'\n') {
-        let line = trim_ascii(line);
-        if let Some(err) = response_failed_error_from_sse_line(line) {
-            return Some(err);
-        }
-    }
-    None
-}
-
-pub(super) fn response_failed_error_from_sse_line(line: &[u8]) -> Option<(String, String)> {
-    if !line.starts_with(b"data:") {
-        return None;
-    }
-    let payload = trim_ascii(&line[5..]);
-    if payload.is_empty() || payload == b"[DONE]" {
-        return None;
-    }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return None;
-    };
-    if value.get("type").and_then(|value| value.as_str()) != Some("response.failed") {
-        return None;
-    }
-    let error = value
-        .get("response")
-        .and_then(|response| response.get("error"))
-        .or_else(|| value.get("error"));
-    let message = error
-        .and_then(|error| error.get("message"))
-        .and_then(|message| message.as_str())
-        .or_else(|| error.and_then(|error| error.as_str()))
-        .unwrap_or("upstream response failed")
-        .trim()
-        .to_string();
-    let err_type = error
-        .and_then(|error| error.get("type"))
-        .and_then(|err_type| err_type.as_str())
-        .unwrap_or("api_error")
-        .trim()
-        .to_string();
-    Some((
-        if message.is_empty() {
-            "upstream response failed".to_string()
-        } else {
-            message
-        },
-        if err_type.is_empty() {
-            "api_error".to_string()
-        } else {
-            err_type
-        },
-    ))
-}
-
-pub(super) fn openai_stream_error_event(message: &str, err_type: &str) -> Vec<u8> {
-    format!(
-        "data: {}\n\n",
-        json!({
-            "error": {
-                "message": message,
-                "type": err_type,
-            }
-        })
-    )
-    .into_bytes()
-}
-
-pub(super) fn claude_stream_error_event(message: &str, err_type: &str) -> Vec<u8> {
-    format!(
-        "event: error\ndata: {}\n\n",
-        json!({
-            "type": "error",
-            "error": {
-                "type": err_type,
-                "message": message,
-            }
-        })
-    )
-    .into_bytes()
-}
-
 pub(super) fn build_passthrough_sse_response(
     endpoint: &'static str,
     model: String,
@@ -320,7 +232,11 @@ pub(super) fn build_passthrough_sse_response(
                         0,
                     );
                     let _ = tx
-                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, err)))
+                        .send(Ok(responses_stream_failed_event(
+                            &model,
+                            "stream read from upstream failed",
+                            "server_error",
+                        )))
                         .await;
                     return;
                 }
@@ -438,15 +354,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/responses/compact", post(responses::v1_responses_compact))
         .route("/models", get(models::v1_models))
-        .route("/chat/completions", post(chat::v1_chat_completions))
-        .route("/completions", post(chat::v1_completions))
-        .route("/images/generations", post(images::v1_images_generations))
-        .route("/images/edits", post(images::v1_images_edits))
-        .route("/messages", post(messages::v1_messages))
-        .route(
-            "/messages/count_tokens",
-            post(messages::v1_messages_count_tokens),
-        )
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
     let frontend = ServeDir::new(FRONTEND_DIST_DIR)
@@ -615,27 +522,22 @@ async fn admin_session_auth(
 
 fn check_request_limits(
     state: &AppState,
-    req: &Request<Body>,
+    _req: &Request<Body>,
     api_key: Option<&str>,
 ) -> Result<RequestLimitGuard, Response> {
-    let path = req.uri().path();
-    let is_image = path.starts_with("/v1/images/") || path.starts_with("/images/");
-    state
-        .rate_limiter
-        .check_request(api_key, is_image)
-        .map_err(|err| {
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "error": {
-                        "message": err.message,
-                        "type": "rate_limit_error",
-                        "code": err.scope,
-                    }
-                })),
-            )
-                .into_response()
-        })
+    state.rate_limiter.check_request(api_key).map_err(|err| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": {
+                    "message": err.message,
+                    "type": "rate_limit_error",
+                    "code": err.scope,
+                }
+            })),
+        )
+            .into_response()
+    })
 }
 
 pub(super) fn extract_api_key(headers: &HeaderMap) -> (Option<String>, &'static str) {
@@ -686,20 +588,6 @@ pub(super) fn send_error(status: StatusCode, message: &str, err_type: &str) -> R
         .into_response()
 }
 
-pub(super) fn send_claude_error(status: StatusCode, err_type: &str, message: &str) -> Response {
-    (
-        status,
-        Json(json!({
-            "type": "error",
-            "error": {
-                "type": err_type,
-                "message": message,
-            }
-        })),
-    )
-        .into_response()
-}
-
 pub(super) fn send_upstream_error(err: UpstreamError) -> Response {
     match err {
         UpstreamError::Status { code, body } => {
@@ -718,18 +606,6 @@ pub(super) fn send_upstream_error(err: UpstreamError) -> Response {
         }
         UpstreamError::Pick(msg) | UpstreamError::Network(msg) => {
             send_error(StatusCode::INTERNAL_SERVER_ERROR, &msg, "server_error")
-        }
-    }
-}
-
-pub(super) fn send_claude_upstream_error(err: UpstreamError) -> Response {
-    match err {
-        UpstreamError::Status { code, body } => {
-            let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
-            send_claude_error(status, "api_error", &String::from_utf8_lossy(&body))
-        }
-        UpstreamError::Pick(msg) | UpstreamError::Network(msg) => {
-            send_claude_error(StatusCode::INTERNAL_SERVER_ERROR, "api_error", &msg)
         }
     }
 }
@@ -930,20 +806,23 @@ pub(super) fn log_stream_read_failed(
     );
 }
 
-pub(super) fn log_stream_incomplete(
-    endpoint: &'static str,
-    model: &str,
-    account: &Account,
-    reason: &'static str,
-) {
-    tracing::warn!(
-        endpoint,
-        model = %model,
-        stream = true,
-        account = account.file_path(),
-        reason,
-        "stream ended without a complete response"
-    );
+fn responses_stream_failed_event(model: &str, message: &str, code: &str) -> Vec<u8> {
+    let id = format!("resp_{}", Uuid::new_v4().simple());
+    let payload = json!({
+        "type": "response.failed",
+        "response": {
+            "id": id,
+            "object": "response",
+            "model": model,
+            "status": "failed",
+            "output": [],
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        },
+    });
+    format!("event: response.failed\ndata: {payload}\n\n").into_bytes()
 }
 
 pub(super) fn extract_codex_passthrough_headers(headers: &HeaderMap) -> Option<HeaderMap> {
@@ -981,34 +860,31 @@ pub(super) fn validate_function_call_output_context_with_known_ids(
         return Ok(());
     };
 
-    let mut has_function_call_output = false;
+    let mut has_tool_call_output = false;
     let mut has_tool_call_context = false;
     for item in input {
-        match item
+        let item_type = item
             .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if is_codex_tool_output_item_type(item_type) {
+            has_tool_call_output = true;
+        } else if is_codex_tool_call_context_item_type(item_type)
+            && !item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
         {
-            "function_call_output" => has_function_call_output = true,
-            "function_call" | "tool_call" => {
-                if !item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
-                {
-                    has_tool_call_context = true;
-                }
-            }
-            _ => {}
+            has_tool_call_context = true;
         }
-        if has_function_call_output && has_tool_call_context {
+        if has_tool_call_output && has_tool_call_context {
             return Ok(());
         }
     }
 
-    if !has_function_call_output || has_tool_call_context {
+    if !has_tool_call_output || has_tool_call_context {
         return Ok(());
     }
     if !v
@@ -1025,39 +901,35 @@ pub(super) fn validate_function_call_output_context_with_known_ids(
     let mut reference_ids = HashSet::<String>::new();
     let mut missing_call_id = false;
     for item in input {
-        match item
+        let item_type = item
             .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or_default()
-        {
-            "function_call_output" => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .trim();
-                if call_id.is_empty() {
-                    missing_call_id = true;
-                } else {
-                    call_ids.insert(call_id.to_string());
-                }
+            .unwrap_or_default();
+        if is_codex_tool_output_item_type(item_type) {
+            let call_id = item
+                .get("call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if call_id.is_empty() {
+                missing_call_id = true;
+            } else {
+                call_ids.insert(call_id.to_string());
             }
-            "item_reference" => {
-                let id = item
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .trim();
-                if !id.is_empty() {
-                    reference_ids.insert(id.to_string());
-                }
+        } else if item_type == "item_reference" {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim();
+            if !id.is_empty() {
+                reference_ids.insert(id.to_string());
             }
-            _ => {}
         }
     }
 
     if missing_call_id {
-        return Err("function_call_output requires call_id on HTTP requests; continuation via previous_response_id requires a response id".to_string());
+        return Err("tool output items require call_id on HTTP requests; continuation via previous_response_id requires a response id".to_string());
     }
 
     if !call_ids.is_empty()
@@ -1068,54 +940,29 @@ pub(super) fn validate_function_call_output_context_with_known_ids(
         return Ok(());
     }
 
-    Err("function_call_output requires matching function_call context, item_reference ids, or previous_response_id on HTTP requests".to_string())
+    Err("tool output items require matching tool call context, item_reference ids, or previous_response_id on HTTP requests".to_string())
 }
 
-#[derive(Debug)]
-pub(super) enum ChatNonStreamOutcome {
-    Success {
-        body: String,
-        usage: Option<UsageTokens>,
-    },
-    Empty,
-    MissingCompleted,
+fn is_codex_tool_call_context_item_type(typ: &str) -> bool {
+    matches!(
+        typ.trim(),
+        "function_call"
+            | "tool_call"
+            | "local_shell_call"
+            | "tool_search_call"
+            | "custom_tool_call"
+            | "mcp_tool_call"
+    )
 }
 
-pub(super) fn parse_chat_non_stream_response(
-    bytes: &[u8],
-    reverse_tool_map: &std::collections::HashMap<String, String>,
-    account: &crate::core::Account,
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-) -> ChatNonStreamOutcome {
-    let Some(completed_payload) = extract_completed_response_payload(bytes) else {
-        return ChatNonStreamOutcome::MissingCompleted;
-    };
-
-    let mut recorded_usage = None;
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&completed_payload) {
-        if let Some(usage) = extract_usage_tokens(&v) {
-            account.record_usage_detail(
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cached_tokens,
-                usage.reasoning_tokens,
-                usage.total_tokens,
-            );
-            record_hourly_usage(runtime_state, now_ms, usage);
-            recorded_usage = Some(usage);
-        }
-    }
-
-    let (out, has_output) = convert_non_stream_response(&completed_payload, reverse_tool_map);
-    if has_output && !out.is_empty() {
-        ChatNonStreamOutcome::Success {
-            body: out,
-            usage: recorded_usage,
-        }
-    } else {
-        ChatNonStreamOutcome::Empty
-    }
+fn is_codex_tool_output_item_type(typ: &str) -> bool {
+    matches!(
+        typ.trim(),
+        "function_call_output"
+            | "tool_search_output"
+            | "custom_tool_call_output"
+            | "mcp_tool_call_output"
+    )
 }
 
 pub(super) fn trim_ascii(input: &[u8]) -> &[u8] {
@@ -1133,8 +980,6 @@ pub(super) fn trim_ascii(input: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Account, TokenData};
-    use crate::state::RuntimeStateStore;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
@@ -1165,7 +1010,6 @@ mod tests {
             request_stats: Arc::new(RequestStats::default()),
             api_keys: Arc::new(HashSet::new()),
             max_retry: 0,
-            empty_retry_max: 0,
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
@@ -1214,7 +1058,6 @@ mod tests {
             request_stats: Arc::new(RequestStats::default()),
             api_keys: Arc::new(HashSet::new()),
             max_retry: 0,
-            empty_retry_max: 0,
             refresher: Refresher::new("").unwrap(),
             save_queue: SaveQueue::start(1),
             refresh_concurrency: 1,
@@ -1273,43 +1116,6 @@ mod tests {
         assert_eq!(value["instructions"], "");
         assert!(value.get("stream").is_none());
         assert!(value.get("stream_options").is_none());
-    }
-
-    #[test]
-    fn api_parse_chat_non_stream_response_uses_output_item_done_fallback() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let runtime_state = RuntimeStateStore::new(dir.path());
-        let account = Account::new(
-            "a.json".to_string(),
-            TokenData {
-                id_token: String::new(),
-                access_token: "at".to_string(),
-                refresh_token: "rt".to_string(),
-                account_id: String::new(),
-                email: "a@example.com".to_string(),
-                expired: String::new(),
-                plan_type: String::new(),
-            },
-        );
-        let raw = concat!(
-            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5.4\"}}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
-        );
-
-        let reverse = std::collections::HashMap::new();
-        let out =
-            parse_chat_non_stream_response(raw.as_bytes(), &reverse, &account, &runtime_state, 1);
-
-        match out {
-            ChatNonStreamOutcome::Success { body, usage } => {
-                let value: Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(value["choices"][0]["message"]["content"], "hi");
-                assert_eq!(value["usage"]["completion_tokens"], 2);
-                assert_eq!(usage.unwrap().total_tokens, 3);
-            }
-            other => panic!("unexpected outcome: {other:?}"),
-        }
     }
 
     #[test]
@@ -1430,7 +1236,7 @@ mod tests {
         });
 
         let err = build_responses_ws_request(&append, &mut session).unwrap_err();
-        assert!(err.contains("function_call_output"));
+        assert!(err.contains("tool output"));
     }
 
     #[test]
