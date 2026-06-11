@@ -40,10 +40,12 @@
   | save-workers | 4 | refresh 后写回账号文件的并发 worker 数；最大 32 |
   | cooldown-401-sec | 30 | 上游返回 401 后，该账号冷却时长 |
   | cooldown-429-sec | 60 | 上游返回 429 后，默认冷却时长 |
+  | cooldown-transport-sec | 600 | 明确持久的上游 transport/proxy/DNS 故障冷却时长 |
   | refresh-single-timeout-sec | 30 | 单个 refresh 请求超时，秒 |
   | quota-check-concurrency | 跟随 refresh-concurrency | quota 查询并发；默认配置下最终是 50 |
   | keepalive-interval | 60 | keepalive ping 间隔，秒 |
   | upstream-timeout-sec | 0 | 等待上游首包/响应头超时；0 表示不启用这个超时 |
+  | native-responses-websocket | false | 实验性：`/v1/responses` 下游 WebSocket 直连 Codex 上游 WebSocket；失败时在未写下游前回退到 HTTP/SSE fallback |
   | selector | round-robin | 账号选择策略：round-robin 或 quota-first |
   | refresh-batch-size | 0 | refresh 分批大小；0 表示本轮待刷新的账号一次性全处理 |
 

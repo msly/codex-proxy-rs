@@ -7,10 +7,11 @@ use axum::http::HeaderMap;
 use axum::http::header;
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use bytes::BytesMut;
+use futures_util::SinkExt;
 use futures_util::StreamExt;
-use memchr::memchr;
 use serde_json::json;
+use tokio_tungstenite::tungstenite::Message as UpstreamWsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::core::Account;
 use crate::state::RuntimeStateStore;
@@ -27,7 +28,7 @@ use super::{
     log_upstream_request_error, parse_stream_field, previous_response_id_from_value,
     record_client_success, record_persist_account_error, record_persist_error,
     record_persist_request, record_persist_usage, record_usage_from_json_bytes,
-    request_limit_guard_from_req, send_error, send_upstream_error, trim_ascii,
+    request_limit_guard_from_req, send_error, send_upstream_error, sse, trim_ascii,
     validate_function_call_output_context, validate_function_call_output_context_with_known_ids,
 };
 
@@ -577,7 +578,7 @@ async fn handle_responses_ws(
                                     continue;
                                 }
                             };
-                        let stream_result = forward_responses_sse_as_ws(
+                        let stream_result = forward_responses_request_as_ws(
                             &mut socket,
                             &state,
                             request_body,
@@ -602,6 +603,7 @@ async fn handle_responses_ws(
                                 write_ws_error(&mut socket, "api_error", &msg).await;
                                 return;
                             }
+                            Err(ResponsesWsError::NativeFallback(_)) => unreachable!(),
                         }
                     }
                     "response.cancel" | "response.close" => {
@@ -700,6 +702,200 @@ enum ResponsesWsError {
     EmptyResponse,
     Upstream(UpstreamError),
     Local(String),
+    NativeFallback(String),
+}
+
+async fn forward_responses_request_as_ws(
+    socket: &mut WebSocket,
+    state: &AppState,
+    request_body: Vec<u8>,
+    model: &str,
+    passthrough_headers: Option<&HeaderMap>,
+    session: &mut ResponsesWsSession,
+) -> Result<(), ResponsesWsError> {
+    if state.codex_client.native_responses_websocket_enabled() {
+        match forward_responses_native_ws_as_ws(
+            socket,
+            state,
+            request_body.clone(),
+            model,
+            passthrough_headers,
+            session,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(ResponsesWsError::NativeFallback(message)) => {
+                tracing::warn!(model = %model, error = %message, "native responses websocket failed before downstream write; falling back to HTTP/SSE");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    forward_responses_sse_as_ws(
+        socket,
+        state,
+        request_body,
+        model,
+        passthrough_headers,
+        session,
+    )
+    .await
+}
+
+async fn forward_responses_native_ws_as_ws(
+    socket: &mut WebSocket,
+    state: &AppState,
+    request_body: Vec<u8>,
+    model: &str,
+    passthrough_headers: Option<&HeaderMap>,
+    session: &mut ResponsesWsSession,
+) -> Result<(), ResponsesWsError> {
+    let codex_value = serde_json::from_slice::<serde_json::Value>(&request_body)
+        .map_err(|err| ResponsesWsError::Local(format!("构建上游 websocket 请求失败: {err}")))?;
+    let session_keys = session_keys_from_request(passthrough_headers, &codex_value);
+    let initial_excluded = sticky_initial_excluded_for_request(
+        state,
+        previous_response_id_from_value(&codex_value),
+        &session_keys,
+    );
+    let account = state
+        .manager
+        .pick_excluding(model, &initial_excluded)
+        .map_err(|err| ResponsesWsError::Upstream(UpstreamError::Pick(err)))?;
+    let _account_limit_guard = state
+        .rate_limiter
+        .check_account(account.file_path())
+        .map_err(|err| ResponsesWsError::NativeFallback(err.message))?;
+    let ws_url = state
+        .codex_client
+        .responses_websocket_url()
+        .map_err(ResponsesWsError::NativeFallback)?;
+    let headers = state
+        .codex_client
+        .websocket_headers(account.as_ref(), passthrough_headers);
+    let mut request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|err| ResponsesWsError::NativeFallback(err.to_string()))?;
+    for (name, value) in headers.iter() {
+        request.headers_mut().insert(name.clone(), value.clone());
+    }
+
+    let (mut upstream_ws, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|err| ResponsesWsError::NativeFallback(err.to_string()))?;
+    let upstream_request = build_codex_websocket_request_body(&request_body);
+    upstream_ws
+        .send(UpstreamWsMessage::Text(
+            String::from_utf8_lossy(&upstream_request)
+                .into_owned()
+                .into(),
+        ))
+        .await
+        .map_err(|err| ResponsesWsError::NativeFallback(err.to_string()))?;
+
+    bind_session_accounts(
+        state.runtime_state.as_ref(),
+        account.as_ref(),
+        &session_keys,
+    );
+
+    let mut saw_event = false;
+    let mut has_text = false;
+    let mut has_tool = false;
+    let mut has_completed_output = false;
+    while let Some(message) = upstream_ws.next().await {
+        let message = message.map_err(|err| {
+            if saw_event {
+                ResponsesWsError::Local(format!("读取上游 websocket 失败: {err}"))
+            } else {
+                ResponsesWsError::NativeFallback(err.to_string())
+            }
+        })?;
+        let payload = match message {
+            UpstreamWsMessage::Text(text) => text.to_string().into_bytes(),
+            UpstreamWsMessage::Binary(bytes) => bytes.to_vec(),
+            UpstreamWsMessage::Ping(payload) => {
+                let _ = upstream_ws.send(UpstreamWsMessage::Pong(payload)).await;
+                continue;
+            }
+            UpstreamWsMessage::Pong(_) => continue,
+            UpstreamWsMessage::Close(_) => break,
+            _ => continue,
+        };
+        let payload = trim_ascii(&payload);
+        if payload.is_empty() {
+            continue;
+        }
+        let normalized_payload = normalize_codex_websocket_completion(payload);
+        let outbound = process_responses_ws_sse_payload(
+            state,
+            account.as_ref(),
+            session,
+            &normalized_payload,
+            &mut has_text,
+            &mut has_tool,
+            &mut has_completed_output,
+        );
+        saw_event = true;
+        if socket.send(Message::Text(outbound.into())).await.is_err() {
+            return Ok(());
+        }
+        if serde_json::from_slice::<serde_json::Value>(&normalized_payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .is_some_and(|event_type| event_type == "response.completed")
+        {
+            break;
+        }
+    }
+
+    if !saw_event {
+        return Err(ResponsesWsError::NativeFallback(
+            "native websocket returned no events".to_string(),
+        ));
+    }
+    record_client_success(
+        account.as_ref(),
+        state.request_stats.as_ref(),
+        state.runtime_state.as_ref(),
+        crate::core::now_unix_ms(),
+    );
+    Ok(())
+}
+
+fn build_codex_websocket_request_body(body: &[u8]) -> Vec<u8> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "type".to_string(),
+            serde_json::Value::String("response.create".to_string()),
+        );
+    }
+    serde_json::to_vec(&value).unwrap_or_else(|_| body.to_vec())
+}
+
+fn normalize_codex_websocket_completion(payload: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(payload) else {
+        return payload.to_vec();
+    };
+    if value.get("type").and_then(|value| value.as_str()) == Some("response.done") {
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "type".to_string(),
+                serde_json::Value::String("response.completed".to_string()),
+            );
+        }
+        return serde_json::to_vec(&value).unwrap_or_else(|_| payload.to_vec());
+    }
+    payload.to_vec()
 }
 
 async fn forward_responses_sse_as_ws(
@@ -752,81 +948,52 @@ async fn forward_responses_sse_as_ws(
     let mut has_text = false;
     let mut has_tool = false;
     let mut has_completed_output = false;
-    let mut buf = BytesMut::new();
+    let mut parser = sse::SseDataParser::default();
     let mut upstream_stream = upstream.bytes_stream();
 
     while let Some(chunk) = upstream_stream.next().await {
         let chunk = chunk.map_err(|e| ResponsesWsError::Local(format!("读取上游响应失败: {e}")))?;
-        buf.extend_from_slice(&chunk);
-
-        while let Some(pos) = memchr(b'\n', buf.as_ref()) {
-            let mut line = buf.split_to(pos + 1);
-            line.truncate(pos);
-            let line = trim_ascii(line.as_ref());
-            if line.is_empty() {
-                continue;
-            }
-            if !line.starts_with(b"data:") {
-                continue;
-            }
-            let payload = trim_ascii(&line[5..]);
-            if payload.is_empty() || payload == b"[DONE]" {
-                continue;
-            }
-
-            let mut outbound_text = None;
-            if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(payload) {
-                update_responses_ws_session_from_event(session, &v);
-                bind_response_account_from_value(
-                    state.runtime_state.as_ref(),
-                    account.as_ref(),
-                    &v,
-                );
-                let had_stream_output = has_text || has_tool;
-                if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
-                    match typ {
-                        "response.output_text.delta" => {
-                            if v.get("delta").and_then(|v| v.as_str()).unwrap_or_default() != "" {
-                                has_text = true;
-                            }
-                        }
-                        "response.output_item.added"
-                        | "response.function_call_arguments.delta"
-                        | "response.function_call_arguments.done"
-                        | "response.output_item.done" => {
-                            has_tool = true;
-                        }
-                        "response.completed" => {
-                            let completed_has_output = completed_response_has_output(payload);
-                            if completed_has_output {
-                                has_completed_output = true;
-                            }
-                            if completed_has_output && had_stream_output {
-                                if let Some(response) = v
-                                    .get_mut("response")
-                                    .and_then(|value| value.as_object_mut())
-                                {
-                                    response.remove("output");
-                                }
-                                outbound_text = Some(v.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
+        let mut outbound = Vec::new();
+        parser.push(&chunk, |payload| {
+            outbound.push(process_responses_ws_sse_payload(
+                state,
+                account.as_ref(),
+                session,
+                payload,
+                &mut has_text,
+                &mut has_tool,
+                &mut has_completed_output,
+            ));
+        });
+        for outbound_text in outbound {
             if socket
-                .send(Message::Text(
-                    outbound_text
-                        .unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
-                        .into(),
-                ))
+                .send(Message::Text(outbound_text.into()))
                 .await
                 .is_err()
             {
                 return Ok(());
             }
+        }
+    }
+    let mut outbound = Vec::new();
+    parser.finish(|payload| {
+        outbound.push(process_responses_ws_sse_payload(
+            state,
+            account.as_ref(),
+            session,
+            payload,
+            &mut has_text,
+            &mut has_tool,
+            &mut has_completed_output,
+        ));
+    });
+    for outbound_text in outbound {
+        if socket
+            .send(Message::Text(outbound_text.into()))
+            .await
+            .is_err()
+        {
+            return Ok(());
         }
     }
 
@@ -842,6 +1009,56 @@ async fn forward_responses_sse_as_ws(
         now_ms,
     );
     Ok(())
+}
+
+fn process_responses_ws_sse_payload(
+    state: &AppState,
+    account: &Account,
+    session: &mut ResponsesWsSession,
+    payload: &[u8],
+    has_text: &mut bool,
+    has_tool: &mut bool,
+    has_completed_output: &mut bool,
+) -> String {
+    let mut outbound_text = None;
+    if let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(payload) {
+        update_responses_ws_session_from_event(session, &v);
+        bind_response_account_from_value(state.runtime_state.as_ref(), account, &v);
+        let had_stream_output = *has_text || *has_tool;
+        if let Some(typ) = v.get("type").and_then(|v| v.as_str()) {
+            match typ {
+                "response.output_text.delta" => {
+                    if v.get("delta").and_then(|v| v.as_str()).unwrap_or_default() != "" {
+                        *has_text = true;
+                    }
+                }
+                "response.output_item.added"
+                | "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+                | "response.output_item.done" => {
+                    *has_tool = true;
+                }
+                "response.completed" => {
+                    let completed_has_output = completed_response_has_output(payload);
+                    if completed_has_output {
+                        *has_completed_output = true;
+                    }
+                    if completed_has_output && had_stream_output {
+                        if let Some(response) = v
+                            .get_mut("response")
+                            .and_then(|value| value.as_object_mut())
+                        {
+                            response.remove("output");
+                        }
+                        outbound_text = Some(v.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    outbound_text.unwrap_or_else(|| String::from_utf8_lossy(payload).into_owned())
 }
 
 async fn write_ws_error(socket: &mut WebSocket, err_type: &str, message: &str) {

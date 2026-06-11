@@ -6,7 +6,7 @@ use crate::core::Account;
 use crate::persist::{PersistStore, RequestLogInput, UsageLogInput};
 use crate::state::RuntimeStateStore;
 
-use super::{RequestStats, trim_ascii};
+use super::RequestStats;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct UsageTokens {
@@ -274,19 +274,12 @@ pub(super) fn record_usage_from_json_bytes(
     record_usage_from_value(account, runtime_state, now_ms, &value)
 }
 
-pub(super) fn record_usage_from_sse_line(
+pub(super) fn record_usage_from_sse_payload(
     account: &Account,
     runtime_state: &RuntimeStateStore,
     now_ms: i64,
-    line: &[u8],
+    payload: &[u8],
 ) -> Option<UsageTokens> {
-    if !line.starts_with(b"data:") {
-        return None;
-    }
-    let payload = trim_ascii(&line[5..]);
-    if payload.is_empty() || payload == b"[DONE]" {
-        return None;
-    }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
         return None;
     };

@@ -109,6 +109,8 @@ async fn main() -> Result<(), String> {
             RetryPolicy {
                 cooldown_401_ms: (cfg.cooldown_401_sec as i64).saturating_mul(1000),
                 default_cooldown_429_ms: (cfg.cooldown_429_sec as i64).saturating_mul(1000),
+                transport_error_cooldown_ms: (cfg.cooldown_transport_sec as i64)
+                    .saturating_mul(1000),
                 header_timeout: if cfg.upstream_timeout_sec > 0 {
                     Some(Duration::from_secs(cfg.upstream_timeout_sec))
                 } else {
@@ -116,7 +118,8 @@ async fn main() -> Result<(), String> {
                 },
             },
         )
-        .with_client_identity(cfg.client_version.clone(), cfg.user_agent.clone()),
+        .with_client_identity(cfg.client_version.clone(), cfg.user_agent.clone())
+        .with_native_responses_websocket(cfg.native_responses_websocket),
     );
 
     let quota_http = net::build_backend_reqwest_client(&cfg, Duration::from_secs(20))?;

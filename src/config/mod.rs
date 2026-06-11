@@ -81,6 +81,9 @@ pub struct Config {
     #[serde(rename = "cooldown-429-sec")]
     pub cooldown_429_sec: u64,
 
+    #[serde(rename = "cooldown-transport-sec")]
+    pub cooldown_transport_sec: u64,
+
     #[serde(rename = "refresh-single-timeout-sec")]
     pub refresh_single_timeout_sec: u64,
 
@@ -92,6 +95,9 @@ pub struct Config {
 
     #[serde(rename = "upstream-timeout-sec")]
     pub upstream_timeout_sec: u64,
+
+    #[serde(rename = "native-responses-websocket")]
+    pub native_responses_websocket: bool,
 
     pub selector: String,
 
@@ -202,10 +208,12 @@ impl Default for Config {
             save_workers: 4,
             cooldown_401_sec: 30,
             cooldown_429_sec: 60,
+            cooldown_transport_sec: 600,
             refresh_single_timeout_sec: 30,
             quota_check_concurrency: 0,
             keepalive_interval: 60,
             upstream_timeout_sec: 0,
+            native_responses_websocket: false,
             selector: "round-robin".to_string(),
             refresh_batch_size: 0,
             api_keys: Vec::new(),

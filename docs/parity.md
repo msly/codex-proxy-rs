@@ -14,7 +14,7 @@
 | `POST /v1/responses` | ✅ | stream/non-stream passthrough（含内部重试 SSE gate） |
 | `POST /refresh` | ✅ | SSE；强制刷新所有账号 Token（成功后会查询 quota） |
 | `POST /v1/responses/compact` | ✅ | stream/non-stream passthrough（上游 `/responses/compact`） |
-| `/v1/responses` websocket upgrade | ✅ | 支持 fallback：`response.create` / `response.append` → HTTP/SSE 转发，并将 SSE payload 作为 WS text frame 透传 |
+| `/v1/responses` websocket upgrade | ✅ | 默认 fallback：`response.create` / `response.append` → HTTP/SSE；可通过 `native-responses-websocket` 实验性直连 Codex 上游 WS |
 | `POST /v1/chat/completions` / `POST /v1/completions` / `POST /v1/messages` / `POST /v1/images/*` | 移除 | 格式转换与图片桥接由上层 gateway 负责，本服务只保留 Codex 代理 |
 | `GET /admin/request-logs` / `GET /admin/usage-logs` / `GET /admin/account-status` | ✅ | SQLite 持久化查询 |
 | `GET /admin/rate-limits` | ✅ | 暴露 key/account 当前限流配置 |

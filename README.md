@@ -9,6 +9,7 @@ Rust 重写版 `codex-proxy`（参考同级目录 `../codex-proxy` 的 Go 实现
 - Codex 代理端点：
   - `POST /v1/responses`（流式/非流式，透传上游 Responses SSE 或 response 对象）
   - `POST /v1/responses/compact`（流式/非流式，透传上游 Compact 响应）
+  - `/v1/responses` WebSocket（默认 HTTP/SSE fallback，可实验性开启原生 Codex WS 代理）
   - `GET /v1/models`（生成 thinking 后缀与 `-fast` 变体）
   - 不再提供 `/v1/chat/completions`、`/v1/completions`、`/v1/messages`、`/v1/images/*` 等格式转换/桥接端点；这些能力由上层 gateway 处理。
 - 管理端点：
@@ -299,7 +300,7 @@ flowchart TD
 
 ## 现状与差异（相对 Go）
 
-- 已实现：`/v1/responses`（含 websocket fallback 与 `response.append` 基础续写）、`/v1/responses/compact`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
+- 已实现：`/v1/responses`（含 websocket fallback、实验性原生上游 websocket 与 `response.append` 基础续写）、`/v1/responses/compact`、`/v1/models`、`/stats`、`/check-quota`、`/refresh`、refresh loop、health checker、keepalive
 - 已移除：`/v1/chat/completions`、`/v1/completions`、`/v1/messages`、`/v1/messages/count_tokens`、`/v1/images/*` 及相关转换/桥接策略
 - 未实现（待补齐）：上游原生 websocket 转发等（当前只实现 Go 同款 fallback）
 

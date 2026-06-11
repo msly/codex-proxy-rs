@@ -14,6 +14,7 @@ use crate::limit::{AccountLimitGuard, RateLimiter};
 pub const CODEX_CLIENT_VERSION: &str = "0.137.0";
 pub const CODEX_USER_AGENT: &str = "codex_cli_rs/0.137.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 
 pub type On401Hook = Arc<dyn Fn(Arc<Account>) + Send + Sync>;
 
@@ -21,6 +22,7 @@ pub type On401Hook = Arc<dyn Fn(Arc<Account>) + Send + Sync>;
 pub struct RetryPolicy {
     pub cooldown_401_ms: i64,
     pub default_cooldown_429_ms: i64,
+    pub transport_error_cooldown_ms: i64,
     pub header_timeout: Option<Duration>,
 }
 
@@ -29,6 +31,7 @@ impl Default for RetryPolicy {
         Self {
             cooldown_401_ms: 30_000,
             default_cooldown_429_ms: 60_000,
+            transport_error_cooldown_ms: 10 * 60_000,
             header_timeout: None,
         }
     }
@@ -41,6 +44,7 @@ pub struct CodexClient {
     retry_policy: RetryPolicy,
     client_version: String,
     user_agent: String,
+    native_responses_websocket: bool,
 }
 
 pub struct UpstreamResponse {
@@ -96,6 +100,7 @@ impl CodexClient {
             retry_policy,
             client_version: CODEX_CLIENT_VERSION.to_string(),
             user_agent: CODEX_USER_AGENT.to_string(),
+            native_responses_websocket: false,
         }
     }
 
@@ -107,6 +112,15 @@ impl CodexClient {
             self.user_agent = user_agent;
         }
         self
+    }
+
+    pub fn with_native_responses_websocket(mut self, enabled: bool) -> Self {
+        self.native_responses_websocket = enabled;
+        self
+    }
+
+    pub fn native_responses_websocket_enabled(&self) -> bool {
+        self.native_responses_websocket
     }
 
     pub fn responses_url(&self) -> Result<Url, String> {
@@ -125,6 +139,107 @@ impl CodexClient {
         u.set_query(None);
         u.set_fragment(None);
         Ok(u)
+    }
+
+    pub fn responses_websocket_url(&self) -> Result<Url, String> {
+        let mut u = self.responses_url()?;
+        match u.scheme() {
+            "http" => {
+                u.set_scheme("ws")
+                    .map_err(|_| "构建 websocket URL 失败: unsupported scheme".to_string())?;
+            }
+            "https" => {
+                u.set_scheme("wss")
+                    .map_err(|_| "构建 websocket URL 失败: unsupported scheme".to_string())?;
+            }
+            other => {
+                return Err(format!(
+                    "构建 websocket URL 失败: unsupported scheme {other}"
+                ));
+            }
+        }
+        if u.host_str().unwrap_or_default().is_empty() {
+            return Err("构建 websocket URL 失败: host is empty".to_string());
+        }
+        Ok(u)
+    }
+
+    pub fn websocket_headers(
+        &self,
+        account: &Account,
+        passthrough_headers: Option<&HeaderMap>,
+    ) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!(
+            "Bearer {}",
+            account.token().access_token
+        )) {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+        headers.insert(
+            "Origin",
+            reqwest::header::HeaderValue::from_static("https://chatgpt.com"),
+        );
+        headers.insert(
+            reqwest::header::REFERER,
+            reqwest::header::HeaderValue::from_static("https://chatgpt.com/"),
+        );
+        headers.insert(
+            "OpenAI-Beta",
+            reqwest::header::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+        );
+        headers.insert(
+            "Originator",
+            reqwest::header::HeaderValue::from_static(CODEX_ORIGINATOR),
+        );
+        headers.insert(
+            "Version",
+            reqwest::header::HeaderValue::from_str(&self.client_version).unwrap_or_else(|_| {
+                reqwest::header::HeaderValue::from_static(CODEX_CLIENT_VERSION)
+            }),
+        );
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_str(&self.user_agent)
+                .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(CODEX_USER_AGENT)),
+        );
+
+        for name in [
+            "OpenAI-Beta",
+            "Version",
+            "User-Agent",
+            "session_id",
+            "Session_id",
+            "Conversation_id",
+            "X-Codex-Turn-Metadata",
+            "X-Client-Request-Id",
+            "X-ResponsesAPI-Include-Timing-Metrics",
+        ] {
+            if let Some(value) = header_clone(passthrough_headers, name) {
+                headers.insert(name, value);
+            }
+        }
+        let beta_header = headers
+            .get("OpenAI-Beta")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !beta_header.contains("responses_websockets=") {
+            headers.insert(
+                "OpenAI-Beta",
+                reqwest::header::HeaderValue::from_static(CODEX_RESPONSES_WEBSOCKET_BETA),
+            );
+        }
+        if headers.get("session_id").is_none() && headers.get("Session_id").is_none() {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(&Uuid::new_v4().to_string()) {
+                headers.insert("session_id", value);
+            }
+        }
+        if !account.token().account_id.is_empty()
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&account.token().account_id)
+        {
+            headers.insert("ChatGPT-Account-ID", value);
+        }
+        headers
     }
 
     pub async fn execute(
@@ -247,6 +362,13 @@ impl CodexClient {
                 Err(err) => {
                     let now_ms = crate::core::now_unix_ms();
                     account.record_failure(now_ms);
+                    let transport_class = classify_transport_error(&err);
+                    if transport_class.persistent {
+                        account.set_cooldown(
+                            self.retry_policy.transport_error_cooldown_ms.max(0),
+                            now_ms,
+                        );
+                    }
                     let will_retry = attempt < max_attempts - 1;
                     tracing::warn!(
                         model = %model,
@@ -255,6 +377,7 @@ impl CodexClient {
                         total = max_attempts,
                         account = account.file_path(),
                         error = %err,
+                        transport_persistent = transport_class.persistent,
                         will_retry,
                         "upstream request network error"
                     );
@@ -435,6 +558,37 @@ fn is_retryable_status(code: u16) -> bool {
     match code {
         400 | 403 => false,
         _ => true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TransportErrorClass {
+    persistent: bool,
+}
+
+fn classify_transport_error(err: &reqwest::Error) -> TransportErrorClass {
+    if err.is_connect() && !err.is_timeout() {
+        return TransportErrorClass { persistent: true };
+    }
+    classify_transport_error_message(&err.to_string())
+}
+
+fn classify_transport_error_message(message: &str) -> TransportErrorClass {
+    let lower = message.to_ascii_lowercase();
+    const PERSISTENT_MARKERS: &[&str] = &[
+        "authentication failed",
+        "proxy authentication required",
+        "connection refused",
+        "no route to host",
+        "network is unreachable",
+        "no such host",
+        "failed to lookup address information",
+        "dns error",
+    ];
+    TransportErrorClass {
+        persistent: PERSISTENT_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker)),
     }
 }
 
@@ -740,6 +894,65 @@ mod tests {
         let body = resp.text().await.unwrap();
         assert_eq!(body, "data: ok\n\n");
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn upstream_transport_error_classification_marks_durable_failures() {
+        for message in [
+            "socks username/password authentication failed",
+            "HTTP status 407 Proxy Authentication Required",
+            "tcp connect error: Connection refused",
+            "dial tcp: no route to host",
+            "network is unreachable",
+            "lookup proxy.example.invalid: no such host",
+            "failed to lookup address information",
+        ] {
+            assert!(
+                classify_transport_error_message(message).persistent,
+                "{message}"
+            );
+        }
+
+        assert!(
+            !classify_transport_error_message(
+                "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+            )
+            .persistent
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_execute_cools_down_account_on_persistent_transport_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        drop(listener);
+        let base_url = Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_auth_file(dir.path(), "a.json", "at1").await;
+
+        let manager = Manager::new(dir.path());
+        manager.load_accounts().unwrap();
+
+        let client = CodexClient::new_with_http_and_policy(
+            base_url,
+            reqwest::Client::new(),
+            RetryPolicy {
+                transport_error_cooldown_ms: 123_000,
+                ..RetryPolicy::default()
+            },
+        );
+        let url = client.responses_url().unwrap();
+
+        let err = execute_tuple_for_test(&client, &manager, url, false, 0, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpstreamError::Network(_)));
+
+        let account = manager.accounts_snapshot().iter().next().unwrap().clone();
+        assert_eq!(account.status(), crate::core::AccountStatus::Cooldown);
+        let now_ms = crate::core::now_unix_ms();
+        assert!(account.cooldown_until_ms() >= now_ms + 120_000);
     }
 
     #[tokio::test]

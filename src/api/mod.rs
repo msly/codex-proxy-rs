@@ -11,10 +11,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bytes::BytesMut;
 use futures_util::StreamExt;
 use futures_util::stream::unfold;
-use memchr::memchr;
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -32,6 +30,7 @@ use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, Upstre
 mod management;
 pub mod models;
 mod responses;
+mod sse;
 mod telemetry;
 
 #[cfg(test)]
@@ -43,7 +42,7 @@ use responses::{
 use telemetry::{
     record_client_success, record_persist_account_error, record_persist_error,
     record_persist_request, record_persist_usage, record_usage_from_json_bytes,
-    record_usage_from_sse_line,
+    record_usage_from_sse_payload,
 };
 
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
@@ -158,19 +157,11 @@ pub(super) fn bind_response_account_from_json_bytes(
     }
 }
 
-fn bind_response_account_from_sse_line(
+fn bind_response_account_from_sse_payload(
     runtime_state: &RuntimeStateStore,
     account: &Account,
-    line: &[u8],
+    payload: &[u8],
 ) {
-    let line = trim_ascii(line);
-    if !line.starts_with(b"data:") {
-        return;
-    }
-    let payload = trim_ascii(&line[5..]);
-    if payload.is_empty() || payload == b"[DONE]" {
-        return;
-    }
     bind_response_account_from_json_bytes(runtime_state, account, payload);
 }
 
@@ -211,7 +202,7 @@ pub(super) fn build_passthrough_sse_response(
         let _account_limit_guard = account_limit_guard;
         let _request_limit_guard = request_limit_guard;
         let mut upstream_stream = upstream.bytes_stream();
-        let mut buf = BytesMut::new();
+        let mut parser = sse::SseDataParser::default();
         let mut recorded_usage = false;
 
         while let Some(chunk) = upstream_stream.next().await {
@@ -250,21 +241,20 @@ pub(super) fn build_passthrough_sse_response(
                 continue;
             }
 
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = memchr(b'\n', buf.as_ref()) {
-                let mut line = buf.split_to(pos + 1);
-                line.truncate(pos);
-
-                let line = trim_ascii(line.as_ref());
-                if line.is_empty() {
-                    continue;
+            parser.push(&chunk, |payload| {
+                bind_response_account_from_sse_payload(
+                    runtime_state.as_ref(),
+                    account.as_ref(),
+                    payload,
+                );
+                if recorded_usage {
+                    return;
                 }
-                bind_response_account_from_sse_line(runtime_state.as_ref(), account.as_ref(), line);
-                if let Some(usage) = record_usage_from_sse_line(
+                if let Some(usage) = record_usage_from_sse_payload(
                     account.as_ref(),
                     runtime_state.as_ref(),
                     crate::core::now_unix_ms(),
-                    line,
+                    payload,
                 ) {
                     record_persist_usage(
                         persist_store.as_ref(),
@@ -275,31 +265,34 @@ pub(super) fn build_passthrough_sse_response(
                         usage,
                     );
                     recorded_usage = true;
-                    break;
                 }
-            }
+            });
         }
 
         if !recorded_usage {
-            let line = trim_ascii(buf.as_ref());
-            if !line.is_empty() {
-                bind_response_account_from_sse_line(runtime_state.as_ref(), account.as_ref(), line);
-                if let Some(usage) = record_usage_from_sse_line(
+            parser.finish(|payload| {
+                bind_response_account_from_sse_payload(
+                    runtime_state.as_ref(),
+                    account.as_ref(),
+                    payload,
+                );
+                if let Some(usage) = record_usage_from_sse_payload(
                     account.as_ref(),
                     runtime_state.as_ref(),
                     crate::core::now_unix_ms(),
-                    line,
+                    payload,
                 ) {
                     record_persist_usage(
                         persist_store.as_ref(),
                         endpoint,
                         &model,
-                        api_key,
+                        api_key.clone(),
                         account.as_ref(),
                         usage,
                     );
+                    recorded_usage = true;
                 }
-            }
+            });
         }
     });
 

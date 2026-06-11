@@ -95,6 +95,37 @@ async fn start_upstream(calls: Arc<AtomicUsize>, body: &'static str) -> Url {
     Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
 }
 
+async fn start_native_ws_upstream(
+    calls: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+) -> Url {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        calls.fetch_add(1, Ordering::Relaxed);
+        let msg = ws.next().await.unwrap().unwrap();
+        let text = msg.into_text().unwrap();
+        bodies
+            .lock()
+            .unwrap()
+            .push(serde_json::from_str(&text).unwrap());
+        for payload in [
+            serde_json::json!({"type":"response.created","response":{"id":"r-native"}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"hi"}),
+            serde_json::json!({"type":"response.done","response":{"id":"r-native"}}),
+        ] {
+            ws.send(Message::Text(payload.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let _ = ws.close(None).await;
+    });
+
+    Url::parse(&format!("http://{addr}/backend-api/codex/")).unwrap()
+}
+
 async fn upstream_responses_capture_ws(
     State(state): State<CapturedWsUpstreamState>,
     headers: HeaderMap,
@@ -270,6 +301,86 @@ async fn api_v1_responses_websocket_fallback_forwards_sse_payloads() {
     assert_eq!(request_stats.rpm(), 1);
     assert_eq!(runtime_state.hourly_trend().len(), 1);
     assert_eq!(runtime_state.hourly_trend()[0].requests, 1);
+}
+
+#[tokio::test]
+async fn api_v1_responses_websocket_native_proxies_to_upstream_ws_when_enabled() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let base_url = start_native_ws_upstream(calls.clone(), bodies.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    write_auth_file(dir.path(), "a.json", "at2").await;
+
+    let manager = Arc::new(Manager::new(dir.path()));
+    manager.load_accounts().unwrap();
+    let request_stats = Arc::new(api::RequestStats::default());
+    let runtime_state = Arc::new(RuntimeStateStore::new(dir.path()));
+
+    let state = AppState {
+        manager: manager.clone(),
+        quota_checker: Arc::new(QuotaChecker::new(&base_url.to_string(), "", "", 1).unwrap()),
+        codex_client: Arc::new(
+            CodexClient::new(base_url, "")
+                .unwrap()
+                .with_native_responses_websocket(true),
+        ),
+        request_stats: request_stats.clone(),
+        api_keys: Arc::new(HashSet::new()),
+        max_retry: 0,
+        refresher: Refresher::new("").unwrap(),
+        save_queue: SaveQueue::start(1),
+        refresh_concurrency: 1,
+        runtime_state: runtime_state.clone(),
+        on_401: None,
+        rate_limiter: Arc::new(codex_proxy_rs::limit::RateLimiter::default()),
+        persist_store: None,
+    };
+
+    let app = api::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/v1/responses"))
+        .await
+        .unwrap();
+
+    ws.send(Message::Text(
+        serde_json::json!({
+            "type": "response.create",
+            "response": {
+                "model": "gpt-5.4",
+                "input": "hi"
+            }
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+
+    assert_eq!(
+        vec![
+            recv_text_json(&mut ws).await,
+            recv_text_json(&mut ws).await,
+            recv_text_json(&mut ws).await,
+        ],
+        vec![
+            serde_json::json!({"type":"response.created","response":{"id":"r-native"}}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"hi"}),
+            serde_json::json!({"type":"response.completed","response":{"id":"r-native"}}),
+        ]
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert_eq!(request_stats.rpm(), 1);
+
+    let captured = bodies.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0]["type"], "response.create");
+    assert_eq!(captured[0]["model"], "gpt-5.4");
 }
 
 #[tokio::test]

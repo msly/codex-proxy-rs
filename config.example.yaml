@@ -67,6 +67,7 @@ quota-check-concurrency: 50
 
 cooldown-401-sec: 7200
 cooldown-429-sec: 86400
+cooldown-transport-sec: 600
 
 # Network settings.
 # enable-http2 controls outbound clients for Codex / wham / health / keepalive.
@@ -79,6 +80,9 @@ startup-load-retry-interval: 10
 shutdown-timeout: 5
 keepalive-interval: 60
 upstream-timeout-sec: 0
+# Experimental: proxy downstream /v1/responses websocket directly to Codex upstream websocket.
+# When false, websocket clients use the existing HTTP/SSE fallback path.
+native-responses-websocket: false
 
 # Override upstream client identity headers (leave empty to use defaults).
 client-version: "0.137.0"
