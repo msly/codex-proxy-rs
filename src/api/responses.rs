@@ -751,8 +751,10 @@ async fn forward_responses_native_ws_as_ws(
     passthrough_headers: Option<&HeaderMap>,
     session: &mut ResponsesWsSession,
 ) -> Result<(), ResponsesWsError> {
-    let codex_value = serde_json::from_slice::<serde_json::Value>(&request_body)
+    let mut body_value = serde_json::from_slice::<serde_json::Value>(&request_body)
         .map_err(|err| ResponsesWsError::Local(format!("构建上游 websocket 请求失败: {err}")))?;
+    let base_model = apply_thinking_to_value(&mut body_value, model);
+    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
     let session_keys = session_keys_from_request(passthrough_headers, &codex_value);
     let initial_excluded = sticky_initial_excluded_for_request(
         state,
@@ -782,10 +784,15 @@ async fn forward_responses_native_ws_as_ws(
         request.headers_mut().insert(name.clone(), value.clone());
     }
 
-    let (mut upstream_ws, _) = tokio_tungstenite::connect_async(request)
+    let connect = tokio_tungstenite::connect_async(request);
+    let (mut upstream_ws, _) = tokio::time::timeout(std::time::Duration::from_secs(10), connect)
         .await
+        .map_err(|_| {
+            ResponsesWsError::NativeFallback("native websocket connect timed out".to_string())
+        })?
         .map_err(|err| ResponsesWsError::NativeFallback(err.to_string()))?;
-    let upstream_request = build_codex_websocket_request_body(&request_body);
+    let upstream_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
+    let upstream_request = build_codex_websocket_request_body(&upstream_body);
     upstream_ws
         .send(UpstreamWsMessage::Text(
             String::from_utf8_lossy(&upstream_request)
@@ -801,13 +808,14 @@ async fn forward_responses_native_ws_as_ws(
         &session_keys,
     );
 
-    let mut saw_event = false;
+    let mut wrote_downstream = false;
     let mut has_text = false;
     let mut has_tool = false;
     let mut has_completed_output = false;
+    let mut completed = false;
     while let Some(message) = upstream_ws.next().await {
         let message = message.map_err(|err| {
-            if saw_event {
+            if wrote_downstream {
                 ResponsesWsError::Local(format!("读取上游 websocket 失败: {err}"))
             } else {
                 ResponsesWsError::NativeFallback(err.to_string())
@@ -829,6 +837,12 @@ async fn forward_responses_native_ws_as_ws(
             continue;
         }
         let normalized_payload = normalize_codex_websocket_completion(payload);
+        if let Some(message) = codex_websocket_error_message(&normalized_payload) {
+            if wrote_downstream {
+                return Err(ResponsesWsError::Local(message));
+            }
+            return Err(ResponsesWsError::NativeFallback(message));
+        }
         let outbound = process_responses_ws_sse_payload(
             state,
             account.as_ref(),
@@ -838,7 +852,7 @@ async fn forward_responses_native_ws_as_ws(
             &mut has_tool,
             &mut has_completed_output,
         );
-        saw_event = true;
+        wrote_downstream = true;
         if socket.send(Message::Text(outbound.into())).await.is_err() {
             return Ok(());
         }
@@ -852,13 +866,19 @@ async fn forward_responses_native_ws_as_ws(
             })
             .is_some_and(|event_type| event_type == "response.completed")
         {
+            completed = true;
             break;
         }
     }
 
-    if !saw_event {
+    if !wrote_downstream {
         return Err(ResponsesWsError::NativeFallback(
             "native websocket returned no events".to_string(),
+        ));
+    }
+    if !completed {
+        return Err(ResponsesWsError::Local(
+            "native websocket ended before response.completed".to_string(),
         ));
     }
     record_client_success(
@@ -896,6 +916,25 @@ fn normalize_codex_websocket_completion(payload: &[u8]) -> Vec<u8> {
         return serde_json::to_vec(&value).unwrap_or_else(|_| payload.to_vec());
     }
     payload.to_vec()
+}
+
+fn codex_websocket_error_message(payload: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
+    if value.get("type").and_then(|value| value.as_str()) != Some("error") {
+        return None;
+    }
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .or_else(|| value.get("message").and_then(|message| message.as_str()))
+        .unwrap_or("upstream websocket error")
+        .trim();
+    Some(if message.is_empty() {
+        "upstream websocket error".to_string()
+    } else {
+        message.to_string()
+    })
 }
 
 async fn forward_responses_sse_as_ws(
