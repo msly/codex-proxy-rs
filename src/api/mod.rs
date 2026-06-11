@@ -1,25 +1,20 @@
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State};
+use axum::extract::State;
 use axum::http::header;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::Engine;
 use bytes::BytesMut;
 use futures_util::StreamExt;
 use futures_util::stream::unfold;
 use memchr::memchr;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -28,22 +23,20 @@ use uuid::Uuid;
 use crate::admin::AdminAuth;
 use crate::core::{Account, Manager};
 use crate::limit::{AccountLimitGuard, RateLimiter, RequestLimitGuard};
-use crate::persist::{PersistStore, RequestLogInput, UsageLogInput};
+use crate::persist::PersistStore;
 use crate::quota::QuotaChecker;
-use crate::refresh::{Refresher, SaveQueue, refresh_account};
+use crate::refresh::{Refresher, SaveQueue};
 use crate::state::RuntimeStateStore;
-use crate::thinking::apply::apply_thinking_to_value;
-use crate::translate::request::convert_openai_value_to_codex_value;
-use crate::translate::{
-    convert_image_request_to_responses_value, convert_non_stream_response,
-    convert_responses_sse_to_images_json, extract_completed_response_payload,
-};
+use crate::translate::{convert_non_stream_response, extract_completed_response_payload};
 use crate::upstream::codex::{CodexClient, UpstreamError, UpstreamRequest, UpstreamResponse};
 
 mod chat;
+mod images;
+mod management;
 mod messages;
 pub mod models;
 mod responses;
+mod telemetry;
 
 #[cfg(test)]
 use responses::{
@@ -51,32 +44,15 @@ use responses::{
     update_responses_ws_session_from_event,
 };
 
+use telemetry::{
+    UsageTokens, extract_usage_tokens, record_client_success, record_hourly_usage,
+    record_persist_account_error, record_persist_error, record_persist_request,
+    record_persist_usage, record_stream_account_failure, record_usage_from_json_bytes,
+    record_usage_from_sse_bytes, record_usage_from_sse_line,
+};
+
 const FRONTEND_DIST_DIR: &str = "frontend/dist";
 const INVALID_STREAM_FIELD_TYPE_MESSAGE: &str = "stream field must be a boolean when provided";
-
-#[derive(Debug, Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    accounts: usize,
-}
-
-#[derive(Debug, Deserialize)]
-struct AdminLoginRequest {
-    username: String,
-    password: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AdminSetupRequest {
-    username: String,
-    password: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AdminChangePasswordRequest {
-    current_password: String,
-    new_password: String,
-}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -105,7 +81,7 @@ pub fn set_admin_auth(auth: Arc<AdminAuth>) {
     admin_auth_swap().store(auth);
 }
 
-fn admin_auth_swap() -> &'static ArcSwap<AdminAuth> {
+pub(super) fn admin_auth_swap() -> &'static ArcSwap<AdminAuth> {
     ADMIN_AUTH.get_or_init(|| {
         ArcSwap::from_pointee(AdminAuth::new(
             "config.yaml",
@@ -150,58 +126,6 @@ impl RequestStats {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct UsageTokens {
-    pub(super) input_tokens: i64,
-    pub(super) output_tokens: i64,
-    pub(super) cached_tokens: i64,
-    pub(super) reasoning_tokens: i64,
-    pub(super) total_tokens: i64,
-}
-
-impl UsageTokens {
-    pub(super) fn has_activity(&self) -> bool {
-        self.input_tokens > 0
-            || self.output_tokens > 0
-            || self.cached_tokens > 0
-            || self.reasoning_tokens > 0
-            || self.total_tokens > 0
-    }
-}
-
-fn record_hourly_request(runtime_state: &RuntimeStateStore, now_ms: i64) {
-    runtime_state.record_hourly_request(now_ms);
-}
-
-pub(super) fn record_hourly_usage(
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-    usage: UsageTokens,
-) {
-    if usage.has_activity() {
-        runtime_state.record_hourly_usage(
-            now_ms,
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cached_tokens,
-            usage.reasoning_tokens,
-            usage.total_tokens,
-        );
-    }
-}
-
-pub(super) fn record_client_success(
-    account: &Account,
-    request_stats: &RequestStats,
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-) {
-    account.record_success(now_ms);
-    account.record_client_success();
-    request_stats.record_request();
-    record_hourly_request(runtime_state, now_ms);
-}
-
 pub(super) fn api_key_from_req(req: &Request<Body>) -> Option<String> {
     req.extensions()
         .get::<RequestApiKey>()
@@ -210,257 +134,6 @@ pub(super) fn api_key_from_req(req: &Request<Body>) -> Option<String> {
 
 pub(super) fn request_limit_guard_from_req(req: &Request<Body>) -> Option<Arc<RequestLimitGuard>> {
     req.extensions().get::<Arc<RequestLimitGuard>>().cloned()
-}
-
-pub(super) fn record_persist_request(
-    persist_store: Option<&Arc<PersistStore>>,
-    endpoint: &'static str,
-    model: &str,
-    stream: bool,
-    status: StatusCode,
-    attempts: usize,
-    api_key: Option<String>,
-    account: Option<&Account>,
-    duration_ms: i64,
-) {
-    let Some(store) = persist_store else {
-        return;
-    };
-    store.record_request(RequestLogInput {
-        ts_ms: crate::core::now_unix_ms(),
-        endpoint: endpoint.to_string(),
-        model: model.to_string(),
-        stream,
-        status: status.as_u16(),
-        attempts,
-        api_key,
-        account_file_path: account.map(|a| a.file_path().to_string()),
-        duration_ms,
-        ..RequestLogInput::default()
-    });
-    if let Some(account) = account {
-        let snap = account.stats_snapshot();
-        store.record_account_status((&snap).into());
-    }
-}
-
-pub(super) fn record_persist_error(
-    persist_store: Option<&Arc<PersistStore>>,
-    endpoint: &'static str,
-    model: &str,
-    stream: bool,
-    status: StatusCode,
-    api_key: Option<String>,
-    message: String,
-    duration_ms: i64,
-) {
-    let Some(store) = persist_store else {
-        return;
-    };
-    store.record_request(RequestLogInput {
-        ts_ms: crate::core::now_unix_ms(),
-        endpoint: endpoint.to_string(),
-        model: model.to_string(),
-        stream,
-        status: status.as_u16(),
-        api_key,
-        error_type: Some("api_error".to_string()),
-        error_message: Some(message),
-        duration_ms,
-        ..RequestLogInput::default()
-    });
-}
-
-pub(super) fn record_persist_account_error(
-    persist_store: Option<&Arc<PersistStore>>,
-    endpoint: &'static str,
-    model: &str,
-    stream: bool,
-    status: StatusCode,
-    attempts: usize,
-    api_key: Option<String>,
-    account: &Account,
-    message: String,
-    duration_ms: i64,
-) {
-    let Some(store) = persist_store else {
-        return;
-    };
-    store.record_request(RequestLogInput {
-        ts_ms: crate::core::now_unix_ms(),
-        endpoint: endpoint.to_string(),
-        model: model.to_string(),
-        stream,
-        status: status.as_u16(),
-        attempts,
-        api_key,
-        account_file_path: Some(account.file_path().to_string()),
-        error_type: Some("api_error".to_string()),
-        error_message: Some(message),
-        duration_ms,
-    });
-    let snap = account.stats_snapshot();
-    store.record_account_status((&snap).into());
-}
-
-pub(super) fn record_persist_usage(
-    persist_store: Option<&Arc<PersistStore>>,
-    endpoint: &'static str,
-    model: &str,
-    api_key: Option<String>,
-    account: &Account,
-    usage: UsageTokens,
-) {
-    if !usage.has_activity() {
-        return;
-    }
-    let Some(store) = persist_store else {
-        return;
-    };
-    store.record_usage(UsageLogInput {
-        ts_ms: crate::core::now_unix_ms(),
-        endpoint: endpoint.to_string(),
-        model: model.to_string(),
-        api_key,
-        account_file_path: account.file_path().to_string(),
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cached_tokens: usage.cached_tokens,
-        reasoning_tokens: usage.reasoning_tokens,
-        total_tokens: usage.total_tokens,
-    });
-    let snap = account.stats_snapshot();
-    store.record_account_status((&snap).into());
-}
-
-fn extract_usage_tokens(value: &serde_json::Value) -> Option<UsageTokens> {
-    let usage = value.get("usage").or_else(|| {
-        value
-            .get("response")
-            .and_then(|response| response.get("usage"))
-    })?;
-    let input_tokens = usage
-        .get("input_tokens")
-        .or_else(|| usage.get("prompt_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0);
-    let output_tokens = usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0);
-    let cached_tokens = usage
-        .get("input_tokens_details")
-        .and_then(|details| details.get("cached_tokens"))
-        .or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-        })
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0);
-    let reasoning_tokens = usage
-        .get("output_tokens_details")
-        .and_then(|details| details.get("reasoning_tokens"))
-        .or_else(|| {
-            usage
-                .get("completion_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens"))
-        })
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| input_tokens.saturating_add(output_tokens))
-        .max(0);
-
-    let usage = UsageTokens {
-        input_tokens,
-        output_tokens,
-        cached_tokens,
-        reasoning_tokens,
-        total_tokens,
-    };
-
-    if !usage.has_activity() {
-        return None;
-    }
-
-    Some(usage)
-}
-
-fn record_usage_from_value(
-    account: &Account,
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-    value: &serde_json::Value,
-) -> Option<UsageTokens> {
-    let Some(usage) = extract_usage_tokens(value) else {
-        return None;
-    };
-    account.record_usage_detail(
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cached_tokens,
-        usage.reasoning_tokens,
-        usage.total_tokens,
-    );
-    record_hourly_usage(runtime_state, now_ms, usage);
-    Some(usage)
-}
-
-pub(super) fn record_usage_from_json_bytes(
-    account: &Account,
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-    bytes: &[u8],
-) -> Option<UsageTokens> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return None;
-    };
-    record_usage_from_value(account, runtime_state, now_ms, &value)
-}
-
-pub(super) fn record_usage_from_sse_line(
-    account: &Account,
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-    line: &[u8],
-) -> Option<UsageTokens> {
-    if !line.starts_with(b"data:") {
-        return None;
-    }
-    let payload = trim_ascii(&line[5..]);
-    if payload.is_empty() || payload == b"[DONE]" {
-        return None;
-    }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) else {
-        return None;
-    };
-    record_usage_from_value(account, runtime_state, now_ms, &value)
-}
-
-pub(super) fn record_usage_from_sse_bytes(
-    account: &Account,
-    runtime_state: &RuntimeStateStore,
-    now_ms: i64,
-    bytes: &[u8],
-) -> Option<UsageTokens> {
-    for line in bytes.split(|b| *b == b'\n') {
-        let line = trim_ascii(line);
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(usage) = record_usage_from_sse_line(account, runtime_state, now_ms, line) {
-            return Some(usage);
-        }
-    }
-    None
 }
 
 pub(super) fn parse_stream_field(value: &serde_json::Value) -> Result<bool, &'static str> {
@@ -607,35 +280,6 @@ pub(super) fn claude_stream_error_event(message: &str, err_type: &str) -> Vec<u8
     .into_bytes()
 }
 
-pub(super) fn record_stream_account_failure(
-    persist_store: Option<&Arc<PersistStore>>,
-    endpoint: &'static str,
-    model: &str,
-    attempts: usize,
-    api_key: Option<String>,
-    account: &Account,
-    runtime_state: &RuntimeStateStore,
-    message: String,
-    started_ms: i64,
-) {
-    let now_ms = crate::core::now_unix_ms();
-    account.record_failure(now_ms);
-    account.record_client_failure();
-    runtime_state.mark_dirty();
-    record_persist_account_error(
-        persist_store,
-        endpoint,
-        model,
-        true,
-        StatusCode::BAD_GATEWAY,
-        attempts,
-        api_key,
-        account,
-        message,
-        now_ms.saturating_sub(started_ms),
-    );
-}
-
 pub(super) fn build_passthrough_sse_response(
     endpoint: &'static str,
     model: String,
@@ -758,27 +402,33 @@ pub(super) fn build_passthrough_sse_response(
 
 pub fn router(state: AppState) -> Router {
     let mgmt = Router::new()
-        .route("/stats", get(stats))
-        .route("/admin/request-logs", get(admin_request_logs))
-        .route("/admin/usage-logs", get(admin_usage_logs))
-        .route("/admin/account-status", get(admin_account_status))
-        .route("/admin/rate-limits", get(admin_rate_limits))
-        .route("/admin/persistence", get(admin_persistence))
-        .route("/admin/logout", post(admin_logout))
-        .route("/admin/change-password", post(admin_change_password))
+        .route("/stats", get(management::stats))
+        .route("/admin/request-logs", get(management::admin_request_logs))
+        .route("/admin/usage-logs", get(management::admin_usage_logs))
+        .route(
+            "/admin/account-status",
+            get(management::admin_account_status),
+        )
+        .route("/admin/rate-limits", get(management::admin_rate_limits))
+        .route("/admin/persistence", get(management::admin_persistence))
+        .route("/admin/logout", post(management::admin_logout))
+        .route(
+            "/admin/change-password",
+            post(management::admin_change_password),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             admin_session_auth,
         ));
 
     let admin_public = Router::new()
-        .route("/admin/status", get(admin_status))
-        .route("/admin/setup", post(admin_setup))
-        .route("/admin/login", post(admin_login));
+        .route("/admin/status", get(management::admin_status))
+        .route("/admin/setup", post(management::admin_setup))
+        .route("/admin/login", post(management::admin_login));
 
     let mgmt_sse = Router::new()
-        .route("/refresh", post(refresh))
-        .route("/check-quota", post(check_quota))
+        .route("/refresh", post(management::refresh))
+        .route("/check-quota", post(management::check_quota))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_key_auth));
 
     let v1 = Router::new()
@@ -790,8 +440,8 @@ pub fn router(state: AppState) -> Router {
         .route("/models", get(models::v1_models))
         .route("/chat/completions", post(chat::v1_chat_completions))
         .route("/completions", post(chat::v1_completions))
-        .route("/images/generations", post(v1_images_generations))
-        .route("/images/edits", post(v1_images_edits))
+        .route("/images/generations", post(images::v1_images_generations))
+        .route("/images/edits", post(images::v1_images_edits))
         .route("/messages", post(messages::v1_messages))
         .route(
             "/messages/count_tokens",
@@ -803,7 +453,7 @@ pub fn router(state: AppState) -> Router {
         .fallback(ServeFile::new(format!("{FRONTEND_DIST_DIR}/index.html")));
 
     let non_v1 = Router::new()
-        .route("/health", get(health))
+        .route("/health", get(management::health))
         .merge(mgmt)
         .merge(admin_public)
         .fallback_service(frontend)
@@ -988,7 +638,7 @@ fn check_request_limits(
         })
 }
 
-fn extract_api_key(headers: &HeaderMap) -> (Option<String>, &'static str) {
+pub(super) fn extract_api_key(headers: &HeaderMap) -> (Option<String>, &'static str) {
     // Authorization: Bearer <key>
     if let Some(v) = headers.get(axum::http::header::AUTHORIZATION) {
         if let Ok(s) = v.to_str() {
@@ -1021,13 +671,6 @@ fn extract_api_key(headers: &HeaderMap) -> (Option<String>, &'static str) {
     }
 
     (None, "none")
-}
-
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        accounts: state.manager.account_count(),
-    })
 }
 
 pub(super) fn send_error(status: StatusCode, message: &str, err_type: &str) -> Response {
@@ -1428,330 +1071,6 @@ pub(super) fn validate_function_call_output_context_with_known_ids(
     Err("function_call_output requires matching function_call context, item_reference ids, or previous_response_id on HTTP requests".to_string())
 }
 
-async fn v1_images_generations(State(state): State<AppState>, req: Request<Body>) -> Response {
-    v1_images(state, req, false).await
-}
-
-async fn v1_images_edits(State(state): State<AppState>, req: Request<Body>) -> Response {
-    v1_images(state, req, true).await
-}
-
-async fn v1_images(state: AppState, req: Request<Body>, edit: bool) -> Response {
-    let api_key = api_key_from_req(&req);
-    let request_limit_guard = request_limit_guard_from_req(&req);
-    let started_ms = crate::core::now_unix_ms();
-    let passthrough_headers = extract_codex_passthrough_headers(req.headers());
-    let raw_value = match parse_image_request_value(req).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let response_format = raw_value
-        .get("response_format")
-        .and_then(|value| value.as_str())
-        .unwrap_or("url")
-        .to_string();
-    let mut body_value = convert_image_request_to_responses_value(raw_value, edit);
-    let model = body_value
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    if model.trim().is_empty() {
-        return send_error(
-            StatusCode::BAD_REQUEST,
-            "缺少 model 字段",
-            "invalid_request_error",
-        );
-    }
-
-    let endpoint = if edit {
-        "/v1/images/edits"
-    } else {
-        "/v1/images/generations"
-    };
-    tracing::info!(model = %model, endpoint, "received images request");
-
-    let base_model = apply_thinking_to_value(&mut body_value, &model);
-    let codex_value = convert_openai_value_to_codex_value(&base_model, body_value, true);
-    let codex_body = serde_json::to_vec(&codex_value).unwrap_or_else(|_| b"{}".to_vec());
-
-    let url = match state.codex_client.responses_url() {
-        Ok(u) => u,
-        Err(err) => {
-            return send_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("构建上游 URL 失败: {err}"),
-                "server_error",
-            );
-        }
-    };
-
-    let upstream_result = match execute_codex_request(
-        &state,
-        &base_model,
-        url,
-        codex_body,
-        true,
-        passthrough_headers.as_ref(),
-        &HashSet::new(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(err) => {
-            log_upstream_request_error(endpoint, &base_model, true, &err);
-            record_persist_error(
-                state.persist_store.as_ref(),
-                endpoint,
-                &base_model,
-                false,
-                StatusCode::BAD_GATEWAY,
-                api_key.clone(),
-                err.to_string(),
-                crate::core::now_unix_ms().saturating_sub(started_ms),
-            );
-            return send_upstream_error(err);
-        }
-    };
-    let upstream = upstream_result.response;
-    let account = upstream_result.account;
-    let attempts = upstream_result.attempts;
-    let _account_limit_guard = upstream_result.account_limit_guard;
-
-    let bytes = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(err) => {
-            log_response_read_failed(endpoint, &base_model, false, account.as_ref(), &err);
-            record_persist_account_error(
-                state.persist_store.as_ref(),
-                endpoint,
-                &base_model,
-                false,
-                StatusCode::BAD_GATEWAY,
-                attempts,
-                api_key.clone(),
-                account.as_ref(),
-                format!("读取上游响应失败: {err}"),
-                crate::core::now_unix_ms().saturating_sub(started_ms),
-            );
-            return send_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("读取上游响应失败: {err}"),
-                "api_error",
-            );
-        }
-    };
-
-    let now_ms = crate::core::now_unix_ms();
-    if let Some(usage) = record_usage_from_sse_bytes(
-        account.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-        &bytes,
-    ) {
-        record_persist_usage(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            api_key.clone(),
-            account.as_ref(),
-            usage,
-        );
-    }
-    if let Some((message, err_type)) = response_failed_error_from_sse_bytes(&bytes) {
-        record_persist_account_error(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            false,
-            StatusCode::BAD_GATEWAY,
-            attempts,
-            api_key,
-            account.as_ref(),
-            message.clone(),
-            crate::core::now_unix_ms().saturating_sub(started_ms),
-        );
-        return send_error(StatusCode::BAD_GATEWAY, &message, &err_type);
-    }
-    let Some(out) = convert_responses_sse_to_images_json(&bytes, &response_format) else {
-        record_persist_account_error(
-            state.persist_store.as_ref(),
-            endpoint,
-            &base_model,
-            false,
-            StatusCode::BAD_GATEWAY,
-            attempts,
-            api_key,
-            account.as_ref(),
-            "上游响应缺少 image_generation_call 输出".to_string(),
-            crate::core::now_unix_ms().saturating_sub(started_ms),
-        );
-        return send_error(
-            StatusCode::BAD_GATEWAY,
-            "上游响应缺少 image_generation_call 输出",
-            "api_error",
-        );
-    };
-
-    record_client_success(
-        account.as_ref(),
-        state.request_stats.as_ref(),
-        state.runtime_state.as_ref(),
-        now_ms,
-    );
-    log_request_completed(
-        endpoint,
-        &base_model,
-        false,
-        StatusCode::OK,
-        attempts,
-        account.as_ref(),
-    );
-    record_persist_request(
-        state.persist_store.as_ref(),
-        endpoint,
-        &base_model,
-        false,
-        StatusCode::OK,
-        attempts,
-        api_key,
-        Some(account.as_ref()),
-        now_ms.saturating_sub(started_ms),
-    );
-
-    let mut resp = Response::new(Body::from(out));
-    let _request_limit_guard = request_limit_guard;
-    *resp.status_mut() = StatusCode::OK;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    resp
-}
-
-async fn parse_image_request_value(req: Request<Body>) -> Result<serde_json::Value, Response> {
-    let is_multipart = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .to_ascii_lowercase()
-                .starts_with("multipart/form-data")
-        });
-
-    if is_multipart {
-        return parse_multipart_image_request_value(req).await;
-    }
-
-    let raw = axum::body::to_bytes(req.into_body(), 50 * 1024 * 1024)
-        .await
-        .map_err(|_| {
-            send_error(
-                StatusCode::BAD_REQUEST,
-                "读取请求体失败",
-                "invalid_request_error",
-            )
-        })?;
-
-    Ok(serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default())))
-}
-
-async fn parse_multipart_image_request_value(
-    mut req: Request<Body>,
-) -> Result<serde_json::Value, Response> {
-    DefaultBodyLimit::max(50 * 1024 * 1024).apply(&mut req);
-    let mut multipart = Multipart::from_request(req, &()).await.map_err(|_| {
-        send_error(
-            StatusCode::BAD_REQUEST,
-            "解析 multipart 请求失败",
-            "invalid_request_error",
-        )
-    })?;
-    let mut object = serde_json::Map::new();
-
-    loop {
-        let field = match multipart.next_field().await {
-            Ok(Some(field)) => field,
-            Ok(None) => break,
-            Err(_) => {
-                return Err(send_error(
-                    StatusCode::BAD_REQUEST,
-                    "读取 multipart 字段失败",
-                    "invalid_request_error",
-                ));
-            }
-        };
-        let Some(name) = field.name().map(str::to_string) else {
-            continue;
-        };
-
-        if name == "image" || name == "image[]" || name == "mask" {
-            let content_type = field.content_type().map(str::to_string);
-            let bytes = field.bytes().await.map_err(|_| {
-                send_error(
-                    StatusCode::BAD_REQUEST,
-                    "读取 multipart 文件失败",
-                    "invalid_request_error",
-                )
-            })?;
-            let mime = content_type.unwrap_or_else(|| "image/png".to_string());
-            let data_url = format!(
-                "data:{};base64,{}",
-                mime,
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            );
-            let target_name = if name == "image[]" { "image" } else { &name };
-            insert_multipart_value(
-                &mut object,
-                target_name,
-                serde_json::Value::String(data_url),
-            );
-        } else {
-            let text = field.text().await.map_err(|_| {
-                send_error(
-                    StatusCode::BAD_REQUEST,
-                    "读取 multipart 文本字段失败",
-                    "invalid_request_error",
-                )
-            })?;
-            insert_multipart_value(&mut object, &name, parse_multipart_text_value(text));
-        }
-    }
-
-    Ok(serde_json::Value::Object(object))
-}
-
-fn parse_multipart_text_value(text: String) -> serde_json::Value {
-    let trimmed = text.trim();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            return value;
-        }
-    }
-    serde_json::Value::String(text)
-}
-
-fn insert_multipart_value(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    value: serde_json::Value,
-) {
-    match object.get_mut(name) {
-        Some(existing) => match existing {
-            serde_json::Value::Array(values) => values.push(value),
-            _ => {
-                let first = std::mem::replace(existing, serde_json::Value::Null);
-                *existing = serde_json::Value::Array(vec![first, value]);
-            }
-        },
-        None => {
-            object.insert(name.to_string(), value);
-        }
-    }
-}
-
 #[derive(Debug)]
 pub(super) enum ChatNonStreamOutcome {
     Success {
@@ -1809,553 +1128,6 @@ pub(super) fn trim_ascii(input: &[u8]) -> &[u8] {
         end -= 1;
     }
     &input[start..end]
-}
-
-async fn check_quota(
-    State(state): State<AppState>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let rx = state.quota_checker.check_all_stream(state.manager);
-
-    let stream = unfold(rx, |mut rx| async move {
-        let evt = rx.recv().await?;
-        let json = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
-        Some((Ok(Event::default().event(evt.event_type).data(json)), rx))
-    });
-
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("ping"),
-    )
-}
-
-async fn refresh(
-    State(state): State<AppState>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
-    let rx = force_refresh_all_stream(
-        state.manager,
-        state.refresher,
-        state.save_queue,
-        state.quota_checker,
-        state.refresh_concurrency,
-    );
-
-    let stream = unfold(rx, |mut rx| async move {
-        let evt = rx.recv().await?;
-        let json = serde_json::to_string(&evt).unwrap_or_else(|_| "{}".to_string());
-        Some((Ok(Event::default().event(evt.event_type).data(json)), rx))
-    });
-
-    Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("ping"),
-    )
-}
-
-fn format_duration(d: std::time::Duration) -> String {
-    let ms = d.as_millis();
-    if ms < 1000 {
-        return format!("{ms}ms");
-    }
-    format!("{:.3}s", d.as_secs_f64())
-}
-
-fn force_refresh_all_stream(
-    manager: Arc<Manager>,
-    refresher: Refresher,
-    save_queue: SaveQueue,
-    quota_checker: Arc<QuotaChecker>,
-    refresh_concurrency: usize,
-) -> tokio::sync::mpsc::Receiver<crate::quota::ProgressEvent> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<crate::quota::ProgressEvent>(100);
-
-    tokio::spawn(async move {
-        let accounts = manager.accounts_snapshot();
-        let total = accounts.len();
-        if total == 0 {
-            let _ = tx
-                .send(crate::quota::ProgressEvent {
-                    event_type: "done",
-                    email: None,
-                    success: None,
-                    message: Some("无账号".to_string()),
-                    total: None,
-                    success_count: None,
-                    failed_count: None,
-                    remaining: None,
-                    duration: Some("0s".to_string()),
-                    current: None,
-                })
-                .await;
-            return;
-        }
-
-        let start = Instant::now();
-        let sem = Arc::new(tokio::sync::Semaphore::new(refresh_concurrency.max(1)));
-        let success_count = Arc::new(AtomicUsize::new(0));
-        let fail_count = Arc::new(AtomicUsize::new(0));
-        let current = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::with_capacity(total);
-
-        for acc in accounts.iter() {
-            if tx.is_closed() {
-                break;
-            }
-
-            let tx = tx.clone();
-            let sem = sem.clone();
-            let manager = manager.clone();
-            let refresher = refresher.clone();
-            let save_queue = save_queue.clone();
-            let quota_checker = quota_checker.clone();
-            let success_count = success_count.clone();
-            let fail_count = fail_count.clone();
-            let current = current.clone();
-            let acc = acc.clone();
-
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
-                let email = acc.token().email.clone();
-
-                // Go parity: force refresh regardless of expiry window.
-                let ok = refresh_account(manager.as_ref(), &refresher, &save_queue, acc.clone(), 3)
-                    .await
-                    .is_ok();
-
-                if ok {
-                    let _ = quota_checker.check_one(acc).await;
-                    success_count.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    fail_count.fetch_add(1, Ordering::Relaxed);
-                }
-
-                let cur = current.fetch_add(1, Ordering::Relaxed) + 1;
-                let _ = tx
-                    .send(crate::quota::ProgressEvent {
-                        event_type: "item",
-                        email: Some(email),
-                        success: Some(ok),
-                        message: None,
-                        total: Some(total),
-                        success_count: None,
-                        failed_count: None,
-                        remaining: None,
-                        duration: None,
-                        current: Some(cur),
-                    })
-                    .await;
-            }));
-        }
-
-        for h in handles {
-            let _ = h.await;
-        }
-
-        let remaining = manager.account_count();
-        let elapsed = start.elapsed();
-        let sc = success_count.load(Ordering::Relaxed);
-        let fc = fail_count.load(Ordering::Relaxed);
-
-        let _ = tx
-            .send(crate::quota::ProgressEvent {
-                event_type: "done",
-                email: None,
-                success: None,
-                message: Some("刷新完成".to_string()),
-                total: Some(total),
-                success_count: Some(sc),
-                failed_count: Some(fc),
-                remaining: Some(remaining),
-                duration: Some(format_duration(elapsed)),
-                current: None,
-            })
-            .await;
-    });
-
-    rx
-}
-
-#[derive(Debug, Serialize)]
-struct StatsSummary {
-    total: usize,
-    active: usize,
-    cooldown: usize,
-    disabled: usize,
-    rpm: i64,
-    total_input_tokens: i64,
-    total_output_tokens: i64,
-    total_cached_tokens: i64,
-    total_reasoning_tokens: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsQuota {
-    valid: bool,
-    status_code: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    raw_data: Option<serde_json::Value>,
-    checked_at_ms: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsUsage {
-    total_completions: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_tokens: i64,
-    reasoning_tokens: i64,
-    total_tokens: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsTrendPoint {
-    hour_start_ms: i64,
-    hour_label: String,
-    requests: i64,
-    input_tokens: i64,
-    output_tokens: i64,
-    cached_tokens: i64,
-    reasoning_tokens: i64,
-    total_tokens: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsTrend {
-    hourly: Vec<StatsTrendPoint>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsAccount {
-    file_path: String,
-    email: String,
-    status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plan_type: Option<String>,
-    used_percent: f64,
-    successful_requests: i64,
-    failed_requests: i64,
-    attempt_requests: i64,
-    attempt_errors: i64,
-    consecutive_failures: i64,
-    last_used_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_used_at: Option<String>,
-    cooldown_until_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_refreshed_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cooldown_until: Option<String>,
-    quota_exhausted: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quota_resets_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    token_expire: Option<String>,
-    usage: StatsUsage,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    quota: Option<StatsQuota>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatsResponse {
-    summary: StatsSummary,
-    trend: StatsTrend,
-    accounts: Vec<StatsAccount>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct LogQuery {
-    #[serde(default = "default_log_limit")]
-    limit: usize,
-}
-
-fn default_log_limit() -> usize {
-    100
-}
-
-async fn admin_request_logs(
-    State(state): State<AppState>,
-    Query(query): Query<LogQuery>,
-) -> Response {
-    let Some(store) = state.persist_store.as_ref() else {
-        return send_error(
-            StatusCode::NOT_FOUND,
-            "persistence is disabled",
-            "not_found",
-        );
-    };
-    match store.list_request_logs(query.limit).await {
-        Ok(data) => Json(json!({ "data": data })).into_response(),
-        Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
-    }
-}
-
-async fn admin_status() -> Response {
-    Json(json!({ "data": admin_auth_swap().load().status() })).into_response()
-}
-
-async fn admin_setup(Json(input): Json<AdminSetupRequest>) -> Response {
-    let auth = admin_auth_swap().load();
-    match auth.setup(&input.username, &input.password) {
-        Ok(token) => Json(json!({
-            "data": {
-                "token": token,
-                "status": auth.status(),
-            }
-        }))
-        .into_response(),
-        Err(err) => send_error(StatusCode::BAD_REQUEST, &err, "invalid_request_error"),
-    }
-}
-
-async fn admin_login(Json(input): Json<AdminLoginRequest>) -> Response {
-    let auth = admin_auth_swap().load();
-    match auth.login(&input.username, &input.password) {
-        Ok(token) => Json(json!({
-            "data": {
-                "token": token,
-                "status": auth.status(),
-            }
-        }))
-        .into_response(),
-        Err(err) => send_error(StatusCode::UNAUTHORIZED, &err, "invalid_request_error"),
-    }
-}
-
-async fn admin_logout(headers: HeaderMap) -> Response {
-    if let (Some(token), _) = extract_api_key(&headers) {
-        admin_auth_swap().load().logout(&token);
-    }
-    Json(json!({ "data": { "ok": true } })).into_response()
-}
-
-async fn admin_change_password(
-    headers: HeaderMap,
-    Json(input): Json<AdminChangePasswordRequest>,
-) -> Response {
-    let Some((token, _)) = extract_api_key(&headers).0.map(|token| (token, ())) else {
-        return send_error(
-            StatusCode::UNAUTHORIZED,
-            "invalid admin session",
-            "invalid_request_error",
-        );
-    };
-    let auth = admin_auth_swap().load();
-    match auth.change_password(&token, &input.current_password, &input.new_password) {
-        Ok(()) => Json(json!({ "data": auth.status() })).into_response(),
-        Err(err) => send_error(StatusCode::BAD_REQUEST, &err, "invalid_request_error"),
-    }
-}
-
-async fn admin_usage_logs(
-    State(state): State<AppState>,
-    Query(query): Query<LogQuery>,
-) -> Response {
-    let Some(store) = state.persist_store.as_ref() else {
-        return send_error(
-            StatusCode::NOT_FOUND,
-            "persistence is disabled",
-            "not_found",
-        );
-    };
-    match store.list_usage_logs(query.limit).await {
-        Ok(data) => Json(json!({ "data": data })).into_response(),
-        Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
-    }
-}
-
-async fn admin_account_status(State(state): State<AppState>) -> Response {
-    let Some(store) = state.persist_store.as_ref() else {
-        return send_error(
-            StatusCode::NOT_FOUND,
-            "persistence is disabled",
-            "not_found",
-        );
-    };
-    match store.list_account_status().await {
-        Ok(data) => Json(json!({ "data": data })).into_response(),
-        Err(err) => send_error(StatusCode::INTERNAL_SERVER_ERROR, &err, "server_error"),
-    }
-}
-
-async fn admin_rate_limits(State(state): State<AppState>) -> Response {
-    Json(json!({ "data": state.rate_limiter.snapshot() })).into_response()
-}
-
-async fn admin_persistence(State(state): State<AppState>) -> Response {
-    let Some(store) = state.persist_store.as_ref() else {
-        return Json(json!({
-            "data": {
-                "enabled": false,
-                "writer_running": false,
-                "dropped_events": 0,
-                "write_errors": 0,
-            }
-        }))
-        .into_response();
-    };
-    let status = store.status();
-    Json(json!({
-        "data": {
-            "enabled": true,
-            "writer_running": status.writer_running,
-            "dropped_events": status.dropped_events,
-            "write_errors": status.write_errors,
-        }
-    }))
-    .into_response()
-}
-
-async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
-    let accounts = state.manager.accounts_snapshot();
-    let now_ms = crate::core::now_unix_ms();
-
-    let mut out = Vec::with_capacity(accounts.len());
-    let mut active = 0usize;
-    let mut cooldown = 0usize;
-    let mut disabled = 0usize;
-    let mut total_input_tokens = 0i64;
-    let mut total_output_tokens = 0i64;
-    let mut total_cached_tokens = 0i64;
-    let mut total_reasoning_tokens = 0i64;
-
-    for acc in accounts.iter() {
-        let snap = acc.stats_snapshot();
-        if let Some(store) = state.persist_store.as_ref() {
-            store.record_account_status((&snap).into());
-        }
-        match snap.status {
-            crate::core::AccountStatus::Active => active += 1,
-            crate::core::AccountStatus::Cooldown => cooldown += 1,
-            crate::core::AccountStatus::Disabled => disabled += 1,
-        }
-        total_input_tokens += snap.usage_input_tokens;
-        total_output_tokens += snap.usage_output_tokens;
-        total_cached_tokens += snap.usage_cached_tokens;
-        total_reasoning_tokens += snap.usage_reasoning_tokens;
-
-        fn ms_to_rfc3339(ms: i64) -> Option<String> {
-            if ms <= 0 {
-                return None;
-            }
-            let dt = time::OffsetDateTime::from_unix_timestamp_nanos(
-                (ms as i128).saturating_mul(1_000_000),
-            )
-            .ok()?;
-            dt.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        }
-
-        let quota = acc.quota_info().map(|info| StatsQuota {
-            valid: info.valid,
-            status_code: info.status_code,
-            raw_data: if info.raw_data.is_empty() {
-                None
-            } else {
-                serde_json::from_slice(&info.raw_data).ok()
-            },
-            checked_at_ms: info.checked_at_ms,
-        });
-
-        let mut quota_exhausted = snap.quota_exhausted;
-        if quota_exhausted && snap.quota_resets_at_ms > 0 && now_ms >= snap.quota_resets_at_ms {
-            quota_exhausted = false;
-        }
-
-        out.push(StatsAccount {
-            file_path: snap.file_path,
-            email: snap.email,
-            status: snap.status.as_str().to_string(),
-            plan_type: if snap.plan_type.is_empty() {
-                None
-            } else {
-                Some(snap.plan_type)
-            },
-            used_percent: snap.used_percent,
-            successful_requests: snap.successful_requests,
-            failed_requests: snap.failed_requests,
-            attempt_requests: snap.total_requests,
-            attempt_errors: snap.total_errors,
-            consecutive_failures: snap.consecutive_failures,
-            last_used_ms: snap.last_used_ms,
-            last_used_at: ms_to_rfc3339(snap.last_used_ms),
-            cooldown_until_ms: snap.cooldown_until_ms,
-            last_refreshed_at: ms_to_rfc3339(snap.last_refreshed_ms),
-            cooldown_until: ms_to_rfc3339(snap.cooldown_until_ms),
-            quota_exhausted,
-            quota_resets_at: if quota_exhausted {
-                ms_to_rfc3339(snap.quota_resets_at_ms)
-            } else {
-                None
-            },
-            token_expire: if snap.token_expire.is_empty() {
-                None
-            } else {
-                Some(snap.token_expire)
-            },
-            usage: StatsUsage {
-                total_completions: snap.usage_total_completions,
-                input_tokens: snap.usage_input_tokens,
-                output_tokens: snap.usage_output_tokens,
-                cached_tokens: snap.usage_cached_tokens,
-                reasoning_tokens: snap.usage_reasoning_tokens,
-                total_tokens: snap.usage_total_tokens,
-            },
-            quota,
-        });
-    }
-
-    fn hour_label(ms: i64) -> String {
-        if ms <= 0 {
-            return String::new();
-        }
-        let Ok(dt) = time::OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000)
-        else {
-            return String::new();
-        };
-        let Ok(fmt) = time::format_description::parse("[month]-[day] [hour]:00") else {
-            return String::new();
-        };
-        dt.format(&fmt).unwrap_or_else(|_| String::new())
-    }
-
-    let trend = StatsTrend {
-        hourly: state
-            .runtime_state
-            .hourly_trend()
-            .into_iter()
-            .map(|point| StatsTrendPoint {
-                hour_start_ms: point.hour_start_ms,
-                hour_label: hour_label(point.hour_start_ms),
-                requests: point.requests,
-                input_tokens: point.input_tokens,
-                output_tokens: point.output_tokens,
-                cached_tokens: point.cached_tokens,
-                reasoning_tokens: point.reasoning_tokens,
-                total_tokens: point.total_tokens,
-            })
-            .collect(),
-    };
-
-    Json(StatsResponse {
-        summary: StatsSummary {
-            total: accounts.len(),
-            active,
-            cooldown,
-            disabled,
-            rpm: state.request_stats.rpm(),
-            total_input_tokens,
-            total_output_tokens,
-            total_cached_tokens,
-            total_reasoning_tokens,
-        },
-        trend,
-        accounts: out,
-    })
 }
 
 #[cfg(test)]
