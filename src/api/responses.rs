@@ -802,12 +802,6 @@ async fn forward_responses_native_ws_as_ws(
         .await
         .map_err(|err| ResponsesWsError::NativeFallback(err.to_string()))?;
 
-    bind_session_accounts(
-        state.runtime_state.as_ref(),
-        account.as_ref(),
-        &session_keys,
-    );
-
     let mut wrote_downstream = false;
     let mut has_text = false;
     let mut has_tool = false;
@@ -852,9 +846,16 @@ async fn forward_responses_native_ws_as_ws(
             &mut has_tool,
             &mut has_completed_output,
         );
-        wrote_downstream = true;
         if socket.send(Message::Text(outbound.into())).await.is_err() {
             return Ok(());
+        }
+        if !wrote_downstream {
+            bind_session_accounts(
+                state.runtime_state.as_ref(),
+                account.as_ref(),
+                &session_keys,
+            );
+            wrote_downstream = true;
         }
         if serde_json::from_slice::<serde_json::Value>(&normalized_payload)
             .ok()
